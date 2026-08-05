@@ -7,8 +7,9 @@ import socket
 import struct
 import time
 
-from l2_client import crypto, item_data, npc_data, packets, skill_data
+from l2_client import crypto, packets
 from l2_client.character import L2Character
+from l2_client.tools.data import item_data, npc_data, skill_data
 
 # --- CONFIGURATION ---
 SERVER_IP = "127.0.0.1"

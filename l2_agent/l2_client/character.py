@@ -24,9 +24,10 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 """
 
-from . import item_data, packets, skill_data
+from . import packets
 from .packets import PAPERDOLL_NAMES, STATUS_ATTRIBUTE_NAMES
 from .radar import Radar
+from .tools.data import item_data, skill_data
 
 
 class L2Character:

@@ -28,7 +28,7 @@ import math
 import re
 import time
 
-from . import npc_data
+from .tools.data import npc_data
 
 
 class Radar:
