@@ -125,6 +125,11 @@ def build_enter_world() -> bytes:
     return pack(p)
 
 
+def build_request_skill_cool_time() -> bytes:
+    """RequestSkillCoolTime (0x9D): ask the server for a SkillCoolTime (0xC1) answer."""
+    return pack(bytearray([0x9D]))
+
+
 def build_net_ping(pid: int) -> bytes:
     return pack(bytearray([0xA8]) + struct.pack("<I", pid))
 
@@ -442,6 +447,26 @@ def parse_status_update(body: bytes) -> dict:
         value = struct.unpack_from("<i", body, pos)[0]; pos += 4
         attrs[attr_id] = value
     return {"object_id": object_id, "attributes": attrs}
+
+
+def parse_skill_cool_time(body: bytes) -> dict:
+    """
+    Parse SkillCoolTime (0xC1).
+
+    Times are whole seconds as sent by the server, i.e. already scaled by its speed settings;
+    only skills that are still cooling down are listed.
+    """
+    if len(body) < 5:
+        return {"cooldowns": []}
+    pos = 1
+    count = struct.unpack_from("<i", body, pos)[0]; pos += 4
+    cooldowns = []
+    for _ in range(count):
+        if pos + 16 > len(body):
+            break
+        skill_id, level, reuse, remaining = struct.unpack_from("<iiii", body, pos); pos += 16
+        cooldowns.append({"skill_id": skill_id, "level": level, "reuse": reuse, "remaining": remaining})
+    return {"cooldowns": cooldowns}
 
 
 def parse_etc_status_update(body: bytes) -> dict:
