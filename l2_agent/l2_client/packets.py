@@ -26,17 +26,109 @@ SOFTWARE.
 
 import re
 import struct
+from enum import IntEnum
 
-PACKET_NAMES = {
-    0x00: "KeyPacket", 0x01: "MoveToLoc", 0x03: "CharInfo", 0x04: "UserInfo",
-    0x0B: "SpawnItem", 0x0E: "StatusUpd", 0x13: "CharSelInfo", 0x14: "LoginFail",
-    0x15: "CharSelected", 0x16: "NpcInfo", 0x1B: "ItemList",
-    0x1C: "Sunrise", 0x1D: "Sunset", 0x26: "ServerClose",
-    0x27: "InvUpdate", 0x4A: "CreatureSay", 0x58: "SkillList",
-    0x64: "SysMsg", 0x7F: "AbnormalSt", 0x80: "QuestList",
-    0xA8: "NetPing", 0xC1: "SkillCool", 0xF3: "EtcStatus",
-    0xF9: "GGQuery", 0xFE: "ExPacket",
-}
+# ---------------------------------------------------------------------------
+# Opcodes
+#
+# Names and values mirror the server sources (L2J_Mobius_CT_0_Interlude):
+# gameserver/network/ServerPackets.java, ClientPackets.java, ExClientPackets.java and
+# loginserver/network/LoginClientPackets.java + loginserver/network/serverpackets/*.java.
+# Login and game server use separate opcode spaces, and so do both directions, so the same
+# byte means different packets in different enums (e.g. 0xA8 is the client's RequestNetPing
+# but the server's AskJoinAlliance).
+# ---------------------------------------------------------------------------
+
+
+class LoginServerPacket(IntEnum):
+    """Login server -> client."""
+
+    INIT = 0x00
+    LOGIN_FAIL = 0x01
+    ACCOUNT_KICKED = 0x02
+    LOGIN_OK = 0x03
+    SERVER_LIST = 0x04
+    PLAY_FAIL = 0x06
+    PLAY_OK = 0x07
+    GG_AUTH = 0x0B
+
+
+class LoginClientPacket(IntEnum):
+    """Client -> login server."""
+
+    REQUEST_AUTH_LOGIN = 0x00
+    REQUEST_SERVER_LOGIN = 0x02
+    REQUEST_SERVER_LIST = 0x05
+    AUTH_GAME_GUARD = 0x07
+
+
+class GameServerPacket(IntEnum):
+    """Game server -> client (the subset the client knows about)."""
+
+    KEY_PACKET = 0x00
+    CHAR_MOVE_TO_LOCATION = 0x01
+    CHAR_INFO = 0x03
+    USER_INFO = 0x04
+    ATTACK = 0x05
+    DIE = 0x06
+    REVIVE = 0x07
+    SPAWN_ITEM = 0x0B
+    DROP_ITEM = 0x0C
+    GET_ITEM = 0x0D
+    STATUS_UPDATE = 0x0E
+    DELETE_OBJECT = 0x12
+    CHAR_SELECT_INFO = 0x13
+    LOGIN_FAIL = 0x14
+    CHAR_SELECTED = 0x15
+    NPC_INFO = 0x16
+    ITEM_LIST = 0x1B
+    SUNRISE = 0x1C
+    SUNSET = 0x1D
+    SERVER_CLOSE = 0x26
+    INVENTORY_UPDATE = 0x27
+    CREATURE_SAY = 0x4A
+    SKILL_LIST = 0x58
+    SYSTEM_MESSAGE = 0x64
+    ABNORMAL_STATUS_UPDATE = 0x7F
+    QUEST_LIST = 0x80
+    ASK_JOIN_ALLIANCE = 0xA8
+    SKILL_COOL_TIME = 0xC1
+    NET_PING = 0xD3  # only ever the answer to the client's RequestNetPing
+    CONFIRM_DLG = 0xED
+    ETC_STATUS_UPDATE = 0xF3
+    GAME_GUARD_QUERY = 0xF9
+    EX_PACKET = 0xFE
+
+
+class GameClientPacket(IntEnum):
+    """Client -> game server."""
+
+    PROTOCOL_VERSION = 0x00
+    MOVE_TO_LOCATION = 0x01
+    ENTER_WORLD = 0x03
+    ACTION = 0x04
+    AUTH_LOGIN = 0x08
+    ATTACK_REQUEST = 0x0A
+    CHARACTER_SELECT = 0x0D
+    USE_ITEM = 0x14
+    REQUEST_MAGIC_SKILL_USE = 0x2F
+    SAY2 = 0x38
+    REQUEST_RESTART_POINT = 0x6D
+    REQUEST_SKILL_COOL_TIME = 0x9D
+    NET_PING = 0xA8
+    DLG_ANSWER = 0xC5
+    GAME_GUARD_REPLY = 0xCA
+    EX_PACKET = 0xD0
+
+
+class GameClientExPacket(IntEnum):
+    """Sub-opcodes (uint16) of :attr:`GameClientPacket.EX_PACKET`."""
+
+    REQUEST_AUTO_SOUL_SHOT = 0x05
+
+
+#: Game server opcode -> packet name, for logging.
+PACKET_NAMES = {packet.value: packet.name for packet in GameServerPacket}
 
 STATUS_ATTRIBUTE_NAMES = {
     0x01: "LEVEL", 0x02: "EXP", 0x03: "STR", 0x04: "DEX",
@@ -82,7 +174,7 @@ def pack(p: bytearray) -> bytes:
 
 
 def build_auth_game_guard(sid: int) -> bytes:
-    return bytes(bytearray([0x07]) + struct.pack("<I", sid) + b'\x00' * 16)
+    return bytes(bytearray([LoginClientPacket.AUTH_GAME_GUARD]) + struct.pack("<I", sid) + b'\x00' * 16)
 
 
 def build_request_auth_login(login: str, pw: str, sid: int, rsa_mod: bytes) -> bytes:
@@ -92,55 +184,61 @@ def build_request_auth_login(login: str, pw: str, sid: int, rsa_mod: bytes) -> b
     r[0x6C:0x6C + 16] = pw.encode('utf-8').ljust(16, b'\x00')
     struct.pack_into("<I", r, 124, sid)
     m = int.from_bytes(rsa_mod, 'big')
-    return bytes(bytearray([0x00]) + pow(int.from_bytes(r, 'big'), 65537, m).to_bytes(128, 'big') + b'\x00' * 8)
+    encrypted = pow(int.from_bytes(r, 'big'), 65537, m).to_bytes(128, 'big')
+    return bytes(bytearray([LoginClientPacket.REQUEST_AUTH_LOGIN]) + encrypted + b'\x00' * 8)
 
 
 def build_request_server_list(l1: int, l2: int) -> bytes:
-    return bytes(bytearray([0x05]) + struct.pack("<II", l1, l2))
+    return bytes(bytearray([LoginClientPacket.REQUEST_SERVER_LIST]) + struct.pack("<II", l1, l2))
 
 
 def build_request_server_login(l1: int, l2: int, sid: int) -> bytes:
-    return bytes(bytearray([0x02]) + struct.pack("<II", l1, l2) + bytes([sid]))
+    return bytes(bytearray([LoginClientPacket.REQUEST_SERVER_LOGIN]) + struct.pack("<II", l1, l2) + bytes([sid]))
 
 
 def build_proto_version(v: int = 746) -> bytes:
-    return pack(bytearray([0x00]) + struct.pack("<I", v))
+    return pack(bytearray([GameClientPacket.PROTOCOL_VERSION]) + struct.pack("<I", v))
 
 
 def build_auth_login_gs(name: str, pk2: int, pk1: int, lk1: int, lk2: int) -> bytes:
-    p = bytearray([0x08]) + name.encode('utf-16-le') + b'\x00\x00'
+    p = bytearray([GameClientPacket.AUTH_LOGIN]) + name.encode('utf-16-le') + b'\x00\x00'
     p += struct.pack("<IIII", pk2, pk1, lk1, lk2)
     return pack(p)
 
 
 def build_character_select(slot: int) -> bytes:
-    p = bytearray([0x0D]) + struct.pack("<I", slot)
+    p = bytearray([GameClientPacket.CHARACTER_SELECT]) + struct.pack("<I", slot)
     p += struct.pack("<H", 0) + struct.pack("<III", 0, 0, 0)
     return pack(p)
 
 
 def build_enter_world() -> bytes:
-    p = bytearray([0x03]) + b'\x00' * 32 + struct.pack("<IIII", 0, 0, 0, 0)
+    p = bytearray([GameClientPacket.ENTER_WORLD]) + b'\x00' * 32 + struct.pack("<IIII", 0, 0, 0, 0)
     p += b'\x00' * 32 + struct.pack("<I", 0) + b'\x00' * 20
     return pack(p)
 
 
 def build_request_skill_cool_time() -> bytes:
     """RequestSkillCoolTime (0x9D): ask the server for a SkillCoolTime (0xC1) answer."""
-    return pack(bytearray([0x9D]))
+    return pack(bytearray([GameClientPacket.REQUEST_SKILL_COOL_TIME]))
 
 
 def build_net_ping(pid: int) -> bytes:
-    return pack(bytearray([0xA8]) + struct.pack("<I", pid))
+    return pack(bytearray([GameClientPacket.NET_PING]) + struct.pack("<I", pid))
+
+
+def build_game_guard_reply() -> bytes:
+    """GameGuardReply (0xCA): answer to the server's GameGuardQuery (0xF9)."""
+    return pack(bytearray([GameClientPacket.GAME_GUARD_REPLY]) + struct.pack("<I", 0))
 
 
 def build_move_to_location(tx: int, ty: int, tz: int,
                            ox: int, oy: int, oz: int, mode: int = 1) -> bytes:
-    return pack(bytearray([0x01]) + struct.pack("<iiiiiii", tx, ty, tz, ox, oy, oz, mode))
+    return pack(bytearray([GameClientPacket.MOVE_TO_LOCATION]) + struct.pack("<iiiiiii", tx, ty, tz, ox, oy, oz, mode))
 
 
 def build_say2(msg: str, chat_type: int = 0, target: str = "") -> bytes:
-    p = bytearray([0x38])
+    p = bytearray([GameClientPacket.SAY2])
     p += msg.encode('utf-16-le') + b'\x00\x00'
     p += struct.pack("<I", chat_type)
     if chat_type == 2 and target:
@@ -154,7 +252,7 @@ def build_action(target_obj_id: int, x: int, y: int, z: int, shift_click: bool =
 
     Format: c dddd c
     """
-    p = bytearray([0x04])
+    p = bytearray([GameClientPacket.ACTION])
     p += struct.pack("<iiii", target_obj_id, x, y, z)
     p += struct.pack("<B", 1 if shift_click else 0)
     return pack(p)
@@ -166,7 +264,7 @@ def build_attack_request(target_obj_id: int, x: int, y: int, z: int, shift_click
 
     Format: c dddd c
     """
-    p = bytearray([0x0A])
+    p = bytearray([GameClientPacket.ATTACK_REQUEST])
     p += struct.pack("<iiii", target_obj_id, x, y, z)
     p += struct.pack("<B", 1 if shift_click else 0)
     return pack(p)
@@ -178,7 +276,7 @@ def build_use_skill(skill_id: int, ctrl_pressed: bool = False, shift_pressed: bo
 
     Format: c ii B  (skillId int, ctrlPressed int, shiftPressed byte)
     """
-    p = bytearray([0x2F])
+    p = bytearray([GameClientPacket.REQUEST_MAGIC_SKILL_USE])
     p += struct.pack("<iiB", skill_id, 1 if ctrl_pressed else 0, 1 if shift_pressed else 0)
     return pack(p)
 
@@ -189,7 +287,7 @@ def build_use_item(object_id: int, ctrl_pressed: bool = False) -> bytes:
 
     Format: c ii  (objectId int, ctrlPressed int)
     """
-    p = bytearray([0x14])
+    p = bytearray([GameClientPacket.USE_ITEM])
     p += struct.pack("<ii", object_id, 1 if ctrl_pressed else 0)
     return pack(p)
 
@@ -201,7 +299,7 @@ def build_request_restart_point(requested_point_type: int = 0) -> bytes:
     Point types: 0 = town (default), 1 = clan hall, 2 = castle, 27 = jail.
     Format: c i
     """
-    p = bytearray([0x6D])
+    p = bytearray([GameClientPacket.REQUEST_RESTART_POINT])
     p += struct.pack("<i", requested_point_type)
     return pack(p)
 
@@ -213,7 +311,7 @@ def build_dlg_answer(message_id: int, answer: int, requester_id: int = 0) -> byt
     Used for accepting/rejecting resurrection, summons, etc.
     Format: c iii
     """
-    p = bytearray([0xC5])
+    p = bytearray([GameClientPacket.DLG_ANSWER])
     p += struct.pack("<iii", message_id, answer, requester_id)
     return pack(p)
 
@@ -224,8 +322,8 @@ def build_auto_soulshot(item_id: int, enable: bool = True) -> bytes:
 
     Format: D0 (H)05 dd
     """
-    p = bytearray([0xD0])
-    p += struct.pack("<H", 0x05)  # sub-opcode
+    p = bytearray([GameClientPacket.EX_PACKET])
+    p += struct.pack("<H", GameClientExPacket.REQUEST_AUTO_SOUL_SHOT)
     p += struct.pack("<ii", item_id, 1 if enable else 0)
     return pack(p)
 
@@ -577,7 +675,7 @@ def parse_die(body: bytes) -> dict:
 
 
 def parse_delete_object(body: bytes) -> dict:
-    """Parse DeleteObject (0x08) packet."""
+    """Parse DeleteObject (0x12) packet."""
     if len(body) < 5:
         return {}
     return {

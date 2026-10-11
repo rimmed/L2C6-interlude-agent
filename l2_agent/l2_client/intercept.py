@@ -26,18 +26,20 @@ SOFTWARE.
 
 USAGE
 
-Start the proxy **before** launching the game client::
+Start the proxy **before** launching the game client (from ``l2_agent/``)::
 
-    uv run intercept.py
+    uv run l2_client/intercept.py
 
 The proxy listens on two ports:
 
-* ``:2106`` -- login server relay -> ``192.168.1.200:2106``
-* ``:7776`` -- game server relay -> ``192.168.1.200:7777``
+* ``:2106`` -- login server relay -> ``127.0.0.1:2106``
+* ``:7776`` -- game server relay -> ``127.0.0.1:7777``
 
 Configure your game client (or ``l2.ini`` / hosts file) to connect to
 ``127.0.0.1`` instead of the real server.  Every packet passing through is
-printed with its opcode and direction (C->S or S->C).
+printed with its direction (C->S or S->C) and, for the game server, its name
+from the opcode enums in :mod:`l2_client.packets`.  Login server traffic is
+Blowfish-encrypted, so its packets are only printed with their size.
 
 COMMANDS
 --------
@@ -75,110 +77,82 @@ Edit the constants at the top of this file:
 import select
 import socket
 import struct
+import sys
 import threading
 import time
+from enum import IntEnum
+from pathlib import Path
+
+if __package__:
+    from . import packets
+else:
+    # Run as a script (``uv run l2_client/intercept.py``): make ``l2_client`` importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from l2_client import packets
 
 # --- CONFIGURATION -------------------------------------------------------
 
 LOGIN_LOCAL_PORT  = 2106
-LOGIN_REMOTE_HOST = "192.168.1.200"
+LOGIN_REMOTE_HOST = "127.0.0.1"
 LOGIN_REMOTE_PORT = 2106
 
 GAME_LOCAL_PORT   = 7776
-GAME_REMOTE_HOST  = "192.168.1.200"
+GAME_REMOTE_HOST  = "127.0.0.1"
 GAME_REMOTE_PORT  = 7777
 
 BUFFER_SIZE = 65536
 
-# --- Packet names (from packets.py) -------------------------------------
+# --- Packet dump -------------------------------------------------------
 
-PACKET_NAMES_S2C = {
-    0x00: "KeyPacket",    0x01: "MoveToLoc",    0x03: "CharInfo",
-    0x04: "UserInfo",     0x05: "Attack",       0x06: "Die",
-    0x08: "DeleteObject", 0x0B: "SpawnItem",    0x0C: "DropItem",
-    0x0D: "GetItem",      0x0E: "StatusUpd",    0x13: "CharSelInfo",
-    0x14: "LoginFail",    0x15: "CharSelected", 0x16: "NpcInfo",
-    0x1B: "ItemList",     0x1C: "Sunrise",      0x1D: "Sunset",
-    0x26: "ServerClose",  0x27: "InvUpdate",    0x4A: "CreatureSay",
-    0x58: "SkillList",    0x64: "SysMsg",       0x7F: "AbnormalSt",
-    0x80: "QuestList",    0xA8: "NetPing",      0xC1: "SkillCool",
-    0xF3: "EtcStatus",    0xF9: "GGQuery",      0xFE: "ExPacket",
-}
-
-PACKET_NAMES_C2S = {
-    0x00: "ProtoVersion",  0x01: "MoveToLoc",     0x03: "EnterWorld",
-    0x04: "Action",        0x05: "ServerList",     0x07: "GameGuard",
-    0x08: "AuthLoginGS",   0x0A: "AttackRequest",  0x0D: "CharSelect",
-    0x38: "Say2",          0x56: "RequestActionUse", 0xA8: "NetPing",
-    0xF9: "GGReply",
-}
-
-# --- Packet helpers ------------------------------------------------------
-
-def pack(payload: bytearray) -> bytes:
-    """Prepend 2-byte little-endian length header."""
-    return struct.pack("<H", len(payload) + 2) + bytes(payload)
+def _packet_name(opcodes: type[IntEnum], pid: int) -> str:
+    """Name of opcode *pid* in *opcodes*, or its hex value when the enum does not know it."""
+    try:
+        return opcodes(pid).name
+    except ValueError:
+        return f"0x{pid:02X}"
 
 
-def build_say2_packet(message: str, chat_type: int = 0) -> bytes:
-    """Build a Say2 (0x38) packet."""
-    p = bytearray([0x38])
-    p += message.encode("utf-16-le") + b"\x00\x00"
-    p += struct.pack("<I", chat_type)
-    return pack(p)
+def _dump_packets(data: bytes, label: str, direction: str, opcodes: type[IntEnum] | None):
+    """
+    Print every complete packet in *data*.
 
-
-def build_move_packet(tx: int, ty: int, tz: int,
-                      ox: int, oy: int, oz: int, mode: int = 1) -> bytes:
-    """Build a MoveToLocation (0x01) packet."""
-    p = bytearray([0x01])
-    p += struct.pack("<iiiiiii", tx, ty, tz, ox, oy, oz, mode)
-    return pack(p)
-
-
-def build_action_packet(target_obj_id: int, x: int, y: int, z: int, shift: int = 0) -> bytes:
-    """Build an Action (0x04) packet."""
-    p = bytearray([0x04])
-    p += struct.pack("<iiiiB", target_obj_id, x, y, z, shift)
-    return pack(p)
-
-
-def build_attack_packet(target_obj_id: int, x: int, y: int, z: int, shift: int = 0) -> bytes:
-    """Build an AttackRequest (0x0A) packet."""
-    p = bytearray([0x0A])
-    p += struct.pack("<iiiiB", target_obj_id, x, y, z, shift)
-    return pack(p)
+    :param opcodes: opcode enum of this direction, or ``None`` for encrypted traffic, whose
+        first body byte is ciphertext rather than an opcode
+    """
+    while len(data) >= 2:
+        sz = struct.unpack_from("<H", data)[0]
+        if sz < 2 or len(data) < sz:
+            break
+        body = data[2:sz]
+        if opcodes is None:
+            name = "(encrypted)"
+        else:
+            name = _packet_name(opcodes, body[0]) if body else "(empty)"
+        print(f"[RELAY {label}] {direction} {name}  {sz}B")
+        data = data[sz:]
 
 
 # --- RELAY ---------------------------------------------------------------
 
-def relay(src: socket.socket, dst: socket.socket, label: str, names: dict):
+def relay(src: socket.socket, dst: socket.socket, label: str,
+          c2s_opcodes: type[IntEnum] | None, s2c_opcodes: type[IntEnum] | None):
     """
-    Bidirectional copier.  On the C->S link, *name* may be replaced by
-    ``inject_queue`` to let the command thread push data.
+    Bidirectional copier between client *src* and server *dst* that dumps every packet.
+
+    :param c2s_opcodes: opcode enum for client -> server packets (``None`` = encrypted)
+    :param s2c_opcodes: opcode enum for server -> client packets (``None`` = encrypted)
     """
 
-    def copy_one_way(reader, writer, direction):
+    def copy_one_way(reader, writer, direction, opcodes):
         try:
             data = reader.recv(BUFFER_SIZE)
         except Exception:
             return False
         if not data:
             return False
-
-        # -- packet dump --
-        while len(data) >= 2:
-            sz = struct.unpack_from("<H", data)[0]
-            if len(data) < sz:
-                break
-            body = data[2:sz]
-            pid = body[0] if body else 0
-            name = names.get(pid, f"0x{pid:02X}")
-            print(f"[RELAY {label}] {direction} {name}  {sz}B")
-            data = data[sz:]
-
+        _dump_packets(data, label, direction, opcodes)
         try:
-            writer.sendall(dst)
+            writer.sendall(data)
         except Exception:
             return False
         return True
@@ -186,10 +160,10 @@ def relay(src: socket.socket, dst: socket.socket, label: str, names: dict):
     while True:
         r, _, _ = select.select([src, dst], [], [], 1.0)
         if src in r:
-            if not copy_one_way(src, dst, "C->S"):
+            if not copy_one_way(src, dst, "C->S", c2s_opcodes):
                 break
         if dst in r:
-            if not copy_one_way(dst, src, "S->C"):
+            if not copy_one_way(dst, src, "S->C", s2c_opcodes):
                 break
 
     print(f"[RELAY {label}]  Connection closed")
@@ -211,7 +185,8 @@ def login_listener():
         remote = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         remote.connect((LOGIN_REMOTE_HOST, LOGIN_REMOTE_PORT))
         print("[RELAY LOGIN]  Connected to remote")
-        threading.Thread(target=relay, args=(client, remote, "LOGIN", PACKET_NAMES_C2S), daemon=True).start()
+        # Login traffic is Blowfish-encrypted end to end, so no opcode can be read from it here.
+        threading.Thread(target=relay, args=(client, remote, "LOGIN", None, None), daemon=True).start()
 
 
 # --- Game listener (with injection support) -----------------------------
@@ -251,17 +226,7 @@ def _relay_with_inject(client: socket.socket, server_side: socket.socket):
                 break
             if not data:
                 break
-            # dump
-            buf = data
-            while len(buf) >= 2:
-                sz = struct.unpack_from("<H", buf)[0]
-                if len(buf) < sz:
-                    break
-                body = buf[2:sz]
-                pid = body[0] if body else 0
-                name = PACKET_NAMES_C2S.get(pid, f"0x{pid:02X}")
-                print(f"[RELAY GAME] C->S {name}  {sz}B")
-                buf = buf[sz:]
+            _dump_packets(data, "GAME", "C->S", packets.GameClientPacket)
             try:
                 server_side.sendall(data)
             except Exception:
@@ -273,16 +238,7 @@ def _relay_with_inject(client: socket.socket, server_side: socket.socket):
                 break
             if not data:
                 break
-            buf = data
-            while len(buf) >= 2:
-                sz = struct.unpack_from("<H", buf)[0]
-                if len(buf) < sz:
-                    break
-                body = buf[2:sz]
-                pid = body[0] if body else 0
-                name = PACKET_NAMES_S2C.get(pid, f"0x{pid:02X}")
-                print(f"[RELAY GAME] S->C {name}  {sz}B")
-                buf = buf[sz:]
+            _dump_packets(data, "GAME", "S->C", packets.GameServerPacket)
             try:
                 client.sendall(data)
             except Exception:
@@ -365,7 +321,7 @@ def command_loop():
                 if not msg:
                     print("[CMD]  Usage: say <message>")
                     continue
-                pkt = build_say2_packet(msg)
+                pkt = packets.build_say2(msg)
                 inject_raw_data(pkt)
 
             elif cmd == "move":
@@ -373,7 +329,7 @@ def command_loop():
                     print("[CMD]  Usage: move <x> <y> <z>")
                     continue
                 tx, ty, tz = parse_coords(" ".join(parts[1:4]))
-                pkt = build_move_packet(tx, ty, tz, cur_x, cur_y, cur_z, mode=1)
+                pkt = packets.build_move_to_location(tx, ty, tz, cur_x, cur_y, cur_z, mode=1)
                 inject_raw_data(pkt)
                 cur_x, cur_y, cur_z = tx, ty, tz
 
@@ -392,7 +348,7 @@ def command_loop():
                         x, y, z = cur_x, cur_y, cur_z
                 else:
                     x, y, z = cur_x, cur_y, cur_z
-                pkt = build_attack_packet(target_id, x, y, z, shift=1 if shift else 0)
+                pkt = packets.build_attack_request(target_id, x, y, z, shift_click=shift)
                 inject_raw_data(pkt)
 
             elif cmd == "pickup" or cmd == "p":
@@ -404,7 +360,7 @@ def command_loop():
                     x, y, z = parse_coords(" ".join(parts[2:5]))
                 else:
                     x, y, z = cur_x, cur_y, cur_z
-                pkt = build_action_packet(target_id, x, y, z, shift=0)
+                pkt = packets.build_action(target_id, x, y, z, shift_click=False)
                 inject_raw_data(pkt)
 
             else:

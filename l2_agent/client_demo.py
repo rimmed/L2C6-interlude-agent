@@ -2,6 +2,7 @@
 # L2J Mobius Interlude client bot -- connects, enters world, reads full character data.
 
 
+import argparse
 import random
 import socket
 import struct
@@ -9,6 +10,7 @@ import time
 
 from l2_client import crypto, packets
 from l2_client.character import L2Character
+from l2_client.packets import GameServerPacket, LoginServerPacket
 from l2_client.tools.data import item_data, npc_data, skill_data
 
 # --- CONFIGURATION ---
@@ -18,6 +20,13 @@ ACCOUNT_LOGIN = ""
 ACCOUNT_PASSWORD = ""
 SERVER_ID = 0
 CHAR_SLOT = 0
+
+# --- MODEL MODE (--model) ---
+HEALING_POTION_ID = 1061
+MODEL_ATTACK_REPEAT_S = 1.5    # don't re-send AttackRequest on the same target more often than this
+MODEL_APPROACH_RANGE = 100     # "moved" walks to the target only when farther than this
+MODEL_ROAM_STEP = 400          # "moved" with nothing to walk to: random step of up to this many units
+MODEL_COOLDOWN_SYNC_S = 1.0    # RequestSkillCoolTime at most this often while a skill cools down
 
 
 def _print_buffs(char: L2Character):
@@ -37,7 +46,7 @@ def _print_buffs(char: L2Character):
 
 def login_server_flow(sock: socket.socket):
     di = crypto.decrypt_init_packet(crypto.recv_packet(sock), crypto.L2MOBIUS_STATIC_KEY)
-    assert di[0] == 0x00
+    assert di[0] == LoginServerPacket.INIT
     sid = struct.unpack_from("<I", di, 1)[0]
     rm = bytearray(di[9:9 + 128])
     crypto.unscramble_modulus(rm)
@@ -48,15 +57,15 @@ def login_server_flow(sock: socket.socket):
     print("[LS]  GGAuth OK")
     crypto.send_encrypted(sock, packets.build_request_auth_login(ACCOUNT_LOGIN, ACCOUNT_PASSWORD, sid, rm), dk)
     dr = crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
-    if dr[0] == 0x01:
+    if dr[0] == LoginServerPacket.LOGIN_FAIL:
         raise RuntimeError(f"Login failed: {dr[1]}")
-    assert dr[0] == 0x03
+    assert dr[0] == LoginServerPacket.LOGIN_OK
     l1 = struct.unpack_from("<I", dr, 1)[0]
     l2 = struct.unpack_from("<I", dr, 5)[0]
     print("[LS]  LoginOk!")
     crypto.send_encrypted(sock, packets.build_request_server_list(l1, l2), dk)
     ds = crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
-    assert ds[0] == 0x04
+    assert ds[0] == LoginServerPacket.SERVER_LIST
     sc = ds[1]
     pos = 3
     servers = []
@@ -70,18 +79,119 @@ def login_server_flow(sock: socket.socket):
     print(f"[LS]  Selected: {ch['ip']}:{ch['port']}")
     crypto.send_encrypted(sock, packets.build_request_server_login(l1, l2, ch['id']), dk)
     dp = crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
-    assert dp[0] == 0x07
+    assert dp[0] == LoginServerPacket.PLAY_OK
     p1 = struct.unpack_from("<I", dp, 1)[0]
     p2 = struct.unpack_from("<I", dp, 5)[0]
     print("[LS]  PlayOk!")
     return (p1, p2, ch['ip'], ch['port'], ACCOUNT_LOGIN, l1, l2)
 
 
+# -- Model mode: decision executor --
+
+def _execute_model_decision(gs: socket.socket, char: L2Character, policy, decision,
+                            current_target_id: int, pending_loot: list[dict],
+                            cur_x: int, cur_y: int, cur_z: int,
+                            attack_memo: dict) -> tuple[int, int, int]:
+    """
+    Turn a :class:`l2_client.policy.Decision` into game packets.
+
+    :param attack_memo: last AttackRequest (``target``/``at``) and pickup (``loot``/``loot_at``), used
+        to avoid re-sending them on every tick (the model predicts ``attacked`` for every swing)
+    :returns: updated ``(current_target_id, cur_x, cur_y)``
+    """
+    now = time.time()
+    radar = char.radar.entries
+    target_alive = bool(current_target_id) and current_target_id in radar
+    mob_id = decision.mob_object_id
+    action = decision.action
+
+    def select(oid: int) -> int:
+        mob = radar[oid]
+        print(f"[MODEL] -> Select target: '{mob['name']}' lvl {mob['level']} objId={oid}")
+        crypto.send_raw(gs, packets.build_action(oid, cur_x, cur_y, cur_z, shift_click=False))
+        return oid
+
+    if action == "selected_target" and mob_id is not None:
+        if mob_id != current_target_id:
+            current_target_id = select(mob_id)
+        elif attack_memo.get("target") != mob_id or now - attack_memo.get("at", 0.0) >= MODEL_ATTACK_REPEAT_S:
+            # A click on the already selected monster is an attack in L2 - that is what the logged
+            # mid-fight "selected_target" rows are.
+            print(f"[MODEL] -> Action (attack) on selected target {mob_id}")
+            crypto.send_raw(gs, packets.build_action(mob_id, cur_x, cur_y, cur_z, shift_click=False))
+            attack_memo.update(target=mob_id, at=now)
+            policy.note_combat(now)
+
+    elif action == "attacked":
+        target = current_target_id if target_alive else mob_id
+        if target is not None:
+            repeat = attack_memo.get("target") == target and now - attack_memo.get("at", 0.0) < MODEL_ATTACK_REPEAT_S
+            if not repeat:
+                print(f"[MODEL] -> AttackRequest on {target}")
+                crypto.send_raw(gs, packets.build_attack_request(target, cur_x, cur_y, cur_z))
+                attack_memo.update(target=target, at=now)
+            policy.note_combat(now)
+            current_target_id = target
+
+    elif action == "used_skill" and decision.skill_id is not None:
+        if not target_alive and mob_id is not None:
+            current_target_id = select(mob_id)  # a skill needs a selected target
+        name = skill_data.get_skill_name(decision.skill_id) or "?"
+        print(f"[MODEL] -> UseSkill {name} (id={decision.skill_id}) on {current_target_id}")
+        crypto.send_raw(gs, packets.build_use_skill(decision.skill_id, ctrl_pressed=True))
+        policy.note_skill_used(decision.skill_id, now)
+        policy.note_combat(now)
+        crypto.send_raw(gs, packets.build_request_skill_cool_time())
+
+    elif action == "picked_up" and pending_loot:
+        # Action on an item makes the server walk there and pick it up (the logged pickups are
+        # "select item" + "pickup" for that reason); the entry leaves the queue on DeleteObject.
+        nearest = min(pending_loot, key=lambda si: (cur_x - si["x"]) ** 2 + (cur_y - si["y"]) ** 2)
+        if attack_memo.get("loot") != nearest["object_id"] or now - attack_memo.get("loot_at", 0.0) > 2.0:
+            iname = item_data.get_item_name(nearest["item_id"])
+            print(f"[MODEL] -> Pickup loot: {iname} ({nearest['item_id']}) x{nearest['count']}")
+            crypto.send_raw(gs, packets.build_action(
+                nearest["object_id"], nearest["x"], nearest["y"], nearest["z"], shift_click=False))
+            attack_memo.update(loot=nearest["object_id"], loot_at=now)
+
+    elif action == "used_item":
+        potion = next((i for i in char.items if i["item_id"] == HEALING_POTION_ID and i["count"] > 0), None)
+        if potion:
+            print(f"[MODEL] -> UseItem: {item_data.get_item_name(HEALING_POTION_ID)} "
+                  f"HP {char.cur_hp:.0f}/{char.max_hp}")
+            crypto.send_raw(gs, packets.build_use_item(potion["object_id"]))
+
+    elif action == "moved":
+        goal_id = current_target_id if target_alive else mob_id
+        goal = radar.get(goal_id) if goal_id is not None else None
+        if goal and ((cur_x - goal["x"]) ** 2 + (cur_y - goal["y"]) ** 2) ** 0.5 > MODEL_APPROACH_RANGE:
+            crypto.send_raw(gs, packets.build_move_to_location(
+                goal["x"], goal["y"], goal["z"], cur_x, cur_y, cur_z, 1))
+            cur_x, cur_y = goal["x"], goal["y"]
+        elif not goal:
+            dx = random.randint(-MODEL_ROAM_STEP, MODEL_ROAM_STEP)
+            dy = random.randint(-MODEL_ROAM_STEP, MODEL_ROAM_STEP)
+            crypto.send_raw(gs, packets.build_move_to_location(
+                cur_x + dx, cur_y + dy, cur_z, cur_x, cur_y, cur_z, 1))
+            cur_x += dx
+            cur_y += dy
+
+    return current_target_id, cur_x, cur_y
+
+
 # -- GS flow --
 
 def game_server_flow(ip: str, port: int, login_name: str,
                      play_ok1: int, play_ok2: int,
-                     login_ok1: int, login_ok2: int):
+                     login_ok1: int, login_ok2: int,
+                     policy=None, decision_interval: float = 0.5):
+    """
+    Enter the world and run the combat loop.
+
+    :param policy: a :class:`l2_client.policy.CombatPolicy`; when given, the neural model decides
+        every combat action instead of the scripted state machine
+    :param decision_interval: seconds between two model decisions
+    """
     gs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     gs.settimeout(60.0)
     try:
@@ -90,16 +200,16 @@ def game_server_flow(ip: str, port: int, login_name: str,
 
         crypto.send_raw(gs, packets.build_proto_version(746))
         kp = crypto.recv_packet(gs)
-        assert kp[0] == 0x00
+        assert kp[0] == GameServerPacket.KEY_PACKET
         print(f"[GS]  KeyPacket: key={bytes(kp[2:10]).hex()}")
 
         crypto.send_raw(gs, packets.build_auth_login_gs(login_name, play_ok2, play_ok1, login_ok1, login_ok2))
         print("[GS]  AuthLogin sent")
 
         csi = bytearray(crypto.recv_packet(gs))
-        if csi[0] == 0x14:
+        if csi[0] == GameServerPacket.LOGIN_FAIL:
             raise RuntimeError(f"GS Auth failed, reason: {csi[1]}")
-        assert csi[0] == 0x13
+        assert csi[0] == GameServerPacket.CHAR_SELECT_INFO
         cc = struct.unpack_from("<I", csi, 1)[0]
         print(f"[GS]  Characters: {cc}")
         if cc == 0:
@@ -131,7 +241,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
 
         print(f"[GS] Selecting character slot {CHAR_SLOT}...")
         crypto.send_raw(gs, packets.build_character_select(CHAR_SLOT))
-        assert crypto.recv_packet(gs)[0] == 0x15
+        assert crypto.recv_packet(gs)[0] == GameServerPacket.CHAR_SELECTED
         print("[GS]  CharSelected OK")
 
         print("[GS] Sending EnterWorld...")
@@ -167,6 +277,11 @@ def game_server_flow(ip: str, port: int, login_name: str,
         char_dead_since: float = 0.0   # timestamp when character died
         asked_for_help: bool = False   # True once help message was sent after death
 
+        # -- Model mode state --
+        last_decision = 0.0
+        last_cooldown_sync = 0.0
+        attack_memo: dict = {}
+
         while True:
             try:
                 if not data_dump_printed:
@@ -181,7 +296,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
 
                 # -- Data-collection phase --
                 if not data_dump_printed:
-                    if pid == 0x04:  # UserInfo
+                    if pid == GameServerPacket.USER_INFO:
                         ui = packets.parse_user_info(body)
                         char.apply_user_info(ui)
                         received_user_info = True
@@ -194,49 +309,49 @@ def game_server_flow(ip: str, port: int, login_name: str,
                               f"SP {char.sp} "
                               f"pos ({cur_x},{cur_y},{cur_z})")
 
-                    elif pid == 0x1B:  # ItemList
+                    elif pid == GameServerPacket.ITEM_LIST:
                         char.apply_item_list(packets.parse_item_list(body))
                         received_item_list = True
                         print(f"[GS]  <- ItemList parsed: {len(char.items)} items")
 
-                    elif pid == 0x58:  # SkillList
+                    elif pid == GameServerPacket.SKILL_LIST:
                         char.apply_skill_list(packets.parse_skill_list(body))
                         received_skill_list = True
                         print(f"[GS]  <- SkillList parsed: {len(char.skills)} skills")
 
-                    elif pid == 0xF3:  # EtcStatusUpdate
+                    elif pid == GameServerPacket.ETC_STATUS_UPDATE:
                         char.apply_etc_status_update(packets.parse_etc_status_update(body))
                         received_etc_status = True
                         print(f"[GS]  <- EtcStatusUpdate parsed: "
                               f"charges={char.charges} "
                               f"weight_penalty={char.weight_penalty}")
 
-                    elif pid == 0x0E:  # StatusUpdate
+                    elif pid == GameServerPacket.STATUS_UPDATE:
                         su = packets.parse_status_update(body)
                         char.apply_status_update(su)
                         char.radar.update_from_status(su)
 
-                    elif pid == 0x16:  # NpcInfo
+                    elif pid == GameServerPacket.NPC_INFO:
                         npc = packets.parse_npc_info(body)
                         char.radar.add_or_update(npc)
 
-                    elif pid == 0x06:  # Die
+                    elif pid == GameServerPacket.DIE:
                         die = packets.parse_die(body)
                         if die:
                             char.radar.remove(die["object_id"])
 
-                    elif pid == 0x08:  # DeleteObject
+                    elif pid == GameServerPacket.DELETE_OBJECT:
                         do = packets.parse_delete_object(body)
                         if do:
                             char.radar.remove(do["object_id"])
 
-                    elif pid == 0x7F:  # AbnormalStatusUpdate -- buffs
+                    elif pid == GameServerPacket.ABNORMAL_STATUS_UPDATE:  # buffs
                         ab = packets.parse_abnormal_status_update(body)
                         char.apply_abnormal_status_update(ab)
                         received_buffs = True
                         _print_buffs(char)
 
-                    elif pid == 0x0B:  # SpawnItem -- queue for pickup
+                    elif pid == GameServerPacket.SPAWN_ITEM:  # queue for pickup
                         si = packets.parse_spawn_item(body)
                         if si:
                             pending_loot.append(si)
@@ -245,7 +360,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
                                   f"x{si['count']} objId={si['object_id']} "
                                   f"(queued #{len(pending_loot)})")
 
-                    elif pid == 0x0C:  # DropItem -- queue for pickup
+                    elif pid == GameServerPacket.DROP_ITEM:  # queue for pickup
                         di = packets.parse_drop_item(body)
                         if di:
                             pending_loot.append(di)
@@ -254,23 +369,17 @@ def game_server_flow(ip: str, port: int, login_name: str,
                                   f"x{di['count']} objId={di['object_id']} "
                                   f"(queued #{len(pending_loot)})")
 
-                    elif pid == 0x0D:  # GetItem -- loot confirmation
+                    elif pid == GameServerPacket.GET_ITEM:  # loot confirmation
                         if len(body) >= 13:
                             picker_id = struct.unpack_from("<i", body, 1)[0]
                             item_id = struct.unpack_from("<i", body, 5)[0]
                             iname = item_data.get_item_name(item_id)
                             print(f"[GS]  <- GetItem: picker={picker_id} {iname} ({item_id})")
 
-                    elif pid == 0xA8:  # NetPing
-                        crypto.send_raw(gs, packets.build_net_ping(struct.unpack_from("<I", body, 1)[0]))
-                        ping_counter += 1
-                        last_ping = time.time()
+                    elif pid == GameServerPacket.GAME_GUARD_QUERY:
+                        crypto.send_raw(gs, packets.build_game_guard_reply())
 
-                    elif pid == 0xF9:  # GameGuard
-                        gg = bytearray([0xCA]) + struct.pack("<I", 0)
-                        crypto.send_raw(gs, packets.pack(gg))
-
-                    elif pid == 0x26:  # ServerClose
+                    elif pid == GameServerPacket.SERVER_CLOSE:
                         print("[GS]  [!] Server closing!")
                         break
 
@@ -292,24 +401,33 @@ def game_server_flow(ip: str, port: int, login_name: str,
                                      if i["item_id"] in char.ALL_SOULSHOT_IDS and i["count"] > 0]
                         print(f"[GS]  [*] Soulshots in inv: {ss_in_inv}")
                         char.enable_auto_soulshot(gs)
+                        if policy is not None:
+                            policy.bind_character(char)
                         print("\n[GS]  -- Game loop started --\n")
                     continue
 
                 # -- Post-collection: game loop --
 
-                if pid == 0x04 and len(body) >= 13:  # UserInfo update
+                if pid == GameServerPacket.USER_INFO and len(body) >= 13:  # position update
                     cur_x = struct.unpack_from("<i", body, 1)[0]
                     cur_y = struct.unpack_from("<i", body, 5)[0]
                     cur_z = struct.unpack_from("<i", body, 9)[0]
                     char.x, char.y, char.z = cur_x, cur_y, cur_z
                     got_coords = True
-                elif pid == 0x16:  # NpcInfo
+                    if policy is not None:
+                        # The model needs live HP/MP/CP and speeds, not just the coordinates.
+                        char.apply_user_info(packets.parse_user_info(body))
+                elif pid == GameServerPacket.NPC_INFO:
                     npc = packets.parse_npc_info(body)
                     char.radar.add_or_update(npc)
-                elif pid == 0x0E:  # StatusUpdate
+                elif pid == GameServerPacket.STATUS_UPDATE:
                     su = packets.parse_status_update(body)
                     char.radar.update_from_status(su)
-                elif pid == 0x06:  # Die
+                    if policy is not None:
+                        policy.update_self_status(char, su)
+                elif pid == GameServerPacket.SKILL_COOL_TIME and policy is not None:  # real cooldowns
+                    policy.apply_skill_cool_time(packets.parse_skill_cool_time(body))
+                elif pid == GameServerPacket.DIE:
                     die = packets.parse_die(body)
                     if die:
                         oid = die["object_id"]
@@ -327,6 +445,8 @@ def game_server_flow(ip: str, port: int, login_name: str,
                             last_action = time.time()
                         elif oid == current_target_id:
                             print(f"[GS]  <- Die: target {current_target_id} killed!")
+                            if policy is not None:
+                                policy.record_event(char, current_target_id, (cur_x, cur_y))
                             current_target_id = 0
                             state = "LOOTING"
                             looting_since = time.time()
@@ -345,7 +465,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
                             if kills >= MAX_KILLS:
                                 print(f"[GS]  [DONE] Reached {MAX_KILLS} kills -- stopping")
                                 return
-                elif pid == 0x08:  # DeleteObject
+                elif pid == GameServerPacket.DELETE_OBJECT:
                     do = packets.parse_delete_object(body)
                     if do:
                         oid = do["object_id"]
@@ -353,10 +473,14 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         if oid == current_target_id:
                             current_target_id = 0
                             state = "IDLE"
-                elif pid == 0x7F:  # AbnormalStatusUpdate -- buffs
+                        if policy is not None:
+                            # Picked up (by anyone) or despawned: stale loot would keep the model's
+                            # session open and its pickup choice valid forever.
+                            pending_loot[:] = [si for si in pending_loot if si["object_id"] != oid]
+                elif pid == GameServerPacket.ABNORMAL_STATUS_UPDATE:  # buffs
                     ab = packets.parse_abnormal_status_update(body)
                     char.apply_abnormal_status_update(ab)
-                elif pid == 0x0B:  # SpawnItem -- queue for pickup
+                elif pid == GameServerPacket.SPAWN_ITEM:  # queue for pickup
                     si = packets.parse_spawn_item(body)
                     if si:
                         pending_loot.append(si)
@@ -364,7 +488,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         print(f"[GS]  <- SpawnItem: {iname} ({si['item_id']}) "
                               f"x{si['count']} objId={si['object_id']} "
                               f"(queued #{len(pending_loot)})")
-                elif pid == 0x0C:  # DropItem -- queue for pickup
+                elif pid == GameServerPacket.DROP_ITEM:  # queue for pickup
                     di = packets.parse_drop_item(body)
                     if di:
                         pending_loot.append(di)
@@ -372,24 +496,22 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         print(f"[GS]  <- DropItem: {iname} ({di['item_id']}) "
                               f"x{di['count']} objId={di['object_id']} "
                               f"(queued #{len(pending_loot)})")
-                elif pid == 0x0D:  # GetItem -- loot confirmation
+                elif pid == GameServerPacket.GET_ITEM:  # loot confirmation
                     if len(body) >= 13:
                         item_id = struct.unpack_from("<i", body, 5)[0]
                         iname = item_data.get_item_name(item_id)
                         print(f"[GS]  <- GetItem: {iname} ({item_id}) collected")
 
-                # Protocol handlers
-                if pid == 0xA8:
-                    crypto.send_raw(gs, packets.build_net_ping(struct.unpack_from("<I", body, 1)[0]))
-                elif pid == 0x26:
+                # Protocol handlers.  Keep-alive is our own RequestNetPing every 5 s below; the server's
+                # NetPing (0xD3) is only the answer to it and must not be answered again.
+                if pid == GameServerPacket.SERVER_CLOSE:
                     print("[GS]  [!] Server closing!"); break
-                elif pid == 0xF9:
-                    gg = bytearray([0xCA]) + struct.pack("<I", 0)
-                    crypto.send_raw(gs, packets.pack(gg))
-                elif pid == 0x4A:
+                elif pid == GameServerPacket.GAME_GUARD_QUERY:
+                    crypto.send_raw(gs, packets.build_game_guard_reply())
+                elif pid == GameServerPacket.CREATURE_SAY:
                     name, msg = packets.parse_creature_say(body)
                     print(f"[GS]      [{name}]: {msg}")
-                elif pid == 0x64 and len(body) >= 13:
+                elif pid == GameServerPacket.SYSTEM_MESSAGE and len(body) >= 13:
                     # SysMsg damage log
                     msg_id = struct.unpack_from("<I", body, 1)[0]
                     param_count = struct.unpack_from("<I", body, 5)[0]
@@ -422,12 +544,18 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         # "You hit for $s1 damage."
                         dmg = params[0] if params else "?"
                         print(f"[GS]  DMG dealt -> target: {dmg}")
+                        if policy is not None:
+                            policy.note_combat()
+                            policy.record_event(char, current_target_id, (cur_x, cur_y))
                     elif msg_id in (36, 37):
                         # "$s1 hit you for $s2 damage."
                         name = params[0] if len(params) > 0 else "?"
                         dmg = params[1] if len(params) > 1 else "?"
                         print(f"[GS]  DMG taken <- {name}: {dmg}")
-                elif pid == 0xED and state == "DEAD" and len(body) >= 5:
+                        if policy is not None:
+                            policy.note_combat()
+                            policy.record_event(char, current_target_id, (cur_x, cur_y))
+                elif pid == GameServerPacket.CONFIRM_DLG and state == "DEAD" and len(body) >= 5:
                     # ConfirmDlg: opcode at [0], message ID int at [1]
                     msg_id = struct.unpack_from("<I", body, 1)[0]
                     print(f"[GS]  <- ConfirmDlg id={msg_id} (len={len(body)})")
@@ -438,7 +566,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         crypto.send_raw(gs, packets.build_dlg_answer(msg_id, 1, 0))
                         state = "IDLE"
                         char_dead_since = 0.0
-                elif pid == 0x64 and state == "DEAD" and len(body) >= 5:
+                elif pid == GameServerPacket.SYSTEM_MESSAGE and state == "DEAD" and len(body) >= 5:
                     # SysMsg (fallback): opcode at [0], message ID int at [1]
                     msg_id = struct.unpack_from("<I", body, 1)[0]
                     print(f"[GS]  SysMsg id={msg_id} (len={len(body)})")
@@ -466,7 +594,23 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         crypto.send_raw(gs, packets.build_request_restart_point(0))
                         return
 
-                if got_coords and time.time() - last_action >= 1.0 and state != "DEAD":
+                if policy is not None:
+                    # -- Model mode: the neural policy replaces the scripted state machine below --
+                    if policy.wants_cooldown_sync() and time.time() - last_cooldown_sync >= MODEL_COOLDOWN_SYNC_S:
+                        crypto.send_raw(gs, packets.build_request_skill_cool_time())
+                        last_cooldown_sync = time.time()
+                    if got_coords and state != "DEAD" and time.time() - last_decision >= decision_interval:
+                        last_decision = time.time()
+                        has_potion = any(i["item_id"] == HEALING_POTION_ID and i["count"] > 0 for i in char.items)
+                        decision = policy.decide(char, current_target_id, (cur_x, cur_y),
+                                                 has_loot=bool(pending_loot), has_potion=has_potion)
+                        print(f"[MODEL]  {decision.describe()}")
+                        current_target_id, cur_x, cur_y = _execute_model_decision(
+                            gs, char, policy, decision, current_target_id, pending_loot,
+                            cur_x, cur_y, cur_z, attack_memo)
+                        last_action = time.time()
+
+                elif got_coords and time.time() - last_action >= 1.0 and state != "DEAD":
                     if state == "LOOTING":
                         # Pick up queued drops: move to nearest, then send Action
                         if pending_loot:
@@ -583,6 +727,8 @@ def game_server_flow(ip: str, port: int, login_name: str,
                     char.dump()
                     data_dump_printed = True
                     last_ping = time.time()
+                    if policy is not None:
+                        policy.bind_character(char)
                     print("\n[GS]  -- Game loop started --\n")
             except ConnectionError:
                 print("[GS]  Connection lost."); break
@@ -595,18 +741,43 @@ def game_server_flow(ip: str, port: int, login_name: str,
 
 # -- Main --
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="L2J Mobius Interlude headless client bot.")
+    parser.add_argument("--server-ip", default=SERVER_IP, help=f"Login server address (default: {SERVER_IP})")
+    parser.add_argument("--model", metavar="ONNX",
+                        help="Drive combat with the trained policy (.onnx from l2_NN/export_onnx.py, "
+                             "its .json must sit next to it) instead of the scripted state machine")
+    parser.add_argument("--model-character-id", type=int, default=None,
+                        help="Training character_id whose skill panel to use (default: best skill overlap)")
+    parser.add_argument("--decision-interval", type=float, default=0.5,
+                        help="Seconds between two model decisions (default: 0.5)")
+    parser.add_argument("--server-speed", type=float, default=5.0,
+                        help="Server speed-up factor; scales the datapack skill reuse delays used until "
+                             "the server's SkillCoolTime answer arrives (default: 5)")
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
     npc_data.load_npc_names()
     item_data.load_item_data()
     skill_data.load_skill_data()
+
+    policy = None
+    if args.model:
+        from l2_client.policy import CombatPolicy  # onnxruntime is only needed in model mode
+        policy = CombatPolicy(args.model, character_id=args.model_character_id, server_speed=args.server_speed)
+        print(f"[MODEL] Loaded {args.model} (seq_len {policy.seq_len}, "
+              f"trained epoch {policy.meta['training'].get('epoch')})")
     ls_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ls_sock.settimeout(10.0)
     try:
-        print(f"[+] Connecting to {SERVER_IP}:{LOGIN_PORT} as '{ACCOUNT_LOGIN}'...")
-        ls_sock.connect((SERVER_IP, LOGIN_PORT))
+        print(f"[+] Connecting to {args.server_ip}:{LOGIN_PORT} as '{ACCOUNT_LOGIN}'...")
+        ls_sock.connect((args.server_ip, LOGIN_PORT))
         p1, p2, gs_ip, gs_port, ln, l1, l2 = login_server_flow(ls_sock)
         ls_sock.close()
-        game_server_flow(gs_ip, gs_port, ln, p1, p2, l1, l2)
+        game_server_flow(gs_ip, gs_port, ln, p1, p2, l1, l2,
+                         policy=policy, decision_interval=args.decision_interval)
     except Exception as e:
         print(f"[-] Error: {e}")
         import traceback
