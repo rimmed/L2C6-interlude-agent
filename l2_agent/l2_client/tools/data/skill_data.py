@@ -36,6 +36,9 @@ _SKILL_NAME: dict[int, str] = {}
 # Maps skill ID -> max level count.
 _SKILL_LEVELS: dict[int, int] = {}
 
+# Maps skill ID -> reuse delay in milliseconds (level 1 value for per-level tables).
+_SKILL_REUSE_MS: dict[int, int] = {}
+
 _loaded = False
 
 
@@ -45,7 +48,7 @@ def load_skill_data(path: str = DEFAULT_SKILL_XML_PATH) -> None:
 
     :param path: directory containing skill XML files (e.g. ``00100-00199.xml``).
     """
-    global _loaded, _SKILL_NAME, _SKILL_LEVELS
+    global _loaded, _SKILL_NAME, _SKILL_LEVELS, _SKILL_REUSE_MS
     if _loaded:
         return
 
@@ -75,10 +78,30 @@ def load_skill_data(path: str = DEFAULT_SKILL_XML_PATH) -> None:
 
             _SKILL_NAME[skill_id] = name
             _SKILL_LEVELS[skill_id] = levels
+            reuse = _read_reuse_delay(skill_elem)
+            if reuse is not None:
+                _SKILL_REUSE_MS[skill_id] = reuse
             count += 1
 
     _loaded = True
     print(f"[SKILL_DATA] Loaded {count} skills from {path}")
+
+
+def _read_reuse_delay(skill_elem: ET.Element) -> int | None:
+    """
+    Read ``<reuseDelay>`` of a skill element, in milliseconds.
+
+    The value is either a literal (``13000``) or a reference to a per-level ``<table name="#x">``,
+    in which case the level 1 entry is used.
+    """
+    text = (skill_elem.findtext("reuseDelay") or "").strip()
+    if text.startswith("#"):
+        table = next((t for t in skill_elem.findall("table") if t.get("name") == text), None)
+        text = (table.text or "").split()[0] if table is not None and table.text else ""
+    try:
+        return int(float(text))
+    except ValueError:
+        return None
 
 
 def get_skill_name(skill_id: int) -> str:
@@ -89,3 +112,8 @@ def get_skill_name(skill_id: int) -> str:
 def get_skill_levels(skill_id: int) -> int:
     """Return the max level count for a skill ID, or ``1`` if unknown."""
     return _SKILL_LEVELS.get(skill_id, 1)
+
+
+def get_skill_reuse_delay(skill_id: int) -> int:
+    """Return the reuse delay of a skill in milliseconds, or ``0`` if unknown."""
+    return _SKILL_REUSE_MS.get(skill_id, 0)
