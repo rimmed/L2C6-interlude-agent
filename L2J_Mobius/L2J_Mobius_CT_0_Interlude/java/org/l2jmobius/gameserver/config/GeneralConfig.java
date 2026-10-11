@@ -26,6 +26,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.l2jmobius.commons.util.ConfigReader;
+import org.l2jmobius.gameserver.GameTimeController;
 import org.l2jmobius.gameserver.model.actor.enums.player.ChatBroadcastType;
 import org.l2jmobius.gameserver.model.actor.enums.player.IllegalActionPunishmentType;
 import org.l2jmobius.gameserver.network.enums.ChatType;
@@ -42,6 +43,7 @@ public class GeneralConfig
 	private static final String GENERAL_CONFIG_FILE = "./config/General.ini";
 	
 	// Constants
+	public static double TIME_SCALE;
 	public static boolean EVERYBODY_HAS_ADMIN_RIGHTS;
 	public static boolean SERVER_GMONLY;
 	public static boolean GM_HERO_AURA;
@@ -183,6 +185,9 @@ public class GeneralConfig
 	public static void load()
 	{
 		final ConfigReader config = new ConfigReader(GENERAL_CONFIG_FILE);
+		TIME_SCALE = config.getDouble("TimeScale", 1.0);
+		GameTimeController.setTimeScale(TIME_SCALE);
+		LOGGER.info("GeneralConfig: TimeScale = " + TIME_SCALE + "x.");
 		EVERYBODY_HAS_ADMIN_RIGHTS = config.getBoolean("EverybodyHasAdminRights", false);
 		SERVER_GMONLY = config.getBoolean("ServerGMOnly", false);
 		GM_HERO_AURA = config.getBoolean("GMHeroAura", false);

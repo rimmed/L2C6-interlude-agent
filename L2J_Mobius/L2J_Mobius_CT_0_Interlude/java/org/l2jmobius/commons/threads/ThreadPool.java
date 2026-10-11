@@ -30,6 +30,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.logging.Logger;
 
 import org.l2jmobius.commons.config.ThreadConfig;
+import org.l2jmobius.commons.time.TimeScale;
 import org.l2jmobius.commons.util.StringUtil;
 import org.l2jmobius.commons.util.TraceUtil;
 
@@ -93,6 +94,7 @@ public class ThreadPool
 		// Log thread pool configuration.
 		LOGGER.info(StringUtil.concat("...scheduled pool executor with ", String.valueOf(ThreadConfig.SCHEDULED_THREAD_POOL_SIZE), " total threads."));
 		LOGGER.info(StringUtil.concat("...instant pool executor with ", String.valueOf(ThreadConfig.INSTANT_THREAD_POOL_SIZE), " total threads."));
+		LOGGER.info(StringUtil.concat("...time scale multiplier set to ", String.valueOf(TimeScale.get()), "x."));
 	}
 	
 	/**
@@ -118,7 +120,7 @@ public class ThreadPool
 	{
 		try
 		{
-			return SCHEDULED_POOL.schedule(new RunnableWrapper(runnable), validateDelay(delay), TimeUnit.MILLISECONDS);
+			return SCHEDULED_POOL.schedule(new RunnableWrapper(runnable), validateDelay(TimeScale.scaleDelay(delay)), TimeUnit.MILLISECONDS);
 		}
 		catch (Exception e)
 		{
@@ -138,7 +140,7 @@ public class ThreadPool
 	{
 		try
 		{
-			return SCHEDULED_POOL.scheduleAtFixedRate(new RunnableWrapper(runnable), validateDelay(initialDelay), validateDelay(period), TimeUnit.MILLISECONDS);
+			return SCHEDULED_POOL.scheduleAtFixedRate(new RunnableWrapper(runnable), validateDelay(TimeScale.scaleDelay(initialDelay)), validateDelay(TimeScale.scaleDelay(period)), TimeUnit.MILLISECONDS);
 		}
 		catch (Exception e)
 		{
@@ -164,7 +166,7 @@ public class ThreadPool
 		
 		try
 		{
-			return HIGH_PRIORITY_SCHEDULED_POOL.scheduleAtFixedRate(new RunnableWrapper(runnable), validateDelay(initialDelay), validateDelay(period), TimeUnit.MILLISECONDS);
+			return HIGH_PRIORITY_SCHEDULED_POOL.scheduleAtFixedRate(new RunnableWrapper(runnable), validateDelay(TimeScale.scaleDelay(initialDelay)), validateDelay(TimeScale.scaleDelay(period)), TimeUnit.MILLISECONDS);
 		}
 		catch (Exception e)
 		{

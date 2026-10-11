@@ -22,9 +22,14 @@ mirrors that:
 
 Features the client cannot observe are filled the way the training data filled them: the logs had
 no move speed (constant default) and no MP cost (``has_enough_mp`` is always 1), every panel slot
-is ``is_available``.  Skill cooldowns come from the server's SkillCoolTime (0xC1) answers, which
-are already scaled by the server's speed; until one arrives after a cast, the datapack reuse delay
-divided by ``server_speed`` is used as an estimate.
+is ``is_available``.  Skill cooldowns come from the server's SkillCoolTime (0xC1) answers; until
+one arrives after a cast, the datapack reuse delay is used as an estimate.
+
+Two clocks are involved when the server runs with ``TimeScale`` > 1 (``server_speed``): the server
+counts cooldowns in *game* time, which runs ``server_speed`` times faster than real time.  The
+expiry of every cooldown is therefore stored in real (``time.time()``) seconds, which decides when
+a skill is usable, while the ``cooldown_norm`` feature is fed in game seconds - the unit of the
+logged ``[CD:...]`` values the model was trained on.
 
 Head outputs that are not executable right now (attack without any monster, pickup without loot,
 a skill on cooldown, the game-response classes such as ``inflicted_damage``) are masked before the
@@ -159,7 +164,7 @@ class CombatPolicy:
         self._frames: deque[_Frame] = deque(maxlen=self.seq_len)
         self._session_engaged = False
         self._cooldown_until: dict[int, float] = {}
-        #: The server runs its timers this many times faster than the datapack values.
+        #: Server ``TimeScale``: game time runs this many times faster than real time.
         self.server_speed = max(server_speed, 1e-6)
         self._cast_at: dict[int, float] = {}
         self._last_combat_at = 0.0
@@ -233,8 +238,8 @@ class CombatPolicy:
         """
         Estimate the cooldown of a skill that was just cast.
 
-        The datapack reuse delay scaled by :attr:`server_speed` is only a placeholder until the
-        server's SkillCoolTime answer arrives (:meth:`apply_skill_cool_time`).
+        The datapack reuse delay (game time, converted to real time) is only a placeholder until
+        the server's SkillCoolTime answer arrives (:meth:`apply_skill_cool_time`).
         """
         now = time.time() if now is None else now
         reuse_s = skill_data.get_skill_reuse_delay(skill_id) / 1000.0 / self.server_speed
@@ -246,9 +251,10 @@ class CombatPolicy:
         Replace the cooldown table with a parsed SkillCoolTime (0xC1).
 
         The packet lists every skill that is still cooling down, so a skill missing from it is ready.
+        Its ``remaining`` is in game seconds and is converted to a real-time expiry here.
         """
         now = time.time() if now is None else now
-        fresh = {cd["skill_id"]: now + cd["remaining"] for cd in parsed.get("cooldowns", [])}
+        fresh = {cd["skill_id"]: now + cd["remaining"] / self.server_speed for cd in parsed.get("cooldowns", [])}
         for skill_id, cast_at in self._cast_at.items():
             if skill_id not in fresh and now - cast_at < CAST_GRACE_S and skill_id in self._cooldown_until:
                 fresh[skill_id] = self._cooldown_until[skill_id]  # the cast has not started yet
@@ -402,7 +408,8 @@ class CombatPolicy:
         scale = self.constants["skill_cooldown_norm_seconds"]
         matrix = np.zeros((self.max_skills, len(self._skill_names)), dtype=np.float32)
         for slot, skill_id in enumerate(self.panel):
-            left = max(0.0, self._cooldown_until.get(skill_id, 0.0) - now)
+            # Expiries are real time, the feature is game time like the logged cooldowns.
+            left = max(0.0, self._cooldown_until.get(skill_id, 0.0) - now) * self.server_speed
             row = {
                 "is_available": 1.0,
                 "is_off_cooldown": 1.0 if left <= 0.0 else 0.0,

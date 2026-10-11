@@ -20,6 +20,7 @@
  */
 package org.l2jmobius.gameserver.model.actor.holders.creature;
 
+import org.l2jmobius.gameserver.GameTimeController;
 import org.l2jmobius.gameserver.model.item.instance.Item;
 import org.l2jmobius.gameserver.model.skill.Skill;
 
@@ -53,7 +54,7 @@ public class TimeStamp
 		_id1 = skill.getId();
 		_id2 = skill.getLevel();
 		_reuse = reuse;
-		_stamp = systime > 0 ? systime : reuse != 0 ? System.currentTimeMillis() + reuse : 0;
+		_stamp = systime > 0 ? systime : reuse != 0 ? GameTimeController.currentTimeMillis() + reuse : 0;
 		_group = -1;
 	}
 	
@@ -68,7 +69,7 @@ public class TimeStamp
 		_id1 = item.getId();
 		_id2 = item.getObjectId();
 		_reuse = reuse;
-		_stamp = systime > 0 ? systime : reuse != 0 ? System.currentTimeMillis() + reuse : 0;
+		_stamp = systime > 0 ? systime : reuse != 0 ? GameTimeController.currentTimeMillis() + reuse : 0;
 		_group = item.getSharedReuseGroup();
 	}
 	
@@ -147,7 +148,7 @@ public class TimeStamp
 			return 0;
 		}
 		
-		final long remainingTime = _stamp - System.currentTimeMillis();
+		final long remainingTime = _stamp - GameTimeController.currentTimeMillis();
 		if (remainingTime <= 0)
 		{
 			_stamp = 0;
@@ -168,7 +169,7 @@ public class TimeStamp
 			return false;
 		}
 		
-		if (System.currentTimeMillis() >= _stamp)
+		if (GameTimeController.currentTimeMillis() >= _stamp)
 		{
 			_stamp = 0;
 			return false;

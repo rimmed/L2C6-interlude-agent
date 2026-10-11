@@ -36,6 +36,7 @@ import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.l2jmobius.commons.threads.ThreadPool;
+import org.l2jmobius.commons.time.TimeScale;
 import org.l2jmobius.commons.util.Rnd;
 import org.l2jmobius.gameserver.ai.Action;
 import org.l2jmobius.gameserver.ai.AttackableAI;
@@ -1161,13 +1162,13 @@ public abstract class Creature extends WorldObject
 						return;
 					}
 					
-					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(timeToHit + (reuse / 2));
+					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(TimeScale.scaleDelay(timeToHit + (reuse / 2)));
 					hitted = doAttackHitByBow(attack, target, timeAtk, reuse);
 					break;
 				}
 				case POLE:
 				{
-					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(timeAtk);
+					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(TimeScale.scaleDelay(timeAtk));
 					hitted = doAttackHitByPole(attack, target, timeToHit);
 					break;
 				}
@@ -1175,7 +1176,7 @@ public abstract class Creature extends WorldObject
 				{
 					if (!isPlayer())
 					{
-						_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(timeAtk);
+						_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(TimeScale.scaleDelay(timeAtk));
 						hitted = doAttackHitSimple(attack, target, timeToHit);
 						break;
 					}
@@ -1185,13 +1186,13 @@ public abstract class Creature extends WorldObject
 				case DUALFIST:
 				case DUALDAGGER:
 				{
-					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(timeAtk);
+					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(TimeScale.scaleDelay(timeAtk));
 					hitted = doAttackHitByDual(attack, target, timeToHit);
 					break;
 				}
 				default:
 				{
-					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(timeAtk);
+					_attackEndTime = currentTime + TimeUnit.MILLISECONDS.toNanos(TimeScale.scaleDelay(timeAtk));
 					hitted = doAttackHitSimple(attack, target, timeToHit);
 					break;
 				}
