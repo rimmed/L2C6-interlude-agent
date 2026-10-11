@@ -39,6 +39,7 @@ class Radar:
 
         {
             "object_id":  int,
+            "npc_id":     int,   # template id (0 if unknown)
             "name":       str,
             "level":      int,
             "heading":    int,   # raw value from NpcInfo packet
@@ -117,8 +118,10 @@ class Radar:
         name = self._resolve_name(npc)
         level = self._resolve_level(npc)
 
+        did = npc.get("display_id", 0)
         self._entries[npc["object_id"]] = {
             "object_id": npc["object_id"],
+            "npc_id": did - 1000000 if did > 1000000 else did,
             "name": name,
             "level": level,
             "heading": npc.get("heading", 0),
