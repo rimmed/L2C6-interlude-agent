@@ -58,6 +58,10 @@ EXECUTABLE_ACTIONS = ("moved", "selected_target", "attacked", "used_skill", "pic
 #: with target selection) and lapses this long after the last combat action.
 IN_COMBAT_TIMEOUT_S = 15.0
 
+#: Monsters this far above or below the character are left out of the candidates: they stand on a
+#: cliff or in a pit, and walking to them straight runs into the terrain (the client has no pathfinding).
+MAX_TARGET_DZ = 300
+
 #: A skill cast this recently may still be queued behind an auto-attack swing, so a SkillCoolTime
 #: answer that does not list it yet must not mark it ready.
 CAST_GRACE_S = 1.5
@@ -119,12 +123,17 @@ class CombatPolicy:
         character_id: int | None = None,
         providers: list[str] | None = None,
         server_speed: float = 1.0,
+        device: str = "cpu",
+        max_target_dz: float | None = MAX_TARGET_DZ,
     ):
         """
         :param model_path: ``.onnx`` file; its ``.json`` metadata must sit next to it
         :param character_id: training ``character_id`` whose skill panel to use; ``None`` picks the
             panel that overlaps most with the character's skills (see :meth:`bind_character`)
-        :param providers: onnxruntime execution providers (default: CPU)
+        :param providers: onnxruntime execution providers; overrides ``device`` when given
+        :param device: ``"cpu"`` or ``"gpu"`` (CUDA); a GPU session that silently falls back to the
+            CPU raises instead, so a benchmark can never measure the wrong device
+        :param max_target_dz: leave out monsters with a larger height difference (``None`` keeps all)
         """
         import onnxruntime as ort  # imported lazily: the scripted bot must run without it
 
@@ -139,7 +148,24 @@ class CombatPolicy:
                 f"(expected {SUPPORTED_METADATA_VERSION})"
             )
 
-        self.session = ort.InferenceSession(str(model_path), providers=providers or ["CPUExecutionProvider"])
+        if providers is None:
+            if device == "gpu":
+                # Load the CUDA/cuDNN libraries shipped as nvidia-* wheels (shared with torch).
+                ort.preload_dlls()
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            elif device == "cpu":
+                providers = ["CPUExecutionProvider"]
+            else:
+                raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
+        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        if providers[0] not in self.session.get_providers()[:1]:
+            raise RuntimeError(f"requested {providers[0]}, but the session runs on {self.session.get_providers()}")
+        self.device = "gpu" if self.session.get_providers()[0] == "CUDAExecutionProvider" else "cpu"
+
+        #: Wall-clock milliseconds of every ``session.run`` (pure inference) and of every whole
+        #: :meth:`decide` call (feature encoding + inference + masking), in call order.
+        self.inference_ms: list[float] = []
+        self.decide_ms: list[float] = []
         self.seq_len: int = self.meta["seq_len"]
         self.max_mobs: int = self.meta["max_mobs"]
         self.max_skills: int = self.meta["max_skills"]
@@ -166,6 +192,7 @@ class CombatPolicy:
         self._cooldown_until: dict[int, float] = {}
         #: Server ``TimeScale``: game time runs this many times faster than real time.
         self.server_speed = max(server_speed, 1e-6)
+        self.max_target_dz = max_target_dz
         self._cast_at: dict[int, float] = {}
         self._last_combat_at = 0.0
 
@@ -291,6 +318,7 @@ class CombatPolicy:
         now: float | None = None,
     ) -> Decision:
         """Append the decision row, run the network and return the best executable action."""
+        started = time.perf_counter()
         now = time.time() if now is None else now
 
         # A training session runs from selected_target to killed/pickup; once the fight is over
@@ -331,7 +359,41 @@ class CombatPolicy:
             slot = max(usable_slots, key=lambda i: logits_skill[i])
             skill_id = self.panel[slot]
 
+        self.decide_ms.append((time.perf_counter() - started) * 1000.0)
         return Decision(action=action, mob_object_id=mob_id, skill_id=skill_id, confidence=float(probs[best]))
+
+    def timing_summary(self, warmup: int = 10) -> dict[str, Any]:
+        """
+        Latency statistics in milliseconds.
+
+        The first ``warmup`` calls are left out: the first runs pay one-off costs (memory arena
+        growth, CUDA kernel selection and context set-up on the GPU) that say nothing about the
+        steady-state latency.
+        """
+
+        def stats(samples: list[float]) -> dict[str, float]:
+            kept = np.asarray(samples[warmup:], dtype=np.float64)
+            if kept.size == 0:
+                return {"count": 0}
+            return {
+                "count": int(kept.size),
+                "mean": float(kept.mean()),
+                "std": float(kept.std()),
+                "median": float(np.median(kept)),
+                "p95": float(np.percentile(kept, 95)),
+                "p99": float(np.percentile(kept, 99)),
+                "min": float(kept.min()),
+                "max": float(kept.max()),
+            }
+
+        return {
+            "device": self.device,
+            "providers": self.session.get_providers(),
+            "warmup_calls_skipped": min(warmup, len(self.inference_ms)),
+            "first_call_ms": self.inference_ms[0] if self.inference_ms else None,
+            "inference_ms": stats(self.inference_ms),
+            "decide_ms": stats(self.decide_ms),
+        }
 
     # ------------------------------------------------------------------
     # Feature encoding (mirrors l2_NN/dataloader/dataloder.py)
@@ -389,8 +451,21 @@ class CombatPolicy:
         target_npc_id = target.get("npc_id", 0) if target else 0
 
         x, y = pos
+        char_z = getattr(char, "z", None)
+
+        def reachable(oid: int, mob: dict) -> bool:
+            # The current target always stays visible: radar positions are spawn positions, so a monster
+            # that came down to fight would otherwise vanish mid-fight.
+            if self.max_target_dz is None or char_z is None or oid == current_target_id:
+                return True
+            return abs(mob.get("z", char_z) - char_z) <= self.max_target_dz
+
         ranked = sorted(
-            ((math.hypot(x - mob["x"], y - mob["y"]), oid, mob) for oid, mob in char.radar.entries.items()),
+            (
+                (math.hypot(x - mob["x"], y - mob["y"]), oid, mob)
+                for oid, mob in char.radar.entries.items()
+                if reachable(oid, mob)
+            ),
             key=lambda item: item[0],
         )[: self.max_mobs]
         for slot, (dist, oid, mob) in enumerate(ranked):
@@ -447,5 +522,7 @@ class CombatPolicy:
             "skills_matrix": skills[None],
             "seq_mask": seq_mask[None],
         }
+        started = time.perf_counter()
         action, pointer, skill = self.session.run(list(self.meta["outputs"]), feeds)
+        self.inference_ms.append((time.perf_counter() - started) * 1000.0)
         return action[0], pointer[0], skill[0]

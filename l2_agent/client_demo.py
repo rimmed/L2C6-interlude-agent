@@ -3,7 +3,9 @@
 
 
 import argparse
+import json
 import random
+import signal
 import socket
 import struct
 import time
@@ -22,11 +24,13 @@ SERVER_ID = 0
 CHAR_SLOT = 0
 
 # --- MODEL MODE (--model) ---
-HEALING_POTION_ID = 1061
+HEALING_POTION_IDS = (1539, 1061, 1060)  # Greater, normal, Lesser Healing Potion (best first)
 MODEL_ATTACK_REPEAT_S = 1.5    # don't re-send AttackRequest on the same target more often than this
 MODEL_APPROACH_RANGE = 100     # "moved" walks to the target only when farther than this
 MODEL_ROAM_STEP = 400          # "moved" with nothing to walk to: random step of up to this many units
 MODEL_COOLDOWN_SYNC_S = 1.0    # RequestSkillCoolTime at most this often while a skill cools down
+MODEL_STUCK_TARGET_S = 15.0    # give up a target that took no hit for this long (unreachable / behind a wall)
+MODEL_IGNORE_TARGET_S = 60.0   # ...and keep it off the radar for this long
 
 
 def _print_buffs(char: L2Character):
@@ -44,7 +48,7 @@ def _print_buffs(char: L2Character):
 
 # -- Login server flow --
 
-def login_server_flow(sock: socket.socket):
+def login_server_flow(sock: socket.socket, account: str = ACCOUNT_LOGIN, password: str = ACCOUNT_PASSWORD):
     di = crypto.decrypt_init_packet(crypto.recv_packet(sock), crypto.L2MOBIUS_STATIC_KEY)
     assert di[0] == LoginServerPacket.INIT
     sid = struct.unpack_from("<I", di, 1)[0]
@@ -55,7 +59,7 @@ def login_server_flow(sock: socket.socket):
     crypto.send_encrypted(sock, packets.build_auth_game_guard(sid), dk)
     crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
     print("[LS]  GGAuth OK")
-    crypto.send_encrypted(sock, packets.build_request_auth_login(ACCOUNT_LOGIN, ACCOUNT_PASSWORD, sid, rm), dk)
+    crypto.send_encrypted(sock, packets.build_request_auth_login(account, password, sid, rm), dk)
     dr = crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
     if dr[0] == LoginServerPacket.LOGIN_FAIL:
         raise RuntimeError(f"Login failed: {dr[1]}")
@@ -83,7 +87,16 @@ def login_server_flow(sock: socket.socket):
     p1 = struct.unpack_from("<I", dp, 1)[0]
     p2 = struct.unpack_from("<I", dp, 5)[0]
     print("[LS]  PlayOk!")
-    return (p1, p2, ch['ip'], ch['port'], ACCOUNT_LOGIN, l1, l2)
+    return (p1, p2, ch['ip'], ch['port'], account, l1, l2)
+
+
+def _find_healing_potion(char: L2Character) -> dict | None:
+    """Best healing potion in the inventory, or ``None``."""
+    for potion_id in HEALING_POTION_IDS:
+        potion = next((i for i in char.items if i["item_id"] == potion_id and i["count"] > 0), None)
+        if potion:
+            return potion
+    return None
 
 
 # -- Model mode: decision executor --
@@ -155,9 +168,9 @@ def _execute_model_decision(gs: socket.socket, char: L2Character, policy, decisi
             attack_memo.update(loot=nearest["object_id"], loot_at=now)
 
     elif action == "used_item":
-        potion = next((i for i in char.items if i["item_id"] == HEALING_POTION_ID and i["count"] > 0), None)
+        potion = _find_healing_potion(char)
         if potion:
-            print(f"[MODEL] -> UseItem: {item_data.get_item_name(HEALING_POTION_ID)} "
+            print(f"[MODEL] -> UseItem: {item_data.get_item_name(potion['item_id'])} "
                   f"HP {char.cur_hp:.0f}/{char.max_hp}")
             crypto.send_raw(gs, packets.build_use_item(potion["object_id"]))
 
@@ -184,14 +197,21 @@ def _execute_model_decision(gs: socket.socket, char: L2Character, policy, decisi
 def game_server_flow(ip: str, port: int, login_name: str,
                      play_ok1: int, play_ok2: int,
                      login_ok1: int, login_ok2: int,
-                     policy=None, decision_interval: float = 0.5):
+                     policy=None, decision_interval: float = 0.5,
+                     max_kills: int = 5, run_stats: dict | None = None):
     """
     Enter the world and run the combat loop.
 
     :param policy: a :class:`l2_client.policy.CombatPolicy`; when given, the neural model decides
         every combat action instead of the scripted state machine
     :param decision_interval: seconds between two model decisions
+    :param max_kills: stop after this many kills
+    :param run_stats: filled while playing (``kills``, ``deaths``), so the caller keeps them however
+        the session ends
     """
+    if run_stats is None:
+        run_stats = {}
+    run_stats.update(kills=0, deaths=0)
     gs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     gs.settimeout(60.0)
     try:
@@ -273,7 +293,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
         pending_loot: list[dict] = []  # items to pick up during LOOTING
         looting_since: float = 0.0     # timestamp when LOOTING started
         kills: int = 0                 # monsters killed so far
-        MAX_KILLS = 5                  # stop after this many kills
+        MAX_KILLS = max_kills          # stop after this many kills
         char_dead_since: float = 0.0   # timestamp when character died
         asked_for_help: bool = False   # True once help message was sent after death
 
@@ -281,6 +301,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
         last_decision = 0.0
         last_cooldown_sync = 0.0
         attack_memo: dict = {}
+        ignored_targets: dict[int, float] = {}  # object_id -> ignored until (model mode)
 
         while True:
             try:
@@ -293,6 +314,35 @@ def game_server_flow(ip: str, port: int, login_name: str,
                 if len(body) == 0:
                     continue
                 pid = body[0]
+
+                # -- Server-side moves (both phases): an RL-environment server teleports agents to their
+                # farm zone on login/respawn and revives them in place of the "return to town" dialog.
+                if pid == GameServerPacket.TELEPORT_TO_LOCATION:
+                    tp = packets.parse_teleport_to_location(body)
+                    if tp and tp["object_id"] == char.object_id:
+                        print(f"[GS]  <- Teleported to ({tp['x']},{tp['y']},{tp['z']})")
+                        crypto.send_raw(gs, packets.build_appearing())
+                        cur_x, cur_y, cur_z = tp["x"], tp["y"], tp["z"]
+                        char.x, char.y, char.z = cur_x, cur_y, cur_z
+                        got_coords = True
+                        # Everything known about the old surroundings is stale now.
+                        char.radar.entries.clear()
+                        pending_loot.clear()
+                        current_target_id = 0
+                        attack_attempts = 0
+                        if state != "DEAD":
+                            state = "IDLE"
+                        if policy is not None:
+                            policy.reset_session()
+                    continue
+                if pid == GameServerPacket.REVIVE:
+                    rv = packets.parse_revive(body)
+                    if rv and rv["object_id"] == char.object_id and state == "DEAD":
+                        print("[GS]  <- Revived")
+                        state = "IDLE"
+                        char_dead_since = 0.0
+                        last_action = time.time()
+                    continue
 
                 # -- Data-collection phase --
                 if not data_dump_printed:
@@ -408,18 +458,26 @@ def game_server_flow(ip: str, port: int, login_name: str,
 
                 # -- Post-collection: game loop --
 
-                if pid == GameServerPacket.USER_INFO and len(body) >= 13:  # position update
-                    cur_x = struct.unpack_from("<i", body, 1)[0]
-                    cur_y = struct.unpack_from("<i", body, 5)[0]
-                    cur_z = struct.unpack_from("<i", body, 9)[0]
-                    char.x, char.y, char.z = cur_x, cur_y, cur_z
+                if pid == GameServerPacket.USER_INFO and len(body) >= 13:
+                    # Full refresh, not just the position: level, class and stats change while playing
+                    # (an RL-environment server boosts and promotes agents right after login).
+                    prev_level, prev_class = char.level, char.class_id
+                    char.apply_user_info(packets.parse_user_info(body))
+                    cur_x, cur_y, cur_z = char.x, char.y, char.z
                     got_coords = True
-                    if policy is not None:
-                        # The model needs live HP/MP/CP and speeds, not just the coordinates.
-                        char.apply_user_info(packets.parse_user_info(body))
+                    if (char.level, char.class_id) != (prev_level, prev_class):
+                        print(f"[GS]  <- UserInfo: lvl {char.level} class {char.class_id} "
+                              f"HP {char.cur_hp:.0f}/{char.max_hp} MP {char.cur_mp:.0f}/{char.max_mp}")
                 elif pid == GameServerPacket.NPC_INFO:
                     npc = packets.parse_npc_info(body)
-                    char.radar.add_or_update(npc)
+                    if ignored_targets.get(npc.get("object_id"), 0.0) <= time.time():
+                        char.radar.add_or_update(npc)
+                elif pid == GameServerPacket.ITEM_LIST:  # full inventory resend (e.g. new equipment)
+                    char.apply_item_list(packets.parse_item_list(body))
+                elif pid == GameServerPacket.SKILL_LIST:  # skills changed (level-up, class transfer)
+                    char.apply_skill_list(packets.parse_skill_list(body))
+                    if policy is not None:
+                        policy.bind_character(char)
                 elif pid == GameServerPacket.STATUS_UPDATE:
                     su = packets.parse_status_update(body)
                     char.radar.update_from_status(su)
@@ -435,6 +493,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         if oid == char.object_id:
                             # Character died
                             print("[GS]  [!] Character died!")
+                            run_stats["deaths"] += 1
                             state = "DEAD"
                             char_dead_since = time.time()
                             asked_for_help = False
@@ -454,6 +513,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
                             attack_attempts = 0
                             last_action = time.time()
                             print(f"[GS]  Kills: {kills}/{MAX_KILLS}")
+                            run_stats["kills"] = kills
                             # Use Healing Potion (itemId=1061) if HP is below 70%
                             potion = next((i for i in char.items
                                           if i["item_id"] == 1061 and i["count"] > 0), None)
@@ -544,6 +604,7 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         # "You hit for $s1 damage."
                         dmg = params[0] if params else "?"
                         print(f"[GS]  DMG dealt -> target: {dmg}")
+                        attack_memo["hit_at"] = time.time()
                         if policy is not None:
                             policy.note_combat()
                             policy.record_event(char, current_target_id, (cur_x, cur_y))
@@ -601,7 +662,19 @@ def game_server_flow(ip: str, port: int, login_name: str,
                         last_cooldown_sync = time.time()
                     if got_coords and state != "DEAD" and time.time() - last_decision >= decision_interval:
                         last_decision = time.time()
-                        has_potion = any(i["item_id"] == HEALING_POTION_ID and i["count"] > 0 for i in char.items)
+                        # A target that takes no hit for a while is unreachable (geodata, walls): drop it,
+                        # otherwise the policy keeps attacking it forever.
+                        if attack_memo.get("engaged") != current_target_id:
+                            attack_memo.update(engaged=current_target_id, engaged_at=last_decision)
+                        last_progress = max(attack_memo.get("engaged_at", 0.0), attack_memo.get("hit_at", 0.0))
+                        if current_target_id and last_decision - last_progress > MODEL_STUCK_TARGET_S:
+                            print(f"[MODEL] !! No hit on {current_target_id} for {MODEL_STUCK_TARGET_S:.0f}s "
+                                  f"-- ignoring it for {MODEL_IGNORE_TARGET_S:.0f}s")
+                            ignored_targets[current_target_id] = last_decision + MODEL_IGNORE_TARGET_S
+                            char.radar.remove(current_target_id)
+                            current_target_id = 0
+                            policy.reset_session()
+                        has_potion = _find_healing_potion(char) is not None
                         decision = policy.decide(char, current_target_id, (cur_x, cur_y),
                                                  has_loot=bool(pending_loot), has_potion=has_potion)
                         print(f"[MODEL]  {decision.describe()}")
@@ -744,6 +817,9 @@ def game_server_flow(ip: str, port: int, login_name: str,
 def parse_args():
     parser = argparse.ArgumentParser(description="L2J Mobius Interlude headless client bot.")
     parser.add_argument("--server-ip", default=SERVER_IP, help=f"Login server address (default: {SERVER_IP})")
+    parser.add_argument("--account", default=ACCOUNT_LOGIN,
+                        help=f"Account name (default: {ACCOUNT_LOGIN}); with AutoCreateAccounts a new name creates the account")
+    parser.add_argument("--password", default=ACCOUNT_PASSWORD, help="Account password")
     parser.add_argument("--model", metavar="ONNX",
                         help="Drive combat with the trained policy (.onnx from l2_NN/export_onnx.py, "
                              "its .json must sit next to it) instead of the scripted state machine")
@@ -752,8 +828,13 @@ def parse_args():
     parser.add_argument("--decision-interval", type=float, default=0.5,
                         help="Seconds between two model decisions (default: 0.5)")
     parser.add_argument("--server-speed", type=float, default=5.0,
-                        help="Server speed-up factor; scales the datapack skill reuse delays used until "
-                             "the server's SkillCoolTime answer arrives (default: 5)")
+                        help="Server TimeScale (General.ini): converts the server's game-time skill "
+                             "cooldowns to real time (default: 5)")
+    parser.add_argument("--device", choices=("cpu", "gpu"), default="cpu",
+                        help="Where the model runs: cpu or gpu (CUDA) (default: cpu)")
+    parser.add_argument("--max-kills", type=int, default=5, help="Stop after this many kills (default: 5)")
+    parser.add_argument("--stats-out", metavar="JSON",
+                        help="Write the run statistics (kills, deaths, model latency) to this file")
     return parser.parse_args()
 
 
@@ -766,18 +847,22 @@ def main():
     policy = None
     if args.model:
         from l2_client.policy import CombatPolicy  # onnxruntime is only needed in model mode
-        policy = CombatPolicy(args.model, character_id=args.model_character_id, server_speed=args.server_speed)
-        print(f"[MODEL] Loaded {args.model} (seq_len {policy.seq_len}, "
-              f"trained epoch {policy.meta['training'].get('epoch')})")
+        policy = CombatPolicy(args.model, character_id=args.model_character_id, server_speed=args.server_speed,
+                              device=args.device)
+        print(f"[MODEL] Loaded {args.model} on {policy.device.upper()} {policy.session.get_providers()} "
+              f"(seq_len {policy.seq_len}, trained epoch {policy.meta['training'].get('epoch')})")
+    run_stats: dict = {}
+    started = time.time()
     ls_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     ls_sock.settimeout(10.0)
     try:
-        print(f"[+] Connecting to {args.server_ip}:{LOGIN_PORT} as '{ACCOUNT_LOGIN}'...")
+        print(f"[+] Connecting to {args.server_ip}:{LOGIN_PORT} as '{args.account}'...")
         ls_sock.connect((args.server_ip, LOGIN_PORT))
-        p1, p2, gs_ip, gs_port, ln, l1, l2 = login_server_flow(ls_sock)
+        p1, p2, gs_ip, gs_port, ln, l1, l2 = login_server_flow(ls_sock, args.account, args.password)
         ls_sock.close()
         game_server_flow(gs_ip, gs_port, ln, p1, p2, l1, l2,
-                         policy=policy, decision_interval=args.decision_interval)
+                         policy=policy, decision_interval=args.decision_interval,
+                         max_kills=args.max_kills, run_stats=run_stats)
     except Exception as e:
         print(f"[-] Error: {e}")
         import traceback
@@ -787,6 +872,30 @@ def main():
             ls_sock.close()
         except Exception:
             pass
+        _report_run(args, policy, run_stats, time.time() - started)
+
+
+def _report_run(args, policy, run_stats: dict, seconds: float):
+    """Print (and optionally save) kills, deaths and the model latency of this run."""
+    # A second Ctrl+C (or a signal forwarded by a wrapper such as `uv run`) must not lose the report.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    report = {"account": args.account, "device": args.device if policy else None,
+              "max_kills": args.max_kills, "seconds": round(seconds, 1), **run_stats}
+    if policy is not None:
+        report["model"] = policy.timing_summary()
+        inf, dec = report["model"]["inference_ms"], report["model"]["decide_ms"]
+        print(f"\n[STATS] {policy.device.upper()}: {run_stats.get('kills', 0)} kills, "
+              f"{run_stats.get('deaths', 0)} deaths in {seconds / 60:.1f} min")
+        if inf.get("count"):
+            print(f"[STATS] inference (session.run): mean {inf['mean']:.3f} ms, median {inf['median']:.3f}, "
+                  f"p95 {inf['p95']:.3f}, p99 {inf['p99']:.3f}  (n={inf['count']}, "
+                  f"first call {report['model']['first_call_ms']:.1f} ms)")
+            print(f"[STATS] whole decision (features + inference): mean {dec['mean']:.3f} ms, "
+                  f"median {dec['median']:.3f}, p95 {dec['p95']:.3f}")
+    if args.stats_out:
+        with open(args.stats_out, "w") as fh:
+            json.dump(report, fh, indent=2)
+        print(f"[STATS] written to {args.stats_out}")
 
 
 if __name__ == "__main__":

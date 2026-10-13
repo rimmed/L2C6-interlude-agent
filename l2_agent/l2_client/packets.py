@@ -86,6 +86,7 @@ class GameServerPacket(IntEnum):
     SUNSET = 0x1D
     SERVER_CLOSE = 0x26
     INVENTORY_UPDATE = 0x27
+    TELEPORT_TO_LOCATION = 0x28
     CREATURE_SAY = 0x4A
     SKILL_LIST = 0x58
     SYSTEM_MESSAGE = 0x64
@@ -112,6 +113,7 @@ class GameClientPacket(IntEnum):
     CHARACTER_SELECT = 0x0D
     USE_ITEM = 0x14
     REQUEST_MAGIC_SKILL_USE = 0x2F
+    APPEARING = 0x30
     SAY2 = 0x38
     REQUEST_RESTART_POINT = 0x6D
     REQUEST_SKILL_COOL_TIME = 0x9D
@@ -225,6 +227,11 @@ def build_request_skill_cool_time() -> bytes:
 
 def build_net_ping(pid: int) -> bytes:
     return pack(bytearray([GameClientPacket.NET_PING]) + struct.pack("<I", pid))
+
+
+def build_appearing() -> bytes:
+    """Appearing (0x30): tells the server the client finished a teleport (TeleportToLocation)."""
+    return pack(bytearray([GameClientPacket.APPEARING]))
 
 
 def build_game_guard_reply() -> bytes:
@@ -672,6 +679,21 @@ def parse_die(body: bytes) -> dict:
         "object_id": struct.unpack_from("<i", body, 1)[0],
         "can_teleport": struct.unpack_from("<i", body, 5)[0] != 0,
     }
+
+
+def parse_teleport_to_location(body: bytes) -> dict:
+    """Parse TeleportToLocation (0x28): object id and destination."""
+    if len(body) < 17:
+        return {}
+    object_id, x, y, z = struct.unpack_from("<iiii", body, 1)
+    return {"object_id": object_id, "x": x, "y": y, "z": z}
+
+
+def parse_revive(body: bytes) -> dict:
+    """Parse Revive (0x07)."""
+    if len(body) < 5:
+        return {}
+    return {"object_id": struct.unpack_from("<i", body, 1)[0]}
 
 
 def parse_delete_object(body: bytes) -> dict:

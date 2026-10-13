@@ -47,6 +47,7 @@ import org.l2jmobius.gameserver.config.custom.MultilingualSupportConfig;
 import org.l2jmobius.gameserver.config.custom.OfflinePlayConfig;
 import org.l2jmobius.gameserver.config.custom.OfflineTradeConfig;
 import org.l2jmobius.gameserver.config.custom.PremiumSystemConfig;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
 import org.l2jmobius.gameserver.config.custom.SellBuffsConfig;
 import org.l2jmobius.gameserver.config.custom.WeddingConfig;
 import org.l2jmobius.gameserver.data.AugmentationData;
@@ -130,6 +131,7 @@ import org.l2jmobius.gameserver.managers.PetitionManager;
 import org.l2jmobius.gameserver.managers.PrecautionaryRestartManager;
 import org.l2jmobius.gameserver.managers.PremiumManager;
 import org.l2jmobius.gameserver.managers.PunishmentManager;
+import org.l2jmobius.gameserver.managers.RLAgentManager;
 import org.l2jmobius.gameserver.managers.RaidBossPointsManager;
 import org.l2jmobius.gameserver.managers.RaidBossSpawnManager;
 import org.l2jmobius.gameserver.managers.ScriptManager;
@@ -264,6 +266,12 @@ public class GameServer
 		{
 			LOGGER.info("PremiumManager: Premium system is enabled.");
 			PremiumManager.getInstance();
+		}
+		
+		if (RLAgentEnvironmentConfig.RL_AGENT_ENABLED)
+		{
+			LOGGER.info("RLAgentManager: RL agent environment is enabled.");
+			RLAgentManager.getInstance();
 		}
 		
 		printSection("Clans");

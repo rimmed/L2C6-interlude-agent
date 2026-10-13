@@ -1,0 +1,803 @@
+/*
+ * Copyright (c) 2013 L2jMobius
+ * 
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ * 
+ * The above copyright notice and this permission notice shall be
+ * included in all copies or substantial portions of the Software.
+ * 
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+ * WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+ * IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+ */
+package org.l2jmobius.gameserver.managers;
+
+import java.util.ArrayList;
+import java.util.Collections;
+import java.util.EnumMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.function.Consumer;
+import java.util.function.Predicate;
+import java.util.logging.Logger;
+
+import org.l2jmobius.commons.threads.ThreadPool;
+import org.l2jmobius.commons.util.Rnd;
+import org.l2jmobius.gameserver.config.custom.AllowedPlayerRacesConfig;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig.FarmZone;
+import org.l2jmobius.gameserver.data.sql.CharInfoTable;
+import org.l2jmobius.gameserver.data.xml.ExperienceData;
+import org.l2jmobius.gameserver.data.xml.ItemData;
+import org.l2jmobius.gameserver.data.xml.PlayerTemplateData;
+import org.l2jmobius.gameserver.model.Location;
+import org.l2jmobius.gameserver.model.actor.Player;
+import org.l2jmobius.gameserver.model.actor.appearance.PlayerAppearance;
+import org.l2jmobius.gameserver.model.actor.enums.player.PlayerClass;
+import org.l2jmobius.gameserver.model.actor.templates.PlayerTemplate;
+import org.l2jmobius.gameserver.model.events.Containers;
+import org.l2jmobius.gameserver.model.events.EventType;
+import org.l2jmobius.gameserver.model.events.ListenersContainer;
+import org.l2jmobius.gameserver.model.events.holders.actor.creature.OnCreatureDeath;
+import org.l2jmobius.gameserver.model.events.holders.actor.player.OnPlayerCreate;
+import org.l2jmobius.gameserver.model.events.holders.actor.player.OnPlayerLevelChanged;
+import org.l2jmobius.gameserver.model.events.holders.actor.player.OnPlayerLogin;
+import org.l2jmobius.gameserver.model.events.holders.actor.player.OnPlayerLogout;
+import org.l2jmobius.gameserver.model.events.listeners.ConsumerEventListener;
+import org.l2jmobius.gameserver.model.itemcontainer.Inventory;
+import org.l2jmobius.gameserver.model.item.Armor;
+import org.l2jmobius.gameserver.model.item.ItemTemplate;
+import org.l2jmobius.gameserver.model.item.Weapon;
+import org.l2jmobius.gameserver.model.item.enums.BodyPart;
+import org.l2jmobius.gameserver.model.item.enums.ItemProcessType;
+import org.l2jmobius.gameserver.model.item.holders.ItemHolder;
+import org.l2jmobius.gameserver.model.item.instance.Item;
+import org.l2jmobius.gameserver.model.item.type.ArmorType;
+import org.l2jmobius.gameserver.model.item.type.CrystalType;
+import org.l2jmobius.gameserver.model.item.type.WeaponType;
+import org.l2jmobius.gameserver.network.GameClient;
+import org.l2jmobius.gameserver.network.clientpackets.CharacterCreate;
+import org.l2jmobius.gameserver.network.serverpackets.ExAutoSoulShot;
+import org.l2jmobius.gameserver.util.RLAgentNameGenerator;
+
+/**
+ * Turns the server into a training environment for autonomous combat agents (see {@code config/Custom/RLAgentEnvironment.ini}).
+ * <ul>
+ * <li>an agent account without characters gets a random character on login ({@link #onAccountAuthenticated});</li>
+ * <li>on its first login an agent is boosted to a random level, promoted along a random class path, taught all skills and equipped with a grade-appropriate set for its archetype;</li>
+ * <li>shots and consumables are topped up and automatic shot use is enabled on every login and respawn;</li>
+ * <li>agents are teleported to the farm zone of their level bracket and revived there when they die.</li>
+ * </ul>
+ * Nothing is registered when {@code EnableRLAgentAutoSetup} is off, so the server then behaves as a standard L2J server.
+ */
+public class RLAgentManager
+{
+	private static final Logger LOGGER = Logger.getLogger(RLAgentManager.class.getName());
+	
+	// Player variables.
+	/** Set on characters created while the system is enabled: they are agents even if {@code RLApplyToExistingCharacters} is off. */
+	private static final String VAR_AGENT = "RL_AGENT";
+	/** Set once the first-login setup (level boost) has run. */
+	private static final String VAR_SETUP_DONE = "RL_SETUP_DONE";
+	/** Grade of the equipment set given last, so a level-up only re-equips when the grade changes. */
+	private static final String VAR_GEAR_GRADE = "RL_GEAR_GRADE";
+	
+	// Shots indexed by CrystalType ordinal (NONE, D, C, B, A, S).
+	private static final int[] SOULSHOTS = { 1835, 1463, 1464, 1465, 1466, 1467 };
+	private static final int[] SPIRITSHOTS = { 2509, 2510, 2511, 2512, 2513, 2514 };
+	private static final int[] BLESSED_SPIRITSHOTS = { 3947, 3948, 3949, 3950, 3951, 3952 };
+	
+	// Levels of the 1st, 2nd and 3rd class transfer.
+	private static final int[] CLASS_TRANSFER_LEVELS = { 20, 40, 76 };
+	
+	// Delays (server timer delays, scaled by TimeScale like every timer).
+	/** Lets EnterWorld finish before the character is moved around. */
+	private static final long LOGIN_SETUP_DELAY = 2000;
+	/** Lets the level change finish (the event is sent before the level is applied). */
+	private static final long LEVEL_CHANGE_DELAY = 500;
+	/** Completes a teleport whose client never answered with Appearing (headless clients). */
+	private static final long TELEPORT_FALLBACK_DELAY = 5000;
+	
+	/** Candidates of one slot tried before the slot is left empty. */
+	private static final int MAX_EQUIP_ATTEMPTS = 10;
+	
+	private static final int[] GEAR_SLOTS = { Inventory.PAPERDOLL_RHAND, Inventory.PAPERDOLL_LHAND, Inventory.PAPERDOLL_HEAD, Inventory.PAPERDOLL_GLOVES, Inventory.PAPERDOLL_CHEST, Inventory.PAPERDOLL_LEGS, Inventory.PAPERDOLL_FEET };
+	
+	/** Equipment style of a class. */
+	private enum Archetype
+	{
+		MAGE(ArmorType.MAGIC, false),
+		ARCHER(ArmorType.LIGHT, false),
+		DAGGER(ArmorType.LIGHT, false),
+		MONK(ArmorType.LIGHT, false),
+		FIGHTER(ArmorType.HEAVY, true);
+		
+		final ArmorType _armorType;
+		final boolean _usesShield;
+		
+		Archetype(ArmorType armorType, boolean usesShield)
+		{
+			_armorType = armorType;
+			_usesShield = usesShield;
+		}
+	}
+	
+	/** Equipment candidates of one grade and archetype, per slot. */
+	private record GearPool(List<ItemTemplate> weapons, List<ItemTemplate> shields, List<ItemTemplate> helmets, List<ItemTemplate> gloves, List<ItemTemplate> boots, List<ItemTemplate> bodies, List<ItemTemplate> legs)
+	{
+	}
+	
+	private final Map<CrystalType, Map<Archetype, GearPool>> _gearPools = new ConcurrentHashMap<>();
+	/** Players whose setup is running; their own level-up events are ignored meanwhile. */
+	private final Set<Integer> _inSetup = ConcurrentHashMap.newKeySet();
+	private final Map<Integer, ScheduledFuture<?>> _respawnTasks = new ConcurrentHashMap<>();
+	
+	// Listeners
+	private final ListenersContainer _listenerContainer = Containers.Players();
+	
+	private final Consumer<OnPlayerCreate> _playerCreateEvent = event ->
+	{
+		final Player player = event.getPlayer();
+		if (isAgentAccount(player.getAccountName()))
+		{
+			player.getVariables().set(VAR_AGENT, true);
+			player.getVariables().storeMe();
+		}
+	};
+	
+	private final Consumer<OnPlayerLogin> _playerLoginEvent = event ->
+	{
+		final Player player = event.getPlayer();
+		if (isAgent(player))
+		{
+			ThreadPool.schedule(() -> runSafely(player, "login setup", () -> onAgentLogin(player)), LOGIN_SETUP_DELAY);
+		}
+	};
+	
+	private final Consumer<OnPlayerLogout> _playerLogoutEvent = event ->
+	{
+		final ScheduledFuture<?> task = _respawnTasks.remove(event.getPlayer().getObjectId());
+		if (task != null)
+		{
+			task.cancel(false);
+		}
+	};
+	
+	private final Consumer<OnPlayerLevelChanged> _playerLevelChangedEvent = event ->
+	{
+		final Player player = event.getPlayer();
+		if ((event.getNewLevel() > event.getOldLevel()) && isAgent(player) && !_inSetup.contains(player.getObjectId()))
+		{
+			ThreadPool.schedule(() -> runSafely(player, "level-up progression", () -> progress(player, false)), LEVEL_CHANGE_DELAY);
+		}
+	};
+	
+	private final Consumer<OnCreatureDeath> _creatureDeathEvent = event ->
+	{
+		if (!RLAgentEnvironmentConfig.RL_RESPAWN_ON_DEATH || !event.getTarget().isPlayer())
+		{
+			return;
+		}
+		
+		final Player player = event.getTarget().asPlayer();
+		if (isAgent(player))
+		{
+			_respawnTasks.put(player.getObjectId(), ThreadPool.schedule(() -> runSafely(player, "respawn", () -> respawn(player)), RLAgentEnvironmentConfig.RL_RESPAWN_DELAY));
+		}
+	};
+	
+	protected RLAgentManager()
+	{
+		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_CREATE, _playerCreateEvent, this));
+		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LOGIN, _playerLoginEvent, this));
+		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LOGOUT, _playerLogoutEvent, this));
+		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LEVEL_CHANGED, _playerLevelChangedEvent, this));
+		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_CREATURE_DEATH, _creatureDeathEvent, this));
+		LOGGER.info(getClass().getSimpleName() + ": Agent levels " + RLAgentEnvironmentConfig.RL_MIN_LEVEL + "-" + RLAgentEnvironmentConfig.RL_MAX_LEVEL + ", accounts matching \"" + RLAgentEnvironmentConfig.RL_AGENT_ACCOUNT_PATTERN.pattern() + "\", " + RLAgentEnvironmentConfig.RL_FARM_ZONES.size() + " farm zone bracket(s).");
+	}
+	
+	// --------------------------------------------------------------------------------
+	// Agent detection
+	// --------------------------------------------------------------------------------
+	
+	private static boolean isAgentAccount(String accountName)
+	{
+		return RLAgentEnvironmentConfig.RL_AGENT_ENABLED && (accountName != null) && RLAgentEnvironmentConfig.RL_AGENT_ACCOUNT_PATTERN.matcher(accountName).matches();
+	}
+	
+	/**
+	 * @param player the player to check
+	 * @return {@code true} if the automated environment manages this character
+	 */
+	public boolean isAgent(Player player)
+	{
+		return (player != null) && isAgentAccount(player.getAccountName()) && (RLAgentEnvironmentConfig.RL_APPLY_TO_EXISTING_CHARACTERS || player.getVariables().getBoolean(VAR_AGENT, false));
+	}
+	
+	private void runSafely(Player player, String what, Runnable action)
+	{
+		try
+		{
+			action.run();
+		}
+		catch (Exception e)
+		{
+			LOGGER.warning(getClass().getSimpleName() + ": " + what + " failed for " + player + ": " + e);
+		}
+	}
+	
+	// --------------------------------------------------------------------------------
+	// Character creation
+	// --------------------------------------------------------------------------------
+	
+	/**
+	 * Called right before the character list is sent to a freshly authenticated client: an agent account without characters gets a random one, so a headless client can select slot 0 immediately.
+	 * @param client the authenticated client
+	 */
+	public void onAccountAuthenticated(GameClient client)
+	{
+		final String account = client.getAccountName();
+		if (!RLAgentEnvironmentConfig.RL_AUTO_CREATE_CHARACTER || !isAgentAccount(account))
+		{
+			return;
+		}
+		
+		final List<PlayerClass> baseClasses = new ArrayList<>();
+		for (PlayerClass playerClass : PlayerClass.values())
+		{
+			if ((playerClass.level() == 0) && isRaceAllowed(playerClass) && (PlayerTemplateData.getInstance().getTemplate(playerClass) != null))
+			{
+				baseClasses.add(playerClass);
+			}
+		}
+		if (baseClasses.isEmpty())
+		{
+			LOGGER.warning(getClass().getSimpleName() + ": No allowed base class, cannot create a character for " + account + ".");
+			return;
+		}
+		
+		final PlayerClass baseClass = baseClasses.get(Rnd.get(baseClasses.size()));
+		final PlayerTemplate template = PlayerTemplateData.getInstance().getTemplate(baseClass);
+		final boolean female = Rnd.nextBoolean();
+		final PlayerAppearance appearance = new PlayerAppearance((byte) Rnd.get(0, 2), (byte) Rnd.get(0, 3), (byte) Rnd.get(0, female ? 6 : 4), female);
+		
+		final Player newChar;
+		synchronized (CharInfoTable.getInstance())
+		{
+			if (CharInfoTable.getInstance().getAccountCharacterCount(account) > 0)
+			{
+				return;
+			}
+			
+			final String name = RLAgentNameGenerator.generate();
+			if (name == null)
+			{
+				LOGGER.warning(getClass().getSimpleName() + ": Could not generate a free character name for " + account + ".");
+				return;
+			}
+			
+			newChar = Player.create(template, account, name, appearance);
+		}
+		if (newChar == null)
+		{
+			return;
+		}
+		
+		newChar.setCurrentHp(newChar.getMaxHp());
+		newChar.setCurrentMp(newChar.getMaxMp());
+		CharacterCreate.initNewChar(client, newChar);
+		LOGGER.info(getClass().getSimpleName() + ": Created agent character " + newChar.getName() + " (" + baseClass + ") for account " + account + ".");
+	}
+	
+	private static boolean isRaceAllowed(PlayerClass playerClass)
+	{
+		return switch (playerClass.getRace())
+		{
+			case HUMAN -> AllowedPlayerRacesConfig.ALLOW_HUMAN;
+			case ELF -> AllowedPlayerRacesConfig.ALLOW_ELF;
+			case DARK_ELF -> AllowedPlayerRacesConfig.ALLOW_DARKELF;
+			case ORC -> AllowedPlayerRacesConfig.ALLOW_ORC;
+			case DWARF -> AllowedPlayerRacesConfig.ALLOW_DWARF;
+			default -> false;
+		};
+	}
+	
+	// --------------------------------------------------------------------------------
+	// Login setup, progression and respawn
+	// --------------------------------------------------------------------------------
+	
+	private void onAgentLogin(Player player)
+	{
+		if (!player.isOnline())
+		{
+			return;
+		}
+		
+		final boolean firstSetup = !player.getVariables().getBoolean(VAR_SETUP_DONE, false);
+		_inSetup.add(player.getObjectId());
+		try
+		{
+			if (firstSetup)
+			{
+				boostLevel(player);
+			}
+			
+			progress(player, firstSetup);
+			
+			if (player.isDead())
+			{
+				player.doRevive();
+			}
+			restoreVitals(player);
+			
+			if (RLAgentEnvironmentConfig.RL_TELEPORT_TO_FARM_ZONE && (firstSetup || RLAgentEnvironmentConfig.RL_TELEPORT_ON_LOGIN))
+			{
+				teleportToFarmZone(player);
+			}
+			
+			if (firstSetup)
+			{
+				player.getVariables().set(VAR_SETUP_DONE, true);
+				LOGGER.info(getClass().getSimpleName() + ": Agent " + player.getName() + " set up: level " + player.getLevel() + ", " + player.getPlayerClass() + ".");
+			}
+			player.getVariables().storeMe();
+			player.store(false);
+		}
+		finally
+		{
+			_inSetup.remove(player.getObjectId());
+		}
+	}
+	
+	private void boostLevel(Player player)
+	{
+		final int maxLevel = Math.min(RLAgentEnvironmentConfig.RL_MAX_LEVEL, ExperienceData.getInstance().getMaxLevel() - 1);
+		final int targetLevel = Rnd.get(Math.min(RLAgentEnvironmentConfig.RL_MIN_LEVEL, maxLevel), maxLevel);
+		if (player.getLevel() >= targetLevel)
+		{
+			return;
+		}
+		
+		player.addExpAndSp(ExperienceData.getInstance().getExpForLevel(targetLevel) - player.getExp(), 0);
+	}
+	
+	/**
+	 * Applies everything that depends on the level: class transfers, skills, equipment and supplies.
+	 * @param player the agent
+	 * @param forceEquip {@code true} to give a new equipment set even if the grade did not change
+	 */
+	private void progress(Player player, boolean forceEquip)
+	{
+		if (!player.isOnline())
+		{
+			return;
+		}
+		
+		if (RLAgentEnvironmentConfig.RL_AUTO_CLASS_TRANSFER)
+		{
+			transferClasses(player);
+		}
+		
+		if (RLAgentEnvironmentConfig.RL_AUTO_LEARN_SKILLS)
+		{
+			learnSkills(player);
+		}
+		
+		if (RLAgentEnvironmentConfig.RL_AUTO_EQUIP)
+		{
+			final CrystalType grade = gradeForLevel(player.getLevel());
+			if (forceEquip || !grade.name().equals(player.getVariables().getString(VAR_GEAR_GRADE, "")))
+			{
+				equip(player, grade);
+			}
+		}
+		
+		supply(player);
+	}
+	
+	private void respawn(Player player)
+	{
+		_respawnTasks.remove(player.getObjectId());
+		if (!player.isOnline() || !player.isDead())
+		{
+			return;
+		}
+		
+		player.doRevive();
+		restoreVitals(player);
+		teleportToFarmZone(player);
+		supply(player);
+	}
+	
+	private static void restoreVitals(Player player)
+	{
+		player.setCurrentHpMp(player.getMaxHp(), player.getMaxMp());
+		player.setCurrentCp(player.getMaxCp());
+	}
+	
+	// --------------------------------------------------------------------------------
+	// Class transfer and skills
+	// --------------------------------------------------------------------------------
+	
+	private void transferClasses(Player player)
+	{
+		boolean changed = false;
+		while (true)
+		{
+			final PlayerClass current = player.getPlayerClass();
+			final int transfer = current.level();
+			if ((transfer >= CLASS_TRANSFER_LEVELS.length) || (player.getLevel() < CLASS_TRANSFER_LEVELS[transfer]))
+			{
+				break;
+			}
+			
+			final List<PlayerClass> options = new ArrayList<>(current.getNextClasses());
+			if (options.isEmpty())
+			{
+				break;
+			}
+			
+			final PlayerClass next = options.get(Rnd.get(options.size()));
+			player.setPlayerClass(next.getId());
+			if (player.isSubClassActive())
+			{
+				player.getSubClasses().get(player.getClassIndex()).setPlayerClass(player.getActiveClass());
+			}
+			else
+			{
+				player.setBaseClass(player.getActiveClass());
+			}
+			changed = true;
+		}
+		
+		if (changed)
+		{
+			player.broadcastUserInfo();
+		}
+	}
+	
+	private static void learnSkills(Player player)
+	{
+		// A class transfer can unlock skills that in turn are prerequisites, so repeat until nothing new is learned.
+		for (int round = 0; (round < 10) && (player.giveAvailableSkills(false, true, true) > 0); round++)
+		{
+			// Keep learning.
+		}
+		player.sendSkillList();
+	}
+	
+	// --------------------------------------------------------------------------------
+	// Equipment
+	// --------------------------------------------------------------------------------
+	
+	private static CrystalType gradeForLevel(int level)
+	{
+		CrystalType grade = CrystalType.NONE;
+		for (Entry<Integer, CrystalType> entry : RLAgentEnvironmentConfig.RL_GRADE_LEVELS.entrySet())
+		{
+			if (level >= entry.getKey())
+			{
+				grade = entry.getValue();
+			}
+		}
+		return grade;
+	}
+	
+	private static Archetype archetypeOf(PlayerClass playerClass)
+	{
+		if (playerClass.isMage())
+		{
+			return Archetype.MAGE;
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.HAWKEYE) || playerClass.equalsOrChildOf(PlayerClass.SILVER_RANGER) || playerClass.equalsOrChildOf(PlayerClass.PHANTOM_RANGER))
+		{
+			return Archetype.ARCHER;
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.ROGUE) || playerClass.equalsOrChildOf(PlayerClass.ELVEN_SCOUT) || playerClass.equalsOrChildOf(PlayerClass.ASSASSIN))
+		{
+			return Archetype.DAGGER;
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.ORC_MONK))
+		{
+			return Archetype.MONK;
+		}
+		return Archetype.FIGHTER;
+	}
+	
+	private void equip(Player player, CrystalType grade)
+	{
+		final GearPool pool = _gearPools.computeIfAbsent(grade, g -> new EnumMap<>(Archetype.class)).computeIfAbsent(archetypeOf(player.getPlayerClass()), archetype -> buildGearPool(grade, archetype));
+		if (pool.weapons().isEmpty())
+		{
+			LOGGER.warning(getClass().getSimpleName() + ": No " + grade + " weapon for " + player.getPlayerClass() + ".");
+			return;
+		}
+		
+		// Agent inventories are disposable: the replaced set is destroyed instead of piling up.
+		final Inventory inventory = player.getInventory();
+		final Set<Integer> removed = new HashSet<>();
+		for (int slot : GEAR_SLOTS)
+		{
+			final Item old = inventory.getPaperdollItem(slot);
+			if ((old != null) && removed.add(old.getObjectId()))
+			{
+				inventory.unEquipItemInSlot(slot);
+				player.destroyItem(ItemProcessType.NONE, old, null, false);
+			}
+		}
+		
+		final Item weapon = equipFirstFitting(player, pool.weapons());
+		if ((weapon == null) || (weapon.getTemplate().getBodyPart() != BodyPart.LR_HAND))
+		{
+			equipFirstFitting(player, pool.shields());
+		}
+		equipFirstFitting(player, pool.helmets());
+		equipFirstFitting(player, pool.gloves());
+		equipFirstFitting(player, pool.boots());
+		final Item body = equipFirstFitting(player, pool.bodies());
+		if ((body == null) || (body.getTemplate().getBodyPart() != BodyPart.FULL_ARMOR))
+		{
+			equipFirstFitting(player, pool.legs());
+		}
+		
+		player.getVariables().set(VAR_GEAR_GRADE, grade.name());
+		player.sendItemList(false);
+		player.broadcastUserInfo();
+	}
+	
+	/**
+	 * Equips a random candidate the player can actually wear: items with an equip condition the agent does not meet (e.g. clan-rank Apella armor) are skipped, and an item the inventory refuses to equip is destroyed and the next one is tried.
+	 * @param player the agent
+	 * @param candidates the slot's candidates
+	 * @return the equipped item, or {@code null} if the slot stays empty
+	 */
+	private static Item equipFirstFitting(Player player, List<ItemTemplate> candidates)
+	{
+		final List<ItemTemplate> shuffled = new ArrayList<>(candidates);
+		Collections.shuffle(shuffled);
+		int attempts = 0;
+		for (ItemTemplate template : shuffled)
+		{
+			if (attempts >= MAX_EQUIP_ATTEMPTS)
+			{
+				break;
+			}
+			if (!template.checkCondition(player, player, false))
+			{
+				continue;
+			}
+			
+			attempts++;
+			final Item item = player.getInventory().addItem(ItemProcessType.REWARD, template.getId(), 1, player, null);
+			if (item == null)
+			{
+				continue;
+			}
+			player.getInventory().equipItem(item);
+			if (item.isEquipped())
+			{
+				return item;
+			}
+			player.destroyItem(ItemProcessType.NONE, item, null, false);
+		}
+		return null;
+	}
+	
+	/**
+	 * A/S gloves and boots come in armor-type variants ("... - Heavy Armor", "... - Light Armor", "... - Robe") whose set bonus only works with that armor type.
+	 * @param item the armor piece
+	 * @param archetype the agent's archetype
+	 * @return {@code false} for a variant of another armor type
+	 */
+	private static boolean fitsArmorVariant(ItemTemplate item, Archetype archetype)
+	{
+		final String name = item.getName();
+		if (name.endsWith("- Heavy Armor"))
+		{
+			return archetype._armorType == ArmorType.HEAVY;
+		}
+		if (name.endsWith("- Light Armor"))
+		{
+			return archetype._armorType == ArmorType.LIGHT;
+		}
+		if (name.endsWith("- Robe"))
+		{
+			return archetype._armorType == ArmorType.MAGIC;
+		}
+		return true;
+	}
+	
+	private static GearPool buildGearPool(CrystalType grade, Archetype archetype)
+	{
+		// Sealed A/S pieces lack the set bonus until unsealed, test and time-limited (shadow) items are not real gear.
+		final Predicate<ItemTemplate> usable = item -> (item.getCrystalType() == grade) && (item.getReferencePrice() > 0) && (item.getDuration() <= 0) && !item.isQuestItem() && !item.isHeroItem() && !item.isPvpItem() && !item.isCommon() && !item.getName().contains("Test") && !item.getName().startsWith("Sealed ");
+		
+		final List<ItemTemplate> weapons = new ArrayList<>();
+		for (Weapon weapon : ItemData.getInstance().getAllWeapons())
+		{
+			if (usable.test(weapon) && fitsArchetype(weapon, archetype))
+			{
+				weapons.add(weapon);
+			}
+		}
+		
+		final List<ItemTemplate> shields = new ArrayList<>();
+		final List<ItemTemplate> helmets = new ArrayList<>();
+		final List<ItemTemplate> gloves = new ArrayList<>();
+		final List<ItemTemplate> boots = new ArrayList<>();
+		final List<ItemTemplate> bodies = new ArrayList<>();
+		final List<ItemTemplate> legs = new ArrayList<>();
+		for (Armor armor : ItemData.getInstance().getAllArmors())
+		{
+			if (!usable.test(armor) || !fitsArmorVariant(armor, archetype))
+			{
+				continue;
+			}
+			
+			final BodyPart bodyPart = armor.getBodyPart();
+			final boolean ownType = armor.getItemType() == archetype._armorType;
+			if ((bodyPart == BodyPart.L_HAND) && archetype._usesShield)
+			{
+				shields.add(armor);
+			}
+			else if (bodyPart == BodyPart.HEAD)
+			{
+				helmets.add(armor);
+			}
+			else if (bodyPart == BodyPart.GLOVES)
+			{
+				gloves.add(armor);
+			}
+			else if (bodyPart == BodyPart.FEET)
+			{
+				boots.add(armor);
+			}
+			else if (((bodyPart == BodyPart.CHEST) || (bodyPart == BodyPart.FULL_ARMOR)) && ownType)
+			{
+				bodies.add(armor);
+			}
+			else if ((bodyPart == BodyPart.LEGS) && ownType)
+			{
+				legs.add(armor);
+			}
+		}
+		
+		LOGGER.info(RLAgentManager.class.getSimpleName() + ": " + grade + " " + archetype + " gear pool: " + weapons.size() + " weapons, " + shields.size() + " shields, " + helmets.size() + " helmets, " + gloves.size() + " gloves, " + boots.size() + " boots, " + bodies.size() + " bodies, " + legs.size() + " legs.");
+		return new GearPool(weapons, shields, helmets, gloves, boots, bodies, legs);
+	}
+	
+	private static boolean fitsArchetype(Weapon weapon, Archetype archetype)
+	{
+		final WeaponType type = weapon.getItemType();
+		return switch (archetype)
+		{
+			case MAGE -> weapon.isMagicWeapon() && ((type == WeaponType.SWORD) || (type == WeaponType.BLUNT));
+			case ARCHER -> type == WeaponType.BOW;
+			case DAGGER -> type == WeaponType.DAGGER;
+			case MONK -> (type == WeaponType.DUALFIST) || (type == WeaponType.FIST);
+			case FIGHTER -> !weapon.isMagicWeapon() && ((type == WeaponType.SWORD) || (type == WeaponType.BLUNT)) && (weapon.getBodyPart() == BodyPart.R_HAND);
+		};
+	}
+	
+	// --------------------------------------------------------------------------------
+	// Supplies
+	// --------------------------------------------------------------------------------
+	
+	private void supply(Player player)
+	{
+		final Weapon weapon = player.getActiveWeaponItem();
+		final int gradeIndex = (weapon == null) ? 0 : Math.min(weapon.getCrystalType().ordinal(), SOULSHOTS.length - 1);
+		final int shotId;
+		final int shotCount;
+		if (player.isMageClass())
+		{
+			shotId = RLAgentEnvironmentConfig.RL_USE_BLESSED_SPIRITSHOTS ? BLESSED_SPIRITSHOTS[gradeIndex] : SPIRITSHOTS[gradeIndex];
+			shotCount = RLAgentEnvironmentConfig.RL_SPIRITSHOT_COUNT;
+		}
+		else
+		{
+			shotId = SOULSHOTS[gradeIndex];
+			shotCount = RLAgentEnvironmentConfig.RL_SOULSHOT_COUNT;
+		}
+		
+		topUp(player, shotId, shotCount);
+		for (ItemHolder consumable : RLAgentEnvironmentConfig.RL_CONSUMABLES)
+		{
+			topUp(player, consumable.getId(), consumable.getCount());
+		}
+		
+		if (RLAgentEnvironmentConfig.RL_AUTO_ENABLE_SHOTS && (shotCount > 0) && (weapon != null) && (player.getActiveWeaponItem() != player.getFistsWeaponItem()))
+		{
+			for (int oldShot : new ArrayList<>(player.getAutoSoulShot()))
+			{
+				if (oldShot != shotId)
+				{
+					player.removeAutoSoulShot(oldShot);
+					player.sendPacket(new ExAutoSoulShot(oldShot, 0));
+				}
+			}
+			player.addAutoSoulShot(shotId);
+			player.sendPacket(new ExAutoSoulShot(shotId, 1));
+			player.rechargeShots(true, true);
+		}
+	}
+	
+	private static void topUp(Player player, int itemId, int wanted)
+	{
+		if ((wanted <= 0) || (ItemData.getInstance().getTemplate(itemId) == null))
+		{
+			return;
+		}
+		
+		final int missing = wanted - player.getInventory().getInventoryItemCount(itemId, -1);
+		if (missing > 0)
+		{
+			player.addItem(ItemProcessType.REWARD, itemId, missing, null, false);
+		}
+	}
+	
+	// --------------------------------------------------------------------------------
+	// Farm zones
+	// --------------------------------------------------------------------------------
+	
+	private void teleportToFarmZone(Player player)
+	{
+		final Location anchor = farmZoneAnchor(player);
+		if (anchor == null)
+		{
+			return;
+		}
+		
+		final int spread = RLAgentEnvironmentConfig.RL_FARM_ZONE_SPREAD;
+		final Location destination = new Location(anchor.getX() + Rnd.get(-spread, spread), anchor.getY() + Rnd.get(-spread, spread), anchor.getZ());
+		player.teleToLocation(destination, false);
+		
+		// A headless client may never send Appearing; finish the teleport for it.
+		ThreadPool.schedule(() ->
+		{
+			if (player.isOnline() && player.isTeleporting())
+			{
+				player.onTeleported();
+			}
+		}, TELEPORT_FALLBACK_DELAY);
+	}
+	
+	private static Location farmZoneAnchor(Player player)
+	{
+		for (FarmZone zone : RLAgentEnvironmentConfig.RL_FARM_ZONES)
+		{
+			if ((player.getLevel() >= zone.minLevel()) && (player.getLevel() <= zone.maxLevel()))
+			{
+				if (zone.useStartPoint() || zone.anchors().isEmpty())
+				{
+					return player.getTemplate().getCreationPoint();
+				}
+				return zone.anchors().get(Rnd.get(zone.anchors().size()));
+			}
+		}
+		return null;
+	}
+	
+	public static RLAgentManager getInstance()
+	{
+		return SingletonHolder.INSTANCE;
+	}
+	
+	private static class SingletonHolder
+	{
+		protected static final RLAgentManager INSTANCE = new RLAgentManager();
+	}
+}

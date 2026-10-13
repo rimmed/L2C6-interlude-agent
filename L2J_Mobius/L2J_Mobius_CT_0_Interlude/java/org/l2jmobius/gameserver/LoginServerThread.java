@@ -52,6 +52,8 @@ import org.l2jmobius.commons.util.HexUtil;
 import org.l2jmobius.commons.util.TraceUtil;
 import org.l2jmobius.gameserver.config.GeneralConfig;
 import org.l2jmobius.gameserver.config.ServerConfig;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
+import org.l2jmobius.gameserver.managers.RLAgentManager;
 import org.l2jmobius.gameserver.model.World;
 import org.l2jmobius.gameserver.model.actor.Player;
 import org.l2jmobius.gameserver.network.ConnectionState;
@@ -336,6 +338,11 @@ public class LoginServerThread extends Thread
 									sendPacket(pig);
 									wcToRemove.gameClient.setConnectionState(ConnectionState.AUTHENTICATED);
 									wcToRemove.gameClient.setSessionId(wcToRemove.sessionKey);
+									if (RLAgentEnvironmentConfig.RL_AGENT_ENABLED)
+									{
+										// An agent account without characters gets one before it sees the character list.
+										RLAgentManager.getInstance().onAccountAuthenticated(wcToRemove.gameClient);
+									}
 									final CharSelectionInfo cl = new CharSelectionInfo(wcToRemove.account, wcToRemove.gameClient.getSessionId().playOkID1);
 									wcToRemove.gameClient.sendPacket(cl);
 									wcToRemove.gameClient.setCharSelection(cl.getCharInfo());

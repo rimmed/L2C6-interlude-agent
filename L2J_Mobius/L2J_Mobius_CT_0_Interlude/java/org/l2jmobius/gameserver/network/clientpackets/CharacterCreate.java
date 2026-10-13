@@ -240,6 +240,10 @@ public class CharacterCreate extends ClientPacket
 		// newChar.setMaxLoad(template.getBaseLoad());
 		
 		initNewChar(client, newChar);
+		
+		final CharSelectionInfo cl = new CharSelectionInfo(client.getAccountName(), client.getSessionId().playOkID1);
+		client.sendPacket(cl);
+		client.setCharSelection(cl.getCharInfo());
 		client.sendPacket(CharCreateOk.STATIC_PACKET);
 		
 		LOGGER_ACCOUNTING.info("Created new character, " + newChar + ", " + client);
@@ -250,7 +254,13 @@ public class CharacterCreate extends ClientPacket
 		return ServerConfig.CHARNAME_TEMPLATE_PATTERN.matcher(text).matches();
 	}
 	
-	private void initNewChar(GameClient client, Player newChar)
+	/**
+	 * Places a freshly created character in the world, gives the starting items, skills and shortcuts, notifies the {@code ON_PLAYER_CREATE} listeners and stores it.<br>
+	 * The caller is responsible for sending the updated character list to the client.
+	 * @param client the owning client
+	 * @param newChar the character returned by {@link Player#create}
+	 */
+	public static void initNewChar(GameClient client, Player newChar)
 	{
 		World.getInstance().addObject(newChar);
 		
@@ -331,17 +341,13 @@ public class CharacterCreate extends ClientPacket
 		
 		newChar.setOnlineStatus(true, false);
 		Disconnection.of(client, newChar).storeAndDelete();
-		
-		final CharSelectionInfo cl = new CharSelectionInfo(client.getAccountName(), client.getSessionId().playOkID1);
-		client.sendPacket(cl);
-		client.setCharSelection(cl.getCharInfo());
 	}
 	
 	/**
 	 * TODO: Unhardcode it using the new listeners.
 	 * @param player
 	 */
-	public void startTutorialQuest(Player player)
+	public static void startTutorialQuest(Player player)
 	{
 		final QuestState qs = player.getQuestState("Q00255_Tutorial");
 		Quest q = null;

@@ -51,6 +51,7 @@ import org.l2jmobius.gameserver.config.custom.PrivateStoreRangeConfig;
 import org.l2jmobius.gameserver.config.custom.PvpAnnounceConfig;
 import org.l2jmobius.gameserver.config.custom.PvpRewardItemConfig;
 import org.l2jmobius.gameserver.config.custom.PvpTitleColorConfig;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
 import org.l2jmobius.gameserver.config.custom.RandomSpawnsConfig;
 import org.l2jmobius.gameserver.config.custom.SchemeBufferConfig;
 import org.l2jmobius.gameserver.config.custom.ScreenWelcomeMessageConfig;
@@ -122,6 +123,7 @@ public class ConfigLoader
 		PvpAnnounceConfig.load();
 		PvpRewardItemConfig.load();
 		PvpTitleColorConfig.load();
+		RLAgentEnvironmentConfig.load();
 		RandomSpawnsConfig.load();
 		SchemeBufferConfig.load();
 		ScreenWelcomeMessageConfig.load();
