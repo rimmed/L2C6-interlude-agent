@@ -57,7 +57,7 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Subset
+from torch.utils.data import DataLoader, Dataset, Subset, WeightedRandomSampler, get_worker_info
 from tqdm import tqdm
 
 # ``uv run l2_NN/train.py`` puts *this file's* directory on ``sys.path``; the project root (the
@@ -66,6 +66,7 @@ PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from l2_NN.dataloader.augment import AugmentConfig  # noqa: E402
 from l2_NN.dataloader.dataloder import (  # noqa: E402 - PROJECT_ROOT is added just above
     MOB_FEATURE_DIM,
     MOB_FEATURE_NAMES,
@@ -100,7 +101,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     data.add_argument("--data-path", type=Path, default=DEFAULT_DATA_PATH, help="Cleaned player-action Parquet file")
     data.add_argument("--seq-len", type=int, default=16, help="Context window length L")
     data.add_argument("--max-mobs", type=int, default=10, help="Top-K monster candidates")
-    data.add_argument("--max-skills", type=int, default=16, help="Skill panel slots N")
+    data.add_argument("--max-skills", type=int, default=64, help="Skill panel slots N")
     data.add_argument("--val-fraction", type=float, default=0.2, help="Share of windows held out for validation")
     data.add_argument(
         "--split-by",
@@ -109,6 +110,13 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
         help="Group key of the train/val split; no group is ever on both sides",
     )
     data.add_argument("--num-workers", type=int, default=2, help="DataLoader worker processes")
+    data.add_argument("--no-augment", action="store_true", help="Train on plain windows (see dataloader/augment.py)")
+    data.add_argument(
+        "--balance-actions",
+        type=float,
+        default=0.0,
+        help="Oversample rare target actions: sample weight = count(action)^-ALPHA (0 = off, 0.5 = moderate)",
+    )
     data.add_argument(
         "--keep-last-target-flag",
         action="store_true",
@@ -206,6 +214,26 @@ def group_split(
     return np.flatnonzero(~is_val).tolist(), np.flatnonzero(is_val).tolist()
 
 
+class AugmentedWindows(Dataset):
+    """The training split with window augmentations; every DataLoader worker draws from its own RNG."""
+
+    def __init__(self, dataset: Lineage2EventDataset, indices: list[int], cfg: AugmentConfig, seed: int):
+        self.dataset = dataset
+        self.indices = indices
+        self.cfg = cfg
+        self.seed = seed
+        self._rng: np.random.Generator | None = None
+
+    def __len__(self) -> int:
+        return len(self.indices)
+
+    def __getitem__(self, i: int) -> dict[str, torch.Tensor]:
+        if self._rng is None:
+            worker = get_worker_info()
+            self._rng = np.random.default_rng([self.seed, worker.id if worker is not None else 0])
+        return self.dataset.window(self.indices[i], self.cfg, self._rng)
+
+
 def build_loaders(
     args: argparse.Namespace,
 ) -> tuple[Lineage2EventDataset, DataLoader, DataLoader, dict[str, int]]:
@@ -238,7 +266,16 @@ def build_loaders(
         persistent_workers=args.num_workers > 0,
     )
     generator = torch.Generator().manual_seed(args.seed)
-    train_loader = DataLoader(Subset(dataset, train_idx), shuffle=True, drop_last=True, generator=generator, **common)
+    train_set = Subset(dataset, train_idx) if args.no_augment else AugmentedWindows(dataset, train_idx, AugmentConfig(), args.seed)
+    sampler = None
+    if args.balance_actions > 0:
+        actions = dataset.features.action_type[[dataset.samples[i][1] for i in train_idx]]
+        counts = np.bincount(actions, minlength=dataset.num_actions).astype(np.float64)
+        weights = counts[actions] ** -args.balance_actions
+        sampler = WeightedRandomSampler(torch.as_tensor(weights), num_samples=len(train_idx), replacement=True,
+                                        generator=generator)
+    train_loader = DataLoader(train_set, shuffle=sampler is None, sampler=sampler, drop_last=True,
+                              generator=generator if sampler is None else None, **common)
     val_loader = DataLoader(Subset(dataset, val_idx), shuffle=False, **common)
     return dataset, train_loader, val_loader, split_info
 
@@ -254,7 +291,7 @@ def prepare_batch(
     last_target_flags = batch["mobs_matrix"][:, -1, :, MOB_IS_TARGET_AT]
     masks = {
         "pointer": last_target_flags.gt(0.5).any(dim=-1),
-        "skill": batch["target_action_type"].eq(USED_SKILL_ACTION_ID),
+        "skill": batch["target_action_type"].eq(USED_SKILL_ACTION_ID) & batch["target_skill_valid"],
     }
     if hide_last_target:
         mobs = batch["mobs_matrix"].clone()
@@ -530,7 +567,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
             "action_to_id": dataset.action_to_id,
-            "skill_panel": {int(k): v for k, v in dataset.skill_panel.items()},
             "split": {"by": args.split_by, **split_info},
             "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         }

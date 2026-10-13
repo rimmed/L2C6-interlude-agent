@@ -3,8 +3,11 @@ Lineage2 C6 Interlude -- neural combat policy for the headless client.
 
 Runs the ONNX export of ``CombatEventTransformer`` (see ``l2_NN/export_onnx.py``) on the live game
 state.  Only ``numpy`` and ``onnxruntime`` are needed: every normalisation constant, the window
-length, the action label space and the per-character skill panels come from the ``.json`` file
-that the exporter writes next to the ``.onnx`` file.
+length and the action label space come from the ``.json`` file that the exporter writes next to
+the ``.onnx`` file.  The skill panel is the character's own combat skills (``SkillList`` filtered
+by the datapack catalog, ``skill_data.combat_panel``), each slot described by its datapack features
+(``l2_client/skill_features.py``, shared with the training dataloader) - so skills of classes the
+model never saw are usable.
 
 How the live state is fed to the network
 ----------------------------------------
@@ -21,8 +24,7 @@ mirrors that:
   with the "pick a target" decision exactly like the training sessions do.
 
 Features the client cannot observe are filled the way the training data filled them: the logs had
-no move speed (constant default) and no MP cost (``has_enough_mp`` is always 1), every panel slot
-is ``is_available``.  Skill cooldowns come from the server's SkillCoolTime (0xC1) answers; until
+no move speed (constant default).  Skill cooldowns come from the server's SkillCoolTime (0xC1) answers; until
 one arrives after a cast, the datapack reuse delay is used as an estimate.
 
 Two clocks are involved when the server runs with ``TimeScale`` > 1 (``server_speed``): the server
@@ -48,6 +50,7 @@ from typing import Any
 
 import numpy as np
 
+from . import skill_features
 from .tools.data import skill_data
 
 #: Action classes the bot can execute.  The rest of the label space (inflicted_damage, killed, ...)
@@ -67,7 +70,7 @@ MAX_TARGET_DZ = 300
 CAST_GRACE_S = 1.5
 
 #: The metadata layout this module understands (``METADATA_VERSION`` in ``export_onnx.py``).
-SUPPORTED_METADATA_VERSION = 1
+SUPPORTED_METADATA_VERSION = 2
 
 # StatusUpdate (0x0E) attribute ids, see ``packets.STATUS_ATTRIBUTE_NAMES``.
 _SU_LEVEL, _SU_CUR_HP, _SU_MAX_HP, _SU_CUR_MP, _SU_MAX_MP, _SU_CUR_CP, _SU_MAX_CP = (
@@ -144,7 +147,6 @@ class CombatPolicy:
     def __init__(
         self,
         model_path: str | Path | None,
-        character_id: int | None = None,
         providers: list[str] | None = None,
         server_speed: float = 1.0,
         device: str = "cpu",
@@ -155,8 +157,6 @@ class CombatPolicy:
         """
         :param model_path: ``.onnx`` file; its ``.json`` metadata must sit next to it. ``None`` builds
             an encoder only (:meth:`observe` works, :meth:`act` does not) from ``metadata_path``
-        :param character_id: training ``character_id`` whose skill panel to use; ``None`` picks the
-            panel that overlaps most with the character's skills (see :meth:`bind_character`)
         :param providers: onnxruntime execution providers; overrides ``device`` when given
         :param device: ``"cpu"`` or ``"gpu"`` (CUDA); a GPU session that silently falls back to the
             CPU raises instead, so a benchmark can never measure the wrong device
@@ -187,7 +187,8 @@ class CombatPolicy:
         #: :meth:`decide` call (feature encoding + inference + masking), in call order.
         self.inference_ms: list[float] = []
         self.decide_ms: list[float] = []
-        self._init_layout(character_id, server_speed, max_target_dz)
+        self._check_skill_encoding(meta_path)
+        self._init_layout(server_speed, max_target_dz)
 
     def _open_session(self, model_path: Path, providers: list[str] | None, device: str) -> None:
         import onnxruntime as ort  # imported lazily: the scripted bot must run without it
@@ -206,7 +207,21 @@ class CombatPolicy:
             raise RuntimeError(f"requested {providers[0]}, but the session runs on {self.session.get_providers()}")
         self.device = "gpu" if self.session.get_providers()[0] == "CUDAExecutionProvider" else "cpu"
 
-    def _init_layout(self, character_id: int | None, server_speed: float, max_target_dz: float | None) -> None:
+    def _check_skill_encoding(self, meta_path: Path) -> None:
+        """The model was trained with these skill-feature scales; a different encoder would feed it garbage."""
+        expected = self.meta.get("skill_encoding", {})
+        actual = {
+            "power_log_scale": skill_features.POWER_LOG_SCALE,
+            "cast_range_scale": skill_features.CAST_RANGE_SCALE,
+            "hit_time_scale_ms": skill_features.HIT_TIME_SCALE_MS,
+            "reuse_log_scale": skill_features.REUSE_LOG_SCALE,
+            "cooldown_scale_s": skill_features.COOLDOWN_SCALE_S,
+        }
+        mismatch = {k: (expected.get(k), v) for k, v in actual.items() if not math.isclose(expected.get(k, -1.0), v)}
+        if mismatch or list(self.meta["features"]["skill"]) != list(skill_features.SKILL_SLOT_FEATURES):
+            raise ValueError(f"{meta_path}: skill encoding differs from l2_client/skill_features.py: {mismatch}")
+
+    def _init_layout(self, server_speed: float, max_target_dz: float | None) -> None:
         self.seq_len: int = self.meta["seq_len"]
         self.max_mobs: int = self.meta["max_mobs"]
         self.max_skills: int = self.meta["max_skills"]
@@ -224,8 +239,8 @@ class CombatPolicy:
         self._executable = [
             (name, self.action_to_id[name]) for name in EXECUTABLE_ACTIONS if name in self.action_to_id
         ]
-        self._requested_character_id = character_id
         self.panel: list[int] = []
+        self._panel_info: list[skill_data.SkillInfo] = []
         self._known_skills: set[int] = set()
 
         self._frames: deque[_Frame] = deque(maxlen=self.seq_len)
@@ -243,35 +258,18 @@ class CombatPolicy:
 
     def bind_character(self, char) -> None:
         """
-        Pick the skill panel (slot -> skill id) the skill head was trained with.
+        Build the skill panel from the character's own skills (``char.skills`` from SkillList).
 
-        Slot semantics are per training character, so the panel must come from the metadata, not
-        from the live ``SkillList``.  Without an explicit ``character_id`` the panel sharing the most
-        skills with the character is used; with no overlap at all the character's own active skills
-        are used instead (the skill head is then unreliable, which is reported).
+        Only learnable combat skills (attack, debuff, heal, buff) get a slot; item skills, crafting
+        and resting never do. Call again whenever a new SkillList arrives.
         """
         self._known_skills = {s["id"] for s in char.skills if not s.get("passive")}
-        panels = {int(k): v for k, v in self.meta["skill_panels"].items()}
-
-        if self._requested_character_id is not None:
-            if self._requested_character_id not in panels:
-                raise ValueError(
-                    f"character_id {self._requested_character_id} is not in the model (known: {sorted(panels)})"
-                )
-            chosen = self._requested_character_id
-        else:
-            chosen = max(panels, key=lambda cid: len(self._known_skills & set(panels[cid])), default=None)
-            if chosen is not None and not self._known_skills & set(panels[chosen]):
-                chosen = None
-
-        if chosen is None:
-            self.panel = sorted(self._known_skills)[: self.max_skills]
-            print(f"[MODEL] !! No training skill panel matches {char.name}'s skills - using its own {self.panel}")
-        else:
-            self.panel = list(panels[chosen])[: self.max_skills]
-            missing = [sid for sid in self.panel if sid not in self._known_skills]
-            print(f"[MODEL] Skill panel of training character {chosen}: {self.panel}"
-                  + (f" (not learned, masked: {missing})" if missing else ""))
+        known = [(s["id"], s.get("level", 1)) for s in char.skills if not s.get("passive")]
+        self._panel_info = skill_data.combat_panel(known, self.max_skills)
+        self.panel = [info.skill_id for info in self._panel_info]
+        print(f"[MODEL] Skill panel of {char.name}: " + ", ".join(
+            f"{info.name} ({info.category})" for info in self._panel_info) if self._panel_info
+            else f"[MODEL] {char.name} has no combat skill yet")
 
     # ------------------------------------------------------------------
     # Live-state hooks
@@ -392,7 +390,10 @@ class CombatPolicy:
         frame = self._snapshot(char, current_target_id, pos, now)
         has_mobs = bool(frame.mob_ids)
         target_alive = bool(current_target_id) and current_target_id in char.radar.entries
-        usable_slots = tuple(i for i, sid in enumerate(self.panel) if self._skill_usable(sid, now))
+        usable_slots = tuple(
+            i for i, info in enumerate(self._panel_info)
+            if self._skill_usable(info.skill_id, now) and char.cur_mp >= info.mp_cost
+        )
         valid = {
             "moved": True,
             "selected_target": has_mobs,
@@ -481,7 +482,7 @@ class CombatPolicy:
             log_dt=log_dt,
             player=self._encode_player(char, current_target_id, now),
             mobs=mobs,
-            skills=self._encode_skills(now),
+            skills=self._encode_skills(char, now),
             mob_ids=mob_ids,
         )
         self._frames.append(frame)
@@ -547,19 +548,14 @@ class CombatPolicy:
             matrix[slot] = [row[name] for name in self._mob_names]
         return matrix, tuple(oid for _, oid, _ in ranked)
 
-    def _encode_skills(self, now: float) -> np.ndarray:
-        scale = self.constants["skill_cooldown_norm_seconds"]
+    def _encode_skills(self, char, now: float) -> np.ndarray:
         matrix = np.zeros((self.max_skills, len(self._skill_names)), dtype=np.float32)
-        for slot, skill_id in enumerate(self.panel):
+        for slot, info in enumerate(self._panel_info):
             # Expiries are real time, the feature is game time like the logged cooldowns.
-            left = max(0.0, self._cooldown_until.get(skill_id, 0.0) - now) * self.server_speed
-            row = {
-                "is_available": 1.0,
-                "is_off_cooldown": 1.0 if left <= 0.0 else 0.0,
-                "cooldown_norm": min(left / scale, 1.0),
-                "has_enough_mp": 1.0,  # the training logs carried no MP cost
-            }
-            matrix[slot] = [row[name] for name in self._skill_names]
+            left = max(0.0, self._cooldown_until.get(info.skill_id, 0.0) - now) * self.server_speed
+            matrix[slot] = skill_features.encode_skill_slot(
+                info, max_mp=char.max_mp, cur_mp=char.cur_mp, cooldown_left_s=left
+            )
         return matrix
 
     def _window(self) -> dict[str, np.ndarray]:

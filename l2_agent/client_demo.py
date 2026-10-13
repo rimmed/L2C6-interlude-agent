@@ -18,10 +18,10 @@ from l2_client.packets import GameServerPacket
 from l2_client.tools.data import item_data, npc_data, skill_data
 
 # --- CONFIGURATION ---
-SERVER_IP = "127.0.0.1"
+SERVER_IP = "192.168.1.200"
 LOGIN_PORT = 2106
-ACCOUNT_LOGIN = ""
-ACCOUNT_PASSWORD = ""
+ACCOUNT_LOGIN = "gather7"
+ACCOUNT_PASSWORD = "S!lver=drag0n"
 SERVER_ID = 0
 CHAR_SLOT = 0
 
@@ -753,8 +753,6 @@ def parse_args():
     parser.add_argument("--model", metavar="ONNX",
                         help="Drive combat with the trained policy (.onnx from l2_NN/export_onnx.py, "
                              "its .json must sit next to it) instead of the scripted state machine")
-    parser.add_argument("--model-character-id", type=int, default=None,
-                        help="Training character_id whose skill panel to use (default: best skill overlap)")
     parser.add_argument("--decision-interval", type=float, default=0.5,
                         help="Seconds between two model decisions (default: 0.5)")
     parser.add_argument("--server-speed", type=float, default=1.0,
@@ -778,8 +776,7 @@ def main():
     policy = None
     if args.model:
         from l2_client.policy import CombatPolicy  # onnxruntime is only needed in model mode
-        policy = CombatPolicy(args.model, character_id=args.model_character_id, server_speed=args.server_speed,
-                              device=args.device)
+        policy = CombatPolicy(args.model, server_speed=args.server_speed, device=args.device)
         print(f"[MODEL] Loaded {args.model} on {policy.device.upper()} {policy.session.get_providers()} "
               f"(seq_len {policy.seq_len}, trained epoch {policy.meta['training'].get('epoch')})")
     run_stats: dict = {}

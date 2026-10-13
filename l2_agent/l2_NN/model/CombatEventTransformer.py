@@ -3,6 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 
+#: Logit of a masked (padding) entity in the pointer heads; finite and float16-safe.
+MASKED_LOGIT = -1e4
+
 class EntityEncoder(nn.Module):
     """
     Entity Encoder for Combat Event Transformer.
@@ -17,11 +20,11 @@ class EntityEncoder(nn.Module):
         )
         self.attn_weights = nn.Linear(embed_dim, 1)
 
-    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         x: Tensor [B, L, K, F]
         mask: [B, L, K] (True for valid entities, False for padding)
-        Returns: Tensor [B, L, embed_dim]
+        Returns: (context [B, L, embed_dim], per-entity embeddings [B, L, K, embed_dim])
         """
         B, L, K, F_dim = x.shape
         # reshape for MLP
@@ -35,7 +38,30 @@ class EntityEncoder(nn.Module):
             scores = scores.masked_fill(~mask, torch.finfo(scores.dtype).min)
         weights = F.softmax(scores, dim=-1).unsqueeze(-1) # [B, L, K, 1]
         context = torch.sum(h * weights, dim=2) # [B, L, embed_dim]
-        return context
+        return context, h
+
+
+class PointerHead(nn.Module):
+    """
+    Scores every entity slot of the last timestep against the sequence state (additive attention).
+
+    A slot's score depends on *what is in the slot* (its embedding), not on its index, so the head
+    works for any slot order and for entities never seen in training (e.g. skills of a new class).
+    """
+    def __init__(self, d_model: int, entity_dim: int, hidden: int = 64):
+        super().__init__()
+        self.query = nn.Linear(d_model, hidden)
+        self.key = nn.Linear(entity_dim, hidden)
+        self.score = nn.Linear(hidden, 1)
+
+    def forward(self, state: torch.Tensor, entities: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+        """
+        state: [B, d_model], entities: [B, K, entity_dim], valid: [B, K] (bool)
+        Returns: logits [B, K], padding slots set to MASKED_LOGIT
+        """
+        hidden = torch.tanh(self.key(entities) + self.query(state).unsqueeze(1))  # [B, K, hidden]
+        logits = self.score(hidden).squeeze(-1)  # [B, K]
+        return logits.masked_fill(~valid, MASKED_LOGIT)
 
 
 class CombatEventTransformer(nn.Module):
@@ -46,9 +72,9 @@ class CombatEventTransformer(nn.Module):
             self,
             player_dim: int = 8,
             mob_features: int = 4,
-            skill_features: int = 3,
+            skill_features: int = 17,
             max_mobs: int = 10,
-            max_skills: int = 16,
+            max_skills: int = 64,
             num_action_types: int = 16,
             d_model: int = 128,
             nhead: int = 4,
@@ -67,11 +93,11 @@ class CombatEventTransformer(nn.Module):
             nn.Linear(32, 64)
         )
         self.mob_encoder = EntityEncoder(in_features=mob_features, embed_dim=64)
-        self.skill_encoder = EntityEncoder(in_features=skill_features, embed_dim=32)
+        self.skill_encoder = EntityEncoder(in_features=skill_features, embed_dim=64)
 
-        # Fusion layer: зведення 64 + 64 + 32 = 160 -> d_model (128)
+        # Fusion layer: зведення 64 + 64 + 64 = 192 -> d_model (128)
         self.fusion = nn.Sequential(
-            nn.Linear(64 + 64 + 32, d_model),
+            nn.Linear(64 + 64 + 64, d_model),
             nn.LayerNorm(d_model),
             nn.ReLU()
         )
@@ -89,8 +115,9 @@ class CombatEventTransformer(nn.Module):
 
         # 3. Multi-Discrete Output Heads
         self.head_action_type = nn.Linear(d_model, num_action_types)
-        self.head_pointer_idx = nn.Linear(d_model, max_mobs)
-        self.head_skill_slot = nn.Linear(d_model, max_skills)
+        # Pointer heads: the target monster and the skill are chosen by their features, not by slot index.
+        self.head_pointer_idx = PointerHead(d_model, entity_dim=64)
+        self.head_skill_slot = PointerHead(d_model, entity_dim=64)
 
     def _generate_causal_mask(self, L: int, device: torch.device) -> torch.Tensor:
         """Генерує причинно-наслідкову (Causal) маску, щоб t не дивився в майбутнє."""
@@ -101,8 +128,8 @@ class CombatEventTransformer(nn.Module):
         # Витягуємо тензори з батчу
         player_state = batch["player_state"]  # [B, L, 8]
         delta_t = batch["delta_t"].unsqueeze(-1)  # [B, L, 1]
-        mobs_matrix = batch["mobs_matrix"]   # [B, L, 10, 4]
-        skills_matrix = batch["skills_matrix"] # [B, L, 16, 3]
+        mobs_matrix = batch["mobs_matrix"]   # [B, L, K, 4]
+        skills_matrix = batch["skills_matrix"] # [B, L, N, F_skill]
         seq_mask = batch["seq_mask"]         # [B, L] (bool)
 
         B, L, _ = player_state.shape
@@ -112,15 +139,15 @@ class CombatEventTransformer(nn.Module):
         emb_player = self.player_mlp(player_combined)                 # [B, L, 64]
 
         # Для мобів: 4-й прапорець is_padded (1 = padded, 0 = real) -> маска valid = is_padded == 0
-        mob_valid_mask = (mobs_matrix[..., 3] == 0)                   # [B, L, 10]
-        emb_mobs = self.mob_encoder(mobs_matrix, mask=mob_valid_mask)  # [B, L, 64]
+        mob_valid_mask = (mobs_matrix[..., 3] == 0)                   # [B, L, K]
+        emb_mobs, mob_entities = self.mob_encoder(mobs_matrix, mask=mob_valid_mask)  # [B, L, 64], [B, L, K, 64]
 
-        # Для скілів: перевіряємо, чи є хоча б одна ненульова фіча
-        skill_valid_mask = (skills_matrix.sum(dim=-1) > 0)             # [B, L, 16]
-        emb_skills = self.skill_encoder(skills_matrix, mask=skill_valid_mask) # [B, L, 32]
+        # Для скілів: порожній слот - повністю нульовий рядок (is_valid = 0)
+        skill_valid_mask = (skills_matrix.sum(dim=-1) > 0)             # [B, L, N]
+        emb_skills, skill_entities = self.skill_encoder(skills_matrix, mask=skill_valid_mask)  # [B, L, 64], [B, L, N, 64]
 
         # Конкатенація всіх ембеддингів у покроковий вектор s_t
-        state_repr = torch.cat([emb_player, emb_mobs, emb_skills], dim=-1) # [B, L, 160]
+        state_repr = torch.cat([emb_player, emb_mobs, emb_skills], dim=-1) # [B, L, 192]
         x = self.fusion(state_repr) # [B, L, d_model]
 
         # --- 2. Temporal Processing (Transformer) ---
@@ -142,8 +169,8 @@ class CombatEventTransformer(nn.Module):
 
         # --- 3. Action Heads ---
         logits_action_type = self.head_action_type(last_step_repr) # [B, num_action_types]
-        logits_pointer_idx = self.head_pointer_idx(last_step_repr) # [B, max_mobs]
-        logits_skill_slot = self.head_skill_slot(last_step_repr)   # [B, max_skills]
+        logits_pointer_idx = self.head_pointer_idx(last_step_repr, mob_entities[:, -1], mob_valid_mask[:, -1])  # [B, K]
+        logits_skill_slot = self.head_skill_slot(last_step_repr, skill_entities[:, -1], skill_valid_mask[:, -1])  # [B, N]
 
         return {
             "logits_action_type": logits_action_type,

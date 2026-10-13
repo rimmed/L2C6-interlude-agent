@@ -620,6 +620,7 @@ ROW_FIELDS = (
     "cooldowns",
     "active_skills",
     "passive_skills",
+    "known_skills",
 )
 
 
@@ -1083,6 +1084,7 @@ def _build_schema() -> pa.Schema:
         ("cooldowns", cooldown_list),
         ("active_skills", skill_list),
         ("passive_skills", skill_list),
+        ("known_skills", skill_list),
     ]
 
     if [name for name, _ in fields] != list(ROW_FIELDS):
@@ -1255,6 +1257,40 @@ def _learn_entities(path: Path, resolver: EntityResolver) -> None:
                 resolver.observe_character(character)
 
 
+def _fill_known_skills(rows: list[dict]) -> int:
+    """
+    Give every frame the active skills its character knows at that moment (``known_skills``).
+
+    Only ``skills_updated`` frames carry the skill list, and they come in bursts that fill the list
+    step by step (``[Active:]``, ``[Active:1322-1]``, ...). Every frame takes the latest list of its
+    character (rows are in chronological order: log files sorted by name, lines in order); frames
+    before the first list take the state the first burst ended with, i.e. the list in force when the
+    character's first non-``skills_updated`` frame appeared.
+
+    :return: number of frames that got a list
+    """
+    current: dict = {}
+    initial: dict = {}
+    settled: set = set()
+    for row in rows:
+        character_id = row["character_id"]
+        if row["action_type"] == "skills_updated":
+            if row["active_skills"]:
+                current[character_id] = row["active_skills"]
+                if character_id not in settled:
+                    initial[character_id] = row["active_skills"]
+        else:
+            settled.add(character_id)
+        row["known_skills"] = current.get(character_id)
+
+    filled = 0
+    for row in rows:
+        if row["known_skills"] is None:
+            row["known_skills"] = initial.get(row["character_id"])
+        filled += row["known_skills"] is not None
+    return filled
+
+
 def process_logs(
     input_path: str | Path,
     output_parquet: str | Path,
@@ -1312,6 +1348,8 @@ def process_logs(
         print(f"  {log_path.name}: {len(rows) - before} action frames")
 
     print(f"Successfully parsed {len(rows)} action frames ({skipped} lines skipped).")
+    known = _fill_known_skills(rows)
+    print(f"known_skills filled for {known} of {len(rows)} frames")
 
     if not rows:
         print("No action frames found to export.")

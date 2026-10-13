@@ -42,7 +42,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from l2_actor.buffer import JsonlBuffer, Transition, TransitionBuffer
-from l2_actor.executor import NON_COMBAT_SKILL_IDS, ActionExecutor, ExecutorConfig, find_healing_potion
+from l2_actor.executor import ActionExecutor, ExecutorConfig, find_healing_potion
 from l2_actor.reward import RewardConfig
 from l2_actor.world import WorldState
 from l2_client import packets
@@ -123,8 +123,7 @@ class Actor:
         skill_data.load_skill_data(str(DATAPACK / "skills"))
 
         # The model decides; its .json (feature layout, skill panels) must sit next to the .onnx.
-        self.encoder = CombatPolicy(cfg.model, server_speed=cfg.server_speed, device=cfg.device,
-                                    excluded_skills=NON_COMBAT_SKILL_IDS)
+        self.encoder = CombatPolicy(cfg.model, server_speed=cfg.server_speed, device=cfg.device)
         log.info("Model: %s on %s", cfg.model, self.encoder.device)
 
         ticket = login(cfg.server_ip, self.account, cfg.password, port=cfg.login_port)

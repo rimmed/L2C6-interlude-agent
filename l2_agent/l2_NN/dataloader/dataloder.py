@@ -48,21 +48,21 @@ logged column                 consumed as
 
 Skill panel slots
 -----------------
-``skills_matrix`` holds ``N`` slots of ``F_skill`` values, one per entry of
-:data:`SKILL_FEATURE_NAMES`:
+The panel of an event is the character's *combat* skill panel at that moment: the learnable
+active skills of ``known_skills`` (filled by the log converter) whose category is attack, debuff,
+heal or buff, ordered by category priority and skill id (``skill_data.combat_panel``, up to ``N``
+slots). Item skills (herbs, potions, keys), crafting and resting never get a slot.
 
-=========================  ==========================================================
-``is_available``           the slot holds one of the character's skills
-``is_off_cooldown``        the skill is ready to cast (nothing left in ``cooldowns``)
-``cooldown_norm``          remaining cooldown / :data:`SKILL_COOLDOWN_NORM_SECONDS`, clipped
-``has_enough_mp``          the current MP covers the skill cost
-=========================  ==========================================================
+Every slot is described by *what the skill is* - category, target, power, MP cost, range, cast and
+reuse time from the datapack - and by its state - ready, remaining cooldown, affordable - see
+``l2_client/skill_features.py`` (:data:`SKILL_FEATURE_NAMES`). The live client uses the very same
+encoder, and the skill head is a pointer over the slots, so a skill is recognised by its features,
+not by its slot number.
 
 ``cooldowns[].remaining`` is the only timing info the logs give per skill; it is logged in
-milliseconds and converted with :data:`MILLISECONDS_PER_SECOND` before the scaling above.
+milliseconds and converted with :data:`MILLISECONDS_PER_SECOND`.
 
-``move_speed`` and the per-skill MP cost are simply absent from the logs: the move speed
-falls back to :data:`DEFAULT_MOVE_SPEED` and an unknown MP cost is treated as affordable.
+``move_speed`` is absent from the logs and falls back to :data:`DEFAULT_MOVE_SPEED`.
 
 Action label space
 ------------------
@@ -106,15 +106,20 @@ The shape/dtype smoke test that used to live in this module's ``__main__`` block
 from __future__ import annotations
 
 import math
-from collections import Counter, defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Final, Optional
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
+
+from l2_client.skill_features import COOLDOWN_SCALE_S, SKILL_SLOT_DIM, SKILL_SLOT_FEATURES, encode_skill_slot
+from l2_client.tools.data import skill_data
+
+from .augment import AugmentConfig
 
 __all__ = ["ACTION_TYPE_IDS", "Lineage2EventDataset"]
 # --------------------------------------------------------------------------------------
@@ -238,13 +243,17 @@ MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_curren
 MOB_FEATURE_DIM: Final[int] = len(MOB_FEATURE_NAMES)
 MOB_PADDED_INDEX: Final[int] = MOB_FEATURE_NAMES.index("is_padded")
 
-SKILL_FEATURE_NAMES: Final[tuple[str, ...]] = (
-    "is_available",
-    "is_off_cooldown",
-    "cooldown_norm",
-    "has_enough_mp",
+SKILL_FEATURE_NAMES: Final[tuple[str, ...]] = SKILL_SLOT_FEATURES
+SKILL_FEATURE_DIM: Final[int] = SKILL_SLOT_DIM
+
+#: Datapack skill XML (the skill catalog is built from it).
+DATAPACK_SKILLS: Final[Path] = (
+    Path(__file__).resolve().parents[3] / "L2J_Mobius" / "L2J_Mobius_CT_0_Interlude" / "dist" / "game" / "data"
+    / "stats" / "skills"
 )
-SKILL_FEATURE_DIM: Final[int] = len(SKILL_FEATURE_NAMES)
+
+#: Environment events (the game answering the player) that ``event_dropout`` may remove.
+ENVIRONMENT_EVENT_NAMES: Final[tuple[str, ...]] = ("inflicted_damage", "took_damage", "effect_applied")
 
 #: Timestamp layout used by the client log (and therefore by the Parquet file).
 TIMESTAMP_FORMAT: Final[str] = "%Y.%m.%d %H:%M:%S,%f"
@@ -260,7 +269,7 @@ MILLISECONDS_PER_SECOND: Final[float] = 1000.0
 
 #: Scale of a "long" skill cooldown: ``cooldowns[].remaining`` (seconds) is divided by this
 #: value and clipped to ``[0, 1]`` for the ``cooldown_norm`` slot feature.
-SKILL_COOLDOWN_NORM_SECONDS: Final[float] = 10.0
+SKILL_COOLDOWN_NORM_SECONDS: Final[float] = COOLDOWN_SCALE_S
 
 #: Fallbacks used when the logs carry no value at all.
 DEFAULT_CAST_SPEED: Final[float] = 333.0
@@ -409,6 +418,14 @@ class _FeatureArrays:
     #: ``True`` when the event's used skill really is part of the character's panel, i.e. when
     #: ``skill_slot`` is a meaningful supervision signal rather than the fallback 0.
     skill_resolved: np.ndarray
+    #: skill id of every panel slot, ``-1`` for an empty slot (``(count, N)``)
+    skill_ids: np.ndarray
+    #: current / maximum MP and level of the character (to encode extra skills on the fly)
+    mp: np.ndarray
+    max_mp: np.ndarray
+    level: np.ndarray
+    #: position of the first event of the event's session
+    session_start: np.ndarray
 
     @property
     def num_events(self) -> int:
@@ -429,7 +446,7 @@ class Lineage2EventDataset(Dataset):
         df: pd.DataFrame,
         seq_len: int = 16,
         max_mobs: int = 10,
-        max_skills: int = 16,
+        max_skills: int = 64,
         *,
         verbose: bool = False,
     ) -> None:
@@ -437,7 +454,8 @@ class Lineage2EventDataset(Dataset):
         :param df: frame read from the cleaned player-action Parquet file
         :param seq_len: length ``L`` of the context window fed to the Transformer encoder
         :param max_mobs: number of monster candidates ``K`` in the Top-K target matrix
-        :param max_skills: number ``N`` of skill-panel slots
+        :param max_skills: number ``N`` of skill-panel slots (combat skills beyond it are dropped,
+            attacks last)
         :param verbose: print construction statistics (sessions, skill panels, timing)
         """
         if not isinstance(df, pd.DataFrame):
@@ -460,9 +478,14 @@ class Lineage2EventDataset(Dataset):
         self.id_to_action: dict[int, str] = {value: key for key, value in self.action_to_id.items()}
 
         self.data = self._preprocess_dataframe(df)
-        #: ``character_id`` -> ordered list of skill ids (the slot -> skill id mapping).
-        self.skill_panel, self.skill_mp_cost = self._build_skill_panels(self.data)
-        #: per-event features, sliced by :meth:`__getitem__`.
+        skill_data.load_skill_data(str(DATAPACK_SKILLS))
+        if "known_skills" not in self.data.columns:
+            print("Warning: no known_skills column (re-run playeraction_log2parquet.py) - every skill panel is empty")
+        #: every combat skill of the datapack: the pool distractor skills are drawn from
+        self._skill_pool: list[int] = skill_data.combat_skill_ids()
+        self._best_level_cache: dict[tuple[int, int], int] = {}
+        self._env_action_ids = np.array([self.action_to_id[name] for name in ENVIRONMENT_EVENT_NAMES])
+        #: per-event features, sliced by :meth:`window`.
         self.features = self._precompute_features(self.data)
         #: ``(window_start, window_end)`` inclusive positional pairs, one per event.
         self.samples: list[tuple[int, int]] = self._create_samples(self.data)
@@ -540,8 +563,14 @@ class Lineage2EventDataset(Dataset):
             "skill_events": int(np.count_nonzero(skill_events)),
             "skill_slot_hits": int(np.count_nonzero(skill_slot[skill_events])),
             "skill_resolved": int(np.count_nonzero(self.features.skill_resolved)),
-            "skill_slots_per_character": {int(key): len(value) for key, value in self.skill_panel.items()},
+            "panel_size": self._panel_size_stats(),
         }
+
+    def _panel_size_stats(self) -> dict[str, int]:
+        sizes = (self.features.skill_ids >= 0).sum(axis=1)
+        if sizes.size == 0:
+            return {"min": 0, "median": 0, "max": 0}
+        return {"min": int(sizes.min()), "median": int(np.median(sizes)), "max": int(sizes.max())}
 
     def _report_construction(self) -> None:
         stats = self.summary()
@@ -559,7 +588,7 @@ class Lineage2EventDataset(Dataset):
             f"skill {stats['skill_resolved']} of {stats['skill_events']} used_skill events"
         )
         print(f"  nonzero pointer slots   : {stats['pointer_hits']}")
-        print(f"  skill slots per char    : {stats['skill_slots_per_character']}")
+        print(f"  combat panel size       : {stats['panel_size']}")
 
     # ----------------------------------------------------------------------------------
     # Preprocessing
@@ -603,87 +632,6 @@ class Lineage2EventDataset(Dataset):
         frame["log_delta_t"] = np.log1p(delta_t.to_numpy())
         frame["action_type"] = frame["action_type"].astype("string").fillna("unknown").astype(str)
         return frame
-
-    def _build_skill_panels(self, frame: pd.DataFrame) -> tuple[dict[Any, list[int]], dict[int, float]]:
-        """
-        Build the per-character skill panel and the skill -> MP-cost table.
-
-        The logs carry **no** ``available_skills`` list and no per-skill MP cost, so the panel
-        is derived from everything the character is ever seen holding:
-
-        * ``active_skills[].id`` - the actives reported by ``skills_updated`` frames,
-        * ``cooldowns[].skill_id`` - every skill the client tracks a cooldown for,
-        * ``skill_id`` of ``used_skill`` frames - the label space itself.
-
-        Slots are ranked by usage count (descending, then by first appearance) so the
-        ``max_skills`` most frequently cast skills survive truncation, which keeps
-        ``target_skill_slot`` resolvable.  The ordering is global per character, which gives
-        the Skill head stable slot semantics across time.
-
-        Should a future log expose ``available_skills`` (list of dicts with ``skill_id``,
-        ``mp_cost``, ``cooldown_left``) it is honoured first and its MP costs are kept.
-        """
-        usage: defaultdict[Any, Counter] = defaultdict(Counter)
-        first_seen: defaultdict[Any, dict[int, int]] = defaultdict(dict)
-        mp_cost: dict[int, float] = {}
-        appearances = 0
-
-        def register(character_id: Any, skill_id: Any, *, weight: int = 1) -> None:
-            """Count one observation of ``skill_id`` for ``character_id``."""
-            nonlocal appearances
-            if _is_missing(character_id) or _is_missing(skill_id):
-                return
-            try:
-                skill_key = int(skill_id)
-            except (TypeError, ValueError):
-                return
-            usage[character_id][skill_key] += weight
-            if skill_key not in first_seen[character_id]:
-                first_seen[character_id][skill_key] = appearances
-                appearances += 1
-
-        has_available_skills = "available_skills" in frame.columns and frame["available_skills"].notna().any()
-        used_skill_label = self.id_to_action[USED_SKILL_ACTION_ID]
-
-        # Positional column lookup: `itertuples` is much faster than `iterrows` here and does
-        # not depend on column names being valid Python identifiers.
-        positions = {name: position for position, name in enumerate(frame.columns)}
-        if "character_id" not in positions:
-            print("Warning: the frame has no character_id column - the skill panel stays empty")
-            return {}, mp_cost
-
-        character_at = positions["character_id"]
-        action_at = positions.get("action_type")
-        skill_at = positions.get("skill_id")
-        active_at = positions.get("active_skills")
-        cooldown_at = positions.get("cooldowns")
-        available_at = positions.get("available_skills")
-
-        for row in frame.itertuples(index=False, name=None):
-            character_id = row[character_at]
-            if not _is_missing(character_id):
-                character_id = int(character_id)
-            if has_available_skills and available_at is not None:
-                for entry in _dict_list(row[available_at]):
-                    skill_id = _optional_number(entry, ("skill_id", "id"))
-                    register(character_id, skill_id, weight=2)
-                    cost = _optional_number(entry, ("mp_cost", "cost"))
-                    if skill_id is not None and cost is not None:
-                        mp_cost[int(skill_id)] = cost
-            if active_at is not None:
-                for entry in _dict_list(row[active_at]):
-                    register(character_id, _optional_number(entry, ("id", "skill_id")))
-            if cooldown_at is not None:
-                for entry in _dict_list(row[cooldown_at]):
-                    register(character_id, _optional_number(entry, ("skill_id", "id")))
-            if action_at is not None and str(row[action_at]) == used_skill_label and skill_at is not None:
-                register(character_id, row[skill_at], weight=max(self.max_skills, 4))
-
-        panel: dict[Any, list[int]] = {}
-        for character_id, position in first_seen.items():
-            ranked = sorted(position, key=lambda skill_id: (-usage[character_id][skill_id], position[skill_id]))
-            panel[character_id] = ranked[: self.max_skills]
-        return panel, mp_cost
 
     def _create_samples(self, frame: pd.DataFrame) -> list[tuple[int, int]]:
         """
@@ -816,63 +764,39 @@ class Lineage2EventDataset(Dataset):
             remaining[int(skill_id)] = milliseconds / MILLISECONDS_PER_SECOND
         return remaining
 
-    def _current_mp_cost(self, skill_id: int) -> float:
-        """MP cost of ``skill_id``; the logs never store one, so this is usually ``0.0``."""
-        if skill_id in self.skill_mp_cost:
-            return self.skill_mp_cost[skill_id]
-        # ``skill_cost`` in the logs is the SP price of a ``learned_skill`` frame, not an MP
-        # cost, so it must never be used here; an unknown cost counts as affordable.
-        return 0.0
-
-    def _encode_skills_matrix(self, row: Any, action_id: int) -> tuple[np.ndarray, int, bool]:
+    def _encode_skills_matrix(self, row: Any, action_id: int) -> tuple[np.ndarray, np.ndarray, int, bool]:
         """
-        Encode the skill panel S ((N, SKILL_FEATURE_DIM)) and the target_skill_slot label.
+        Encode the combat skill panel (``(N, SKILL_FEATURE_DIM)``) and the ``target_skill_slot`` label.
 
-        Features per slot (``F_skill = SKILL_FEATURE_DIM``, see :data:`SKILL_FEATURE_NAMES`):
-        1. is_available     - 1.0 if the slot holds a skill, 0.0 for the padding slots.
-        2. is_off_cooldown  - 1.0 if ready to cast, 0.0 while the skill is cooling down.
-        3. cooldown_norm    - remaining cooldown / :data:`SKILL_COOLDOWN_NORM_SECONDS`, clipped
-                              to ``[0, 1]`` (0.0 means "ready right now").
-        4. has_enough_mp    - 1.0 if the current MP covers the skill cost, 0.0 if it does not.
+        :return: ``(matrix, skill_ids, slot_label, resolved)`` - ``skill_ids`` holds the skill of every
+            slot (``-1`` = empty); ``resolved`` tells whether the used skill is on the panel
         """
         matrix = np.zeros((self.max_skills, SKILL_FEATURE_DIM), dtype=np.float32)
+        skill_ids = np.full(self.max_skills, -1, dtype=np.int32)
 
-        character_id = _optional_number(row, ("character_id",))
-        panel = self.skill_panel.get(int(character_id), []) if character_id is not None else []
+        known = [
+            (int(entry["id"]), int(entry.get("level") or 1))
+            for entry in _dict_list(_lookup(row, "known_skills", None))
+            if entry.get("id") is not None
+        ]
+        panel = skill_data.combat_panel(known, self.max_skills)
 
         current_mp = _feature_number(row, ("mp", "char_stats.mp"), 0.0)
+        max_mp = _feature_number(row, ("max_mp", "char_stats.max_mp"), 1.0)
         remaining = self._cooldown_left_by_skill(row)
 
         used_skill_id = _optional_number(row, ("skill_id",)) if action_id == USED_SKILL_ACTION_ID else None
         used_skill_key = None if used_skill_id is None else int(used_skill_id)
 
-        slot_label = 0
-        resolved = False
-
-        for slot_idx, skill_id in enumerate(panel[: self.max_skills]):
-            cooldown_left = max(0.0, float(remaining.get(skill_id, 0.0)))
-            is_off_cooldown = 1.0 if cooldown_left <= 0.0 else 0.0
-
-            # Cooldown progress: 0.0 is "ready", 1.0 a full (or longer than the scale) cooldown.
-            cooldown_norm = min(cooldown_left / SKILL_COOLDOWN_NORM_SECONDS, 1.0)
-
-            cost = self._current_mp_cost(skill_id)
-            # An unknown cost (the logs carry none) counts as affordable, so the flag only turns
-            # 0.0 once a per-skill MP cost table exists and the character cannot pay it.
-            has_enough_mp = 1.0 if (cost == 0.0 or current_mp >= cost) else 0.0
-
-            matrix[slot_idx] = (
-                1.0,  # [0] is_available
-                is_off_cooldown,  # [1] is_off_cooldown (1.0 = ready, 0.0 = cooling down)
-                cooldown_norm,  # [2] cooldown_norm (0.0 = ready, >0.0 = seconds to wait)
-                has_enough_mp,  # [3] has_enough_mp
+        slot_label, resolved = 0, False
+        for slot_idx, info in enumerate(panel):
+            matrix[slot_idx] = encode_skill_slot(
+                info, max_mp=max_mp, cur_mp=current_mp, cooldown_left_s=remaining.get(info.skill_id, 0.0)
             )
-
-            if used_skill_key is not None and skill_id == used_skill_key:
-                slot_label = slot_idx
-                resolved = True
-
-        return matrix, slot_label, resolved
+            skill_ids[slot_idx] = info.skill_id
+            if used_skill_key is not None and info.skill_id == used_skill_key:
+                slot_label, resolved = slot_idx, True
+        return matrix, skill_ids, slot_label, resolved
 
     # ----------------------------------------------------------------------------------
     # Feature cache and sampling
@@ -891,15 +815,25 @@ class Lineage2EventDataset(Dataset):
         action_type = np.zeros(count, dtype=np.int64)
         pointer_resolved = np.zeros(count, dtype=bool)
         skill_resolved = np.zeros(count, dtype=bool)
+        skill_ids = np.full((count, self.max_skills), -1, dtype=np.int32)
+        mp = np.zeros(count, dtype=np.float32)
+        max_mp = np.ones(count, dtype=np.float32)
+        level = np.ones(count, dtype=np.float32)
 
         for position, (_, row) in enumerate(frame.iterrows()):
             action_id = self._encode_action_type(row)
             action_type[position] = action_id
             player_state[position] = self._encode_player_state(row)
             mobs_matrix[position], pointer_idx[position], pointer_resolved[position] = self._encode_mobs_matrix(row)
-            skills_matrix[position], skill_slot[position], skill_resolved[position] = self._encode_skills_matrix(
-                row, action_id
-            )
+            (skills_matrix[position], skill_ids[position], skill_slot[position],
+             skill_resolved[position]) = self._encode_skills_matrix(row, action_id)
+            mp[position] = _feature_number(row, ("mp", "char_stats.mp"), 0.0)
+            max_mp[position] = _feature_number(row, ("max_mp", "char_stats.max_mp"), 1.0)
+            level[position] = _feature_number(row, ("lvl", "level"), 1.0)
+
+        sessions = frame["session_id"].to_numpy()
+        is_first = np.concatenate(([True], sessions[1:] != sessions[:-1])) if count else np.zeros(0, dtype=bool)
+        session_start = np.maximum.accumulate(np.where(is_first, np.arange(count), 0)) if count else np.zeros(0, int)
 
         return _FeatureArrays(
             player_state=player_state,
@@ -911,6 +845,11 @@ class Lineage2EventDataset(Dataset):
             action_type=action_type,
             pointer_resolved=pointer_resolved,
             skill_resolved=skill_resolved,
+            skill_ids=skill_ids,
+            mp=mp,
+            max_mp=max_mp,
+            level=level,
+            session_start=session_start,
         )
 
     @staticmethod
@@ -934,26 +873,154 @@ class Lineage2EventDataset(Dataset):
         return self._pad_timesteps(block, pad_len, 0.0)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
+        return self.window(index)
+
+    def window(self, index: int, augment: AugmentConfig | None = None,
+               rng: np.random.Generator | None = None) -> dict[str, torch.Tensor]:
+        """
+        The left-padded window of sample ``index`` and its targets.
+
+        :param augment: training augmentations (see ``augment.py``); ``None`` returns the plain window
+        :param rng: random generator for the augmentations
+        """
         start_idx, end_idx = self.samples[index]
-        length = end_idx - start_idx + 1
-        pad_len = self.seq_len - length
-        features = self.features
+        f = self.features
+        pointer_label = int(f.pointer_idx[end_idx])
+        skill_label = int(f.skill_slot[end_idx])
 
-        player_state = self._pad_timesteps(features.player_state[start_idx : end_idx + 1], pad_len)
-        mobs_matrix = self._pad_mob_timesteps(features.mobs_matrix[start_idx : end_idx + 1], pad_len)
-        skills_matrix = self._pad_skill_timesteps(features.skills_matrix[start_idx : end_idx + 1], pad_len)
-        delta_t = self._pad_timesteps(features.log_delta_t[start_idx : end_idx + 1], pad_len)
+        if augment is None:
+            rows = np.arange(start_idx, end_idx + 1)
+            player_state = f.player_state[rows]
+            mobs_matrix = f.mobs_matrix[rows]
+            skills_matrix = f.skills_matrix[rows]
+            delta_t = f.log_delta_t[rows]
+        else:
+            rng = rng if rng is not None else np.random.default_rng()
+            rows, raw_dt = self._augmented_rows(end_idx, augment, rng)
+            player_state = f.player_state[rows].copy()
+            mobs_matrix = f.mobs_matrix[rows].copy()
+            skills_matrix = f.skills_matrix[rows].copy()
 
+            if rng.random() < augment.time_scale_p:
+                low, high = augment.time_scale_range
+                raw_dt = raw_dt * math.exp(rng.uniform(math.log(low), math.log(high)))
+            delta_t = np.log1p(raw_dt).astype(np.float32)
+
+            if rng.random() < augment.noise_p:
+                self._add_noise(player_state, mobs_matrix, augment.noise_std, rng)
+            if rng.random() < augment.distractor_p and augment.max_distractors > 0:
+                self._add_distractor_skills(skills_matrix, rows, end_idx, augment.max_distractors, rng)
+            if rng.random() < augment.mob_shuffle_p:
+                pointer_label = self._shuffle_mobs(mobs_matrix, pointer_label, rng)
+            if rng.random() < augment.skill_shuffle_p:
+                permutation = rng.permutation(self.max_skills)
+                skills_matrix = skills_matrix[:, permutation]
+                skill_label = int(np.argsort(permutation)[skill_label])
+
+        pad_len = self.seq_len - len(rows)
+        player_state = self._pad_timesteps(player_state, pad_len)
+        mobs_matrix = self._pad_mob_timesteps(mobs_matrix, pad_len)
+        skills_matrix = self._pad_skill_timesteps(skills_matrix, pad_len)
+        delta_t = self._pad_timesteps(delta_t, pad_len)
         seq_mask = np.zeros(self.seq_len, dtype=bool)
         seq_mask[pad_len:] = True
 
         return {
-            "player_state": torch.from_numpy(np.ascontiguousarray(player_state)),
-            "mobs_matrix": torch.from_numpy(np.ascontiguousarray(mobs_matrix)),
-            "skills_matrix": torch.from_numpy(np.ascontiguousarray(skills_matrix)),
-            "delta_t": torch.from_numpy(np.ascontiguousarray(delta_t)),
+            "player_state": torch.from_numpy(np.ascontiguousarray(player_state, dtype=np.float32)),
+            "mobs_matrix": torch.from_numpy(np.ascontiguousarray(mobs_matrix, dtype=np.float32)),
+            "skills_matrix": torch.from_numpy(np.ascontiguousarray(skills_matrix, dtype=np.float32)),
+            "delta_t": torch.from_numpy(np.ascontiguousarray(delta_t, dtype=np.float32)),
             "seq_mask": torch.from_numpy(seq_mask),
-            "target_action_type": torch.tensor(int(features.action_type[end_idx]), dtype=torch.long),
-            "target_pointer_idx": torch.tensor(int(features.pointer_idx[end_idx]), dtype=torch.long),
-            "target_skill_slot": torch.tensor(int(features.skill_slot[end_idx]), dtype=torch.long),
+            "target_action_type": torch.tensor(int(f.action_type[end_idx]), dtype=torch.long),
+            "target_pointer_idx": torch.tensor(pointer_label, dtype=torch.long),
+            "target_skill_slot": torch.tensor(skill_label, dtype=torch.long),
+            "target_skill_valid": torch.tensor(bool(f.skill_resolved[end_idx])),
         }
+
+    # ----------------------------------------------------------------------------------
+    # Augmentations (training split only)
+    # ----------------------------------------------------------------------------------
+
+    def _augmented_rows(self, end_idx: int, cfg: AugmentConfig,
+                        rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Rows of the window plus their real ``delta_t`` in seconds, after event dropout and cropping.
+
+        Dropped environment events hand their time gap to the next kept row, so the kept rows still
+        add up to the real elapsed time. The decision row (the last one) is never dropped.
+        """
+        f = self.features
+        rows = np.arange(int(f.session_start[end_idx]), end_idx + 1)
+        raw_dt = np.expm1(f.log_delta_t[rows].astype(np.float64))
+
+        if rng.random() < cfg.event_dropout_p and len(rows) > 1:
+            drop = np.isin(f.action_type[rows], self._env_action_ids) & (rng.random(len(rows)) < cfg.event_dropout_rate)
+            drop[-1] = False
+            if drop.any():
+                carried = np.cumsum(np.where(drop, raw_dt, 0.0))
+                kept = np.flatnonzero(~drop)
+                # gap of each kept row = its own gap + the gaps of the dropped rows right before it
+                before = np.concatenate(([0.0], carried[kept[:-1]]))
+                raw_dt = raw_dt[kept] + (carried[kept] - before)
+                rows = rows[kept]
+
+        rows, raw_dt = rows[-self.seq_len:], raw_dt[-self.seq_len:]
+        if rng.random() < cfg.crop_p and len(rows) > 1:
+            keep = int(rng.integers(1, len(rows) + 1))
+            rows, raw_dt = rows[-keep:], raw_dt[-keep:]
+        return rows, raw_dt
+
+    @staticmethod
+    def _add_noise(player_state: np.ndarray, mobs_matrix: np.ndarray, std: float, rng: np.random.Generator) -> None:
+        """Jitter the HP/MP/CP ratios and the distance of the real monster slots."""
+        hp_mp_cp = slice(0, 3)
+        player_state[:, hp_mp_cp] = np.clip(player_state[:, hp_mp_cp] + rng.normal(0.0, std, player_state[:, hp_mp_cp].shape), 0.0, 1.0)
+        real = mobs_matrix[..., MOB_PADDED_INDEX] == 0.0
+        jitter = rng.normal(0.0, std, real.shape)
+        mobs_matrix[..., 0] = np.where(real, np.clip(mobs_matrix[..., 0] + jitter, 0.0, 1.0), mobs_matrix[..., 0])
+
+    def _shuffle_mobs(self, mobs_matrix: np.ndarray, pointer_label: int, rng: np.random.Generator) -> int:
+        """Permute the monster slots of every row independently; return the moved label of the last row."""
+        for t in range(len(mobs_matrix)):
+            permutation = rng.permutation(self.max_mobs)
+            mobs_matrix[t] = mobs_matrix[t][permutation]
+            if t == len(mobs_matrix) - 1:
+                pointer_label = int(np.argsort(permutation)[pointer_label])
+        return pointer_label
+
+    def _best_level(self, skill_id: int, character_level: int) -> int:
+        key = (skill_id, character_level)
+        if key not in self._best_level_cache:
+            self._best_level_cache[key] = skill_data.best_level_for(skill_id, character_level)
+        return self._best_level_cache[key]
+
+    def _add_distractor_skills(self, skills_matrix: np.ndarray, rows: np.ndarray, end_idx: int, max_count: int,
+                               rng: np.random.Generator) -> None:
+        """
+        Put combat skills the character did not use into free slots of every row: ready and
+        affordable, at the highest level the character's level allows.
+        """
+        f = self.features
+        panel_ids = f.skill_ids[rows]
+        first_free = int((panel_ids >= 0).sum(axis=1).max()) if len(rows) else 0
+        free = self.max_skills - first_free
+        if free <= 0:
+            return
+        used = set(int(sid) for sid in np.unique(panel_ids) if sid >= 0)
+        character_level = int(f.level[end_idx])
+        count = int(rng.integers(1, min(max_count, free) + 1))
+        chosen: list[skill_data.SkillInfo] = []
+        for skill_id in rng.permutation(self._skill_pool):
+            skill_id = int(skill_id)
+            if skill_id in used:
+                continue
+            level = self._best_level(skill_id, character_level)
+            if level > 0:
+                chosen.append(skill_data.get_skill_info(skill_id, level))
+                if len(chosen) == count:
+                    break
+        for t, row in enumerate(rows):
+            for j, info in enumerate(chosen):
+                skills_matrix[t, first_free + j] = encode_skill_slot(
+                    info, max_mp=float(f.max_mp[row]), cur_mp=float(f.mp[row]), cooldown_left_s=0.0
+                )

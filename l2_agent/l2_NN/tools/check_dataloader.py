@@ -49,7 +49,7 @@ from l2_NN.dataloader.dataloder import (  # noqa: E402 - PROJECT_ROOT is added j
 
 #: Positions inside a skill slot row, resolved from the dataloader's own layout declaration so
 #: that the checks keep working when a slot feature is inserted or reordered.
-SKILL_AVAILABLE_AT: Final[int] = SKILL_FEATURE_NAMES.index("is_available")
+SKILL_AVAILABLE_AT: Final[int] = SKILL_FEATURE_NAMES.index("is_valid")
 SKILL_OFF_COOLDOWN_AT: Final[int] = SKILL_FEATURE_NAMES.index("is_off_cooldown")
 SKILL_COOLDOWN_NORM_AT: Final[int] = SKILL_FEATURE_NAMES.index("cooldown_norm")
 SKILL_ENOUGH_MP_AT: Final[int] = SKILL_FEATURE_NAMES.index("has_enough_mp")
@@ -59,10 +59,10 @@ def _check_skill_panel(batch: dict[str, torch.Tensor]) -> None:
     """
     Validate the ``skills_matrix`` contract of one collated batch.
 
-    Every slot row has to stay inside the declared ranges, an empty slot must look empty
-    (``is_available``/``is_off_cooldown``/``cooldown_norm`` all 0), a ready skill must have
-    ``cooldown_norm == 0`` while a cooling-down skill must have ``cooldown_norm > 0``, and the
-    ``target_skill_slot`` of a ``used_skill`` target must point at a real (available) slot.
+    Every slot row has to stay inside the declared ranges, an empty slot must be all zeros, a
+    ready skill must have ``cooldown_norm == 0`` while a cooling-down skill must have
+    ``cooldown_norm > 0``, and the ``target_skill_slot`` of a resolved ``used_skill`` target must
+    point at a real slot.
     """
     skills = batch["skills_matrix"]  # (B, L, N, F_skill)
     available = skills[..., SKILL_AVAILABLE_AT]
@@ -70,21 +70,21 @@ def _check_skill_panel(batch: dict[str, torch.Tensor]) -> None:
     cooldown_norm = skills[..., SKILL_COOLDOWN_NORM_AT]
     enough_mp = skills[..., SKILL_ENOUGH_MP_AT]
 
-    for name, flag in (("is_available", available), ("is_off_cooldown", off_cooldown), ("has_enough_mp", enough_mp)):
+    for name, flag in (("is_valid", available), ("is_off_cooldown", off_cooldown), ("has_enough_mp", enough_mp)):
         assert bool(((flag == 0.0) | (flag == 1.0)).all()), f"skill slot {name} must be 0.0 or 1.0"
     assert float(cooldown_norm.min()) >= 0.0, "cooldown_norm below 0"
     assert float(cooldown_norm.max()) <= 1.0, "cooldown_norm above 1"
 
+    assert float(skills.min()) >= 0.0 and float(skills.max()) <= 1.0, "skill features must lie in [0, 1]"
     empty = available == 0.0
-    assert bool((cooldown_norm[empty] == 0.0).all()), "an empty skill slot must have cooldown_norm == 0"
-    assert bool((off_cooldown[empty] == 0.0).all()), "an empty skill slot must not be off cooldown"
+    assert bool((skills[empty] == 0.0).all()), "an empty skill slot must be all zeros"
 
     ready = (available == 1.0) & (off_cooldown == 1.0)
     cooling = (available == 1.0) & (off_cooldown == 0.0)
     assert bool((cooldown_norm[ready] == 0.0).all()), "a ready skill must have cooldown_norm == 0"
     assert bool((cooldown_norm[cooling] > 0.0).all()), "a cooling-down skill must have cooldown_norm > 0"
 
-    used_skill = batch["target_action_type"] == USED_SKILL_ACTION_ID
+    used_skill = (batch["target_action_type"] == USED_SKILL_ACTION_ID) & batch["target_skill_valid"]
     if bool(used_skill.any()):
         # The target timestep of a sample is its own event, so the label can be checked right here.
         slot_rows = skills[used_skill][:, -1]
@@ -135,7 +135,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("-i", "--input", type=str, required=True, help="Path to the player-action Parquet file")
     parser.add_argument("-w", type=int, default=16, help="Window length L / seq_len (default: 16)")
     parser.add_argument("--max-mobs", type=int, default=10, help="Top-K monster candidates (default: 10)")
-    parser.add_argument("--max-skills", type=int, default=16, help="Skill panel slots N (default: 16)")
+    parser.add_argument("--max-skills", type=int, default=64, help="Skill panel slots N (default: 64)")
     parser.add_argument("--batch-size", type=int, default=4, help="Batch size to probe (default: 4)")
     parser.add_argument("--all-batches", action="store_true", help="Iterate the whole loader instead of one batch")
     parser.add_argument("--quiet", action="store_true", help="Suppress the dataset statistics")

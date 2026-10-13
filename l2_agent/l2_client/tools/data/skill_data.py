@@ -26,6 +26,8 @@ SOFTWARE.
 
 import os
 import xml.etree.ElementTree as ET
+from collections.abc import Iterable
+from dataclasses import dataclass
 
 # Path to skill XML files relative to the project root.
 DEFAULT_SKILL_XML_PATH = "../L2J_Mobius/L2J_Mobius_CT_0_Interlude/dist/game/data/stats/skills"
@@ -39,6 +41,70 @@ _SKILL_LEVELS: dict[int, int] = {}
 # Maps skill ID -> reuse delay in milliseconds (level 1 value for per-level tables).
 _SKILL_REUSE_MS: dict[int, int] = {}
 
+# Maps skill ID -> raw definition used by the combat catalog (see :func:`get_skill_info`).
+_SKILL_RAW: dict[int, dict] = {}
+
+# Skill ids that appear in a player skill tree, i.e. skills a character can learn. Item skills
+# (herbs, potions, keys) are not in any tree, which is how they are kept off the skill panel.
+_LEARNABLE: set[int] = set()
+
+# ---------------------------------------------------------------------------
+# Combat catalog
+# ---------------------------------------------------------------------------
+
+#: Skill categories, in panel priority order (the first ones survive when a panel is full).
+CATEGORIES = ("attack", "debuff", "heal", "buff")
+#: Coarse target classes.
+TARGETS = ("self", "single", "area")
+
+_ATTACK_EFFECTS = frozenset((
+    "PhysicalDamage", "MagicalDamage", "MagicalDamageMp", "HpDrain", "FatalBlow", "Lethal", "EnergyDamage",
+    "DeathLink", "StaticDamage", "CpDamPercent", "PhysicalDamageHpLink",
+))
+_MAGIC_ATTACK_EFFECTS = frozenset(("MagicalDamage", "MagicalDamageMp", "HpDrain", "DeathLink"))
+_DEBUFF_EFFECTS = frozenset((
+    "Debuff", "DamOverTime", "ManaDamOverTime", "Stun", "Root", "Paralyze", "Mute", "PhysicalMute", "Fear",
+    "Sleep", "Confuse", "Bluff", "Betray",
+))
+_HEAL_EFFECTS = frozenset((
+    "Heal", "HealOverTime", "HealPercent", "CpHeal", "ManaHeal", "ManaHealOverTime", "ManaHealByLevel",
+    "ManaHealPercent", "HpByLevel",
+))
+#: Non-combat skills: resting, faking death, sneaking (toggles) and corpse handling (sweeping).
+_NON_COMBAT_EFFECTS = frozenset(("Relax", "FakeDeath", "SilentMove", "ChameleonRest", "Sweeper", "ConsumeBody"))
+_SELF_TARGETS = frozenset(("SELF", "PARTY", "CLAN", "PARTY_CLAN", "CLAN_MEMBER", "OWNER_PET", "SERVITOR", "NONE"))
+_AREA_TARGETS = frozenset(("AURA", "AREA", "FRONT_AREA", "BEHIND_AREA", "FRONT_AURA", "BEHIND_AURA", "AREA_CORPSE_MOB",
+                           "AURA_CORPSE_MOB", "AREA_UNDEAD", "AURA_UNDEAD_ENEMY", "AREA_FRIENDLY", "AURA_FRIENDLY",
+                           "GROUND"))
+
+
+@dataclass(frozen=True)
+class SkillInfo:
+    """Static, level-specific description of a skill, used as model features."""
+
+    skill_id: int
+    level: int
+    name: str
+    #: one of :data:`CATEGORIES`, or ``"other"`` (crafting, summons, escape, ...)
+    category: str
+    #: one of :data:`TARGETS`
+    target: str
+    is_magic: bool
+    power: float
+    mp_cost: float
+    cast_range: float
+    hit_time_ms: float
+    reuse_ms: float
+    #: the skill is in a player skill tree (not an item skill)
+    learnable: bool
+    #: character level from which this skill level is learnable (0 if unknown)
+    magic_level: int = 0
+
+    @property
+    def combat(self) -> bool:
+        """Belongs on the combat skill panel: a learnable active/toggle skill of a combat category."""
+        return self.learnable and self.category in CATEGORIES
+
 _loaded = False
 
 
@@ -48,7 +114,7 @@ def load_skill_data(path: str = DEFAULT_SKILL_XML_PATH) -> None:
 
     :param path: directory containing skill XML files (e.g. ``00100-00199.xml``).
     """
-    global _loaded, _SKILL_NAME, _SKILL_LEVELS, _SKILL_REUSE_MS
+    global _loaded, _SKILL_NAME, _SKILL_LEVELS, _SKILL_REUSE_MS, _SKILL_RAW
     if _loaded:
         return
 
@@ -81,10 +147,143 @@ def load_skill_data(path: str = DEFAULT_SKILL_XML_PATH) -> None:
             reuse = _read_reuse_delay(skill_elem)
             if reuse is not None:
                 _SKILL_REUSE_MS[skill_id] = reuse
+            _SKILL_RAW[skill_id] = _read_raw(skill_elem, name, levels)
             count += 1
 
+    trees = os.path.join(os.path.dirname(os.path.normpath(path)), "players", "skillTrees")
+    _load_learnable(trees)
     _loaded = True
-    print(f"[SKILL_DATA] Loaded {count} skills from {path}")
+    print(f"[SKILL_DATA] Loaded {count} skills from {path} ({len(_LEARNABLE)} learnable)")
+
+
+def _read_raw(skill_elem: ET.Element, name: str, levels: int) -> dict:
+    """Keep what the combat catalog needs: operate/target type, effects and per-level values."""
+    tables = {t.get("name"): (t.text or "").split() for t in skill_elem.findall("table") if t.get("name")}
+    values = {tag: (skill_elem.findtext(tag) or "").strip()
+              for tag in ("power", "mpConsume", "mpInitialConsume", "castRange", "hitTime", "reuseDelay", "isMagic",
+                    "magicLevel")}
+    return {
+        "name": name,
+        "levels": levels,
+        "operate_type": (skill_elem.findtext("operateType") or "").strip(),
+        "target_type": (skill_elem.findtext("targetType") or "").strip(),
+        "effects": frozenset(e.get("name") for e in skill_elem.iter("effect") if e.get("name")),
+        "tables": tables,
+        "values": values,
+    }
+
+
+def _load_learnable(directory: str) -> None:
+    """Collect every ``skillId`` of the player skill trees."""
+    _LEARNABLE.clear()
+    if not os.path.isdir(directory):
+        print(f"[SKILL_DATA] !! Skill tree directory not found: {directory} (no skill is learnable)")
+        return
+    for root_dir, _, files in os.walk(directory):
+        for fname in files:
+            if not fname.endswith(".xml"):
+                continue
+            try:
+                tree = ET.parse(os.path.join(root_dir, fname))
+            except Exception:
+                continue
+            for skill in tree.getroot().iter("skill"):
+                try:
+                    _LEARNABLE.add(int(skill.get("skillId", "")))
+                except ValueError:
+                    continue
+
+
+def _level_value(raw: dict, tag: str, level: int, default: float = 0.0) -> float:
+    """Value of ``tag`` at ``level``: a literal, or the level's entry of a ``#table``."""
+    text = raw["values"].get(tag, "")
+    if text.startswith("#"):
+        table = raw["tables"].get(text, [])
+        if not table:
+            return default
+        text = table[min(max(level, 1), len(table)) - 1]
+    try:
+        return float(text)
+    except ValueError:
+        return default
+
+
+def get_skill_info(skill_id: int, level: int = 1) -> SkillInfo | None:
+    """Static description of a skill at ``level``, or ``None`` for an unknown skill."""
+    raw = _SKILL_RAW.get(skill_id)
+    if raw is None:
+        return None
+    level = min(max(level, 1), max(raw["levels"], 1))
+    effects, operate = raw["effects"], raw["operate_type"]
+    is_active = operate.startswith("A") or operate == "T"
+    # Corpse-targeted skills need a dead monster as target, which the bots never select.
+    if not is_active or effects & _NON_COMBAT_EFFECTS or "CORPSE" in raw["target_type"]:
+        category = "other"
+    elif effects & _ATTACK_EFFECTS:
+        category = "attack"
+    elif effects & _DEBUFF_EFFECTS:
+        category = "debuff"
+    elif effects & _HEAL_EFFECTS:
+        category = "heal"
+    elif "Buff" in effects or operate == "T":
+        category = "buff"
+    else:
+        category = "other"
+
+    target_type = raw["target_type"]
+    target = "self" if target_type in _SELF_TARGETS else "area" if target_type in _AREA_TARGETS else "single"
+    magic_flag = _level_value(raw, "isMagic", level, default=-1.0)
+    is_magic = magic_flag == 1.0 or (magic_flag < 0 and bool(effects & _MAGIC_ATTACK_EFFECTS))
+    return SkillInfo(
+        skill_id=skill_id,
+        level=level,
+        name=raw["name"],
+        category=category,
+        target=target,
+        is_magic=is_magic,
+        power=_level_value(raw, "power", level),
+        mp_cost=_level_value(raw, "mpConsume", level) + _level_value(raw, "mpInitialConsume", level),
+        cast_range=max(0.0, _level_value(raw, "castRange", level)),
+        hit_time_ms=_level_value(raw, "hitTime", level),
+        reuse_ms=_level_value(raw, "reuseDelay", level),
+        learnable=skill_id in _LEARNABLE,
+        magic_level=int(_level_value(raw, "magicLevel", level)),
+    )
+
+
+def combat_skill_ids() -> list[int]:
+    """Ids of every learnable skill of a combat category (the pool of possible panel skills)."""
+    return sorted(sid for sid in _SKILL_RAW if (info := get_skill_info(sid)) is not None and info.combat)
+
+
+def best_level_for(skill_id: int, character_level: int) -> int:
+    """Highest level of ``skill_id`` a character of ``character_level`` can have (0 = none yet)."""
+    raw = _SKILL_RAW.get(skill_id)
+    if raw is None:
+        return 0
+    best = 0
+    for level in range(1, max(raw["levels"], 1) + 1):
+        if _level_value(raw, "magicLevel", level) <= character_level:
+            best = level
+    return best
+
+
+def combat_panel(skills: Iterable[tuple[int, int]], max_slots: int = 64) -> list[SkillInfo]:
+    """
+    The combat skill panel of a character: its learnable active skills of a combat category.
+
+    :param skills: ``(skill_id, level)`` pairs the character knows (passives are dropped here)
+    :param max_slots: panel size; when there are more skills, categories earlier in
+        :data:`CATEGORIES` win (attacks first), then lower skill ids
+    :return: the panel in a stable order (category priority, then skill id)
+    """
+    best: dict[int, SkillInfo] = {}
+    for skill_id, level in skills:
+        info = get_skill_info(int(skill_id), int(level))
+        if info is not None and info.combat and (skill_id not in best or level > best[skill_id].level):
+            best[int(skill_id)] = info
+    ranked = sorted(best.values(), key=lambda s: (CATEGORIES.index(s.category), s.skill_id))
+    return ranked[:max_slots]
 
 
 def _read_reuse_delay(skill_elem: ET.Element) -> int | None:

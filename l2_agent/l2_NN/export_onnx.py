@@ -5,10 +5,11 @@ Two files are written next to each other:
 
 * ``<name>.onnx`` - the network: five positional inputs, three logit outputs, dynamic batch axis.
 * ``<name>.json`` - everything a runtime needs to build the inputs **without** importing torch,
-  pandas or the dataloader: window length, Top-K sizes, the action label space, the per-character
-  skill panels (slot -> skill id) and the feature-normalisation constants of
-  :mod:`l2_NN.dataloader.dataloder`.  The headless client (``l2_client/policy.py``) reads only this
-  pair of files.
+  pandas or the dataloader: window length, Top-K / panel sizes, the action label space and the
+  feature-normalisation constants of :mod:`l2_NN.dataloader.dataloder` and
+  ``l2_client/skill_features.py``.  The skill panel itself is built by the client from the
+  character's own skills, so the model is not tied to the training characters.  The headless
+  client (``l2_client/policy.py``) reads only this pair of files.
 
 After the export the ONNX graph is run with ``onnxruntime`` on a left-padded probe batch and
 compared to the PyTorch model, so a broken export fails here instead of inside the bot.
@@ -38,6 +39,7 @@ PROJECT_ROOT: Final[Path] = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from l2_client import skill_features as sf  # noqa: E402
 from l2_NN.dataloader import dataloder as dl  # noqa: E402 - PROJECT_ROOT is added just above
 from l2_NN.model.CombatEventTransformer import CombatEventTransformer  # noqa: E402
 
@@ -45,7 +47,7 @@ INPUT_NAMES: Final[tuple[str, ...]] = ("player_state", "delta_t", "mobs_matrix",
 OUTPUT_NAMES: Final[tuple[str, ...]] = ("logits_action_type", "logits_pointer_idx", "logits_skill_slot")
 
 #: Bumped whenever the meaning of a metadata field changes, so the client can refuse a stale file.
-METADATA_VERSION: Final[int] = 1
+METADATA_VERSION: Final[int] = 2  # 2: skill slots described by datapack features, pointer heads
 
 
 class OnnxPolicy(nn.Module):
@@ -136,7 +138,6 @@ def build_metadata(checkpoint: dict, onnx_path: Path) -> dict:
         # inference has to feed the network the same way.
         "hide_last_target": not bool(args.get("keep_last_target_flag", False)),
         "action_to_id": checkpoint["action_to_id"],
-        "skill_panels": {str(k): list(v) for k, v in checkpoint["skill_panel"].items()},
         "features": {
             "player": list(dl.PLAYER_FEATURE_NAMES),
             "mob": list(dl.MOB_FEATURE_NAMES),
@@ -153,6 +154,15 @@ def build_metadata(checkpoint: dict, onnx_path: Path) -> dict:
             # The logs never carried a move speed, so every training row used this default.
             "default_move_speed": dl.DEFAULT_MOVE_SPEED,
             "skill_cooldown_norm_seconds": dl.SKILL_COOLDOWN_NORM_SECONDS,
+        },
+        # The skill panel is the character's own combat skills (skill_data.combat_panel), encoded by
+        # l2_client/skill_features.py; the client checks that its encoder still matches these scales.
+        "skill_encoding": {
+            "power_log_scale": sf.POWER_LOG_SCALE,
+            "cast_range_scale": sf.CAST_RANGE_SCALE,
+            "hit_time_scale_ms": sf.HIT_TIME_SCALE_MS,
+            "reuse_log_scale": sf.REUSE_LOG_SCALE,
+            "cooldown_scale_s": sf.COOLDOWN_SCALE_S,
         },
         "training": {
             "epoch": checkpoint.get("epoch"),

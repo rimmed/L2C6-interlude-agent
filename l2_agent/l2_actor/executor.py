@@ -30,8 +30,6 @@ log = logging.getLogger(__name__)
 #: Mystic classes (``PlayerClass.isMage()`` on the server).
 MAGE_CLASS_IDS = frozenset((10, 11, 12, 13, 14, 15, 16, 17, 25, 26, 27, 28, 29, 30, 38, 39, 40, 41, 42, 43,
                             49, 50, 51, 52, 94, 95, 96, 97, 98, 103, 104, 105, 110, 111, 112, 115, 116))
-#: Skills that are useless in a fight: Create Item, Create Common Item, Dwarven / Common Craft, Relax.
-NON_COMBAT_SKILL_IDS = frozenset((172, 1320, 1321, 1322, 226))
 #: Greater, normal and Lesser Healing Potion, best first.
 HEALING_POTION_IDS = (1539, 1061, 1060)
 
