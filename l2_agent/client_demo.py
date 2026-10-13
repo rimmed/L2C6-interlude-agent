@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import logging
 import random
 import signal
 import socket
@@ -12,7 +13,8 @@ import time
 
 from l2_client import crypto, packets
 from l2_client.character import L2Character
-from l2_client.packets import GameServerPacket, LoginServerPacket
+from l2_client.connection import GameConnection, login
+from l2_client.packets import GameServerPacket
 from l2_client.tools.data import item_data, npc_data, skill_data
 
 # --- CONFIGURATION ---
@@ -29,6 +31,12 @@ MODEL_ATTACK_REPEAT_S = 1.5    # don't re-send AttackRequest on the same target 
 MODEL_APPROACH_RANGE = 100     # "moved" walks to the target only when farther than this
 MODEL_ROAM_STEP = 400          # "moved" with nothing to walk to: random step of up to this many units
 MODEL_COOLDOWN_SYNC_S = 1.0    # RequestSkillCoolTime at most this often while a skill cools down
+# Mystic classes (PlayerClass.isMage() on the server). For them a click on the already selected
+# monster is a weapon hit, which the casters in the training data almost never do.
+MAGE_CLASS_IDS = frozenset((10, 11, 12, 13, 14, 15, 16, 17, 25, 26, 27, 28, 29, 30, 38, 39, 40, 41, 42, 43,
+                            49, 50, 51, 52, 94, 95, 96, 97, 98, 103, 104, 105, 110, 111, 112, 115, 116))
+MODEL_CAST_MARGIN_S = 0.15     # extra wait after the server-announced cast time before the next decision
+MODEL_PICKUP_COMMIT_S = 3.0    # after a pickup command, hold new decisions this long while the item is still there
 MODEL_STUCK_TARGET_S = 15.0    # give up a target that took no hit for this long (unreachable / behind a wall)
 MODEL_IGNORE_TARGET_S = 60.0   # ...and keep it off the radar for this long
 
@@ -47,48 +55,6 @@ def _print_buffs(char: L2Character):
 
 
 # -- Login server flow --
-
-def login_server_flow(sock: socket.socket, account: str = ACCOUNT_LOGIN, password: str = ACCOUNT_PASSWORD):
-    di = crypto.decrypt_init_packet(crypto.recv_packet(sock), crypto.L2MOBIUS_STATIC_KEY)
-    assert di[0] == LoginServerPacket.INIT
-    sid = struct.unpack_from("<I", di, 1)[0]
-    rm = bytearray(di[9:9 + 128])
-    crypto.unscramble_modulus(rm)
-    dk = di[9 + 128 + 16:9 + 128 + 16 + 16]
-    print(f"[LS]  Session: {sid}")
-    crypto.send_encrypted(sock, packets.build_auth_game_guard(sid), dk)
-    crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
-    print("[LS]  GGAuth OK")
-    crypto.send_encrypted(sock, packets.build_request_auth_login(account, password, sid, rm), dk)
-    dr = crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
-    if dr[0] == LoginServerPacket.LOGIN_FAIL:
-        raise RuntimeError(f"Login failed: {dr[1]}")
-    assert dr[0] == LoginServerPacket.LOGIN_OK
-    l1 = struct.unpack_from("<I", dr, 1)[0]
-    l2 = struct.unpack_from("<I", dr, 5)[0]
-    print("[LS]  LoginOk!")
-    crypto.send_encrypted(sock, packets.build_request_server_list(l1, l2), dk)
-    ds = crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
-    assert ds[0] == LoginServerPacket.SERVER_LIST
-    sc = ds[1]
-    pos = 3
-    servers = []
-    for i in range(sc):
-        si = ds[pos]; pos += 1
-        ib = ds[pos:pos + 4]; pos += 4
-        port = struct.unpack_from("<I", ds, pos)[0]; pos += 4
-        pos += 1; pos += 1; pos += 2; pos += 2; pos += 1; pos += 4; pos += 1
-        servers.append({'id': si, 'ip': f"{ib[0]}.{ib[1]}.{ib[2]}.{ib[3]}", 'port': port})
-    ch = servers[SERVER_ID]
-    print(f"[LS]  Selected: {ch['ip']}:{ch['port']}")
-    crypto.send_encrypted(sock, packets.build_request_server_login(l1, l2, ch['id']), dk)
-    dp = crypto.decrypt_l2_packet(crypto.recv_packet(sock), dk)
-    assert dp[0] == LoginServerPacket.PLAY_OK
-    p1 = struct.unpack_from("<I", dp, 1)[0]
-    p2 = struct.unpack_from("<I", dp, 5)[0]
-    print("[LS]  PlayOk!")
-    return (p1, p2, ch['ip'], ch['port'], account, l1, l2)
-
 
 def _find_healing_potion(char: L2Character) -> dict | None:
     """Best healing potion in the inventory, or ``None``."""
@@ -127,6 +93,8 @@ def _execute_model_decision(gs: socket.socket, char: L2Character, policy, decisi
     if action == "selected_target" and mob_id is not None:
         if mob_id != current_target_id:
             current_target_id = select(mob_id)
+        elif char.class_id in MAGE_CLASS_IDS:
+            pass  # a caster keeps its target and waits for the next cast instead of meleeing
         elif attack_memo.get("target") != mob_id or now - attack_memo.get("at", 0.0) >= MODEL_ATTACK_REPEAT_S:
             # A click on the already selected monster is an attack in L2 - that is what the logged
             # mid-fight "selected_target" rows are.
@@ -165,7 +133,7 @@ def _execute_model_decision(gs: socket.socket, char: L2Character, policy, decisi
             print(f"[MODEL] -> Pickup loot: {iname} ({nearest['item_id']}) x{nearest['count']}")
             crypto.send_raw(gs, packets.build_action(
                 nearest["object_id"], nearest["x"], nearest["y"], nearest["z"], shift_click=False))
-            attack_memo.update(loot=nearest["object_id"], loot_at=now)
+            attack_memo.update(loot=nearest["object_id"], loot_at=now, pickup_until=now + MODEL_PICKUP_COMMIT_S)
 
     elif action == "used_item":
         potion = _find_healing_potion(char)
@@ -194,13 +162,13 @@ def _execute_model_decision(gs: socket.socket, char: L2Character, policy, decisi
 
 # -- GS flow --
 
-def game_server_flow(ip: str, port: int, login_name: str,
-                     play_ok1: int, play_ok2: int,
-                     login_ok1: int, login_ok2: int,
+def game_server_flow(conn: GameConnection,
                      policy=None, decision_interval: float = 0.5,
                      max_kills: int = 5, run_stats: dict | None = None):
     """
     Enter the world and run the combat loop.
+
+    :param conn: game-server connection (``l2_client.connection``); the loop below reads its socket directly
 
     :param policy: a :class:`l2_client.policy.CombatPolicy`; when given, the neural model decides
         every combat action instead of the scripted state machine
@@ -212,61 +180,11 @@ def game_server_flow(ip: str, port: int, login_name: str,
     if run_stats is None:
         run_stats = {}
     run_stats.update(kills=0, deaths=0)
-    gs = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    gs.settimeout(60.0)
+    gs = conn.sock
     try:
-        print(f"\n[GS] Connecting to {ip}:{port}...")
-        gs.connect((ip, port))
-
-        crypto.send_raw(gs, packets.build_proto_version(746))
-        kp = crypto.recv_packet(gs)
-        assert kp[0] == GameServerPacket.KEY_PACKET
-        print(f"[GS]  KeyPacket: key={bytes(kp[2:10]).hex()}")
-
-        crypto.send_raw(gs, packets.build_auth_login_gs(login_name, play_ok2, play_ok1, login_ok1, login_ok2))
-        print("[GS]  AuthLogin sent")
-
-        csi = bytearray(crypto.recv_packet(gs))
-        if csi[0] == GameServerPacket.LOGIN_FAIL:
-            raise RuntimeError(f"GS Auth failed, reason: {csi[1]}")
-        assert csi[0] == GameServerPacket.CHAR_SELECT_INFO
-        cc = struct.unpack_from("<I", csi, 1)[0]
-        print(f"[GS]  Characters: {cc}")
-        if cc == 0:
-            raise RuntimeError("No characters")
-
-        pos = 5
-        for i in range(cc):
-            nb = bytearray()
-            while True:
-                if pos + 2 > len(csi):
-                    break
-                ch = struct.unpack_from("<H", csi, pos)[0]; pos += 2
-                if ch == 0:
-                    break
-                nb += struct.pack("<H", ch)
-            name = nb.decode('utf-16-le', errors='replace')
-            oid = struct.unpack_from("<I", csi, pos)[0]; pos += 4
-            print(f"[GS]   Slot {i}: '{name}' (objId={oid})")
-            if i >= CHAR_SLOT:
-                break
-            while True:
-                if pos + 2 > len(csi):
-                    break
-                if struct.unpack_from("<H", csi, pos)[0] == 0:
-                    pos += 2
-                    break
-                pos += 2
-            pos += 200
-
-        print(f"[GS] Selecting character slot {CHAR_SLOT}...")
-        crypto.send_raw(gs, packets.build_character_select(CHAR_SLOT))
-        assert crypto.recv_packet(gs)[0] == GameServerPacket.CHAR_SELECTED
-        print("[GS]  CharSelected OK")
-
-        print("[GS] Sending EnterWorld...")
-        crypto.send_raw(gs, packets.build_enter_world())
-        print("[GS]  Entered world!\n")
+        conn.enter_world()
+        gs.settimeout(60.0)
+        print(f"[GS]  Entered world as '{conn.character_name}'!\n")
 
         # -- Collect character data into L2Character --
         char = L2Character()
@@ -483,6 +401,12 @@ def game_server_flow(ip: str, port: int, login_name: str,
                     char.radar.update_from_status(su)
                     if policy is not None:
                         policy.update_self_status(char, su)
+                elif pid == GameServerPacket.MAGIC_SKILL_USE and policy is not None:
+                    # Our own cast started: a new command before it ends is refused by the server.
+                    msu = packets.parse_magic_skill_use(body)
+                    if msu and msu["caster_id"] == char.object_id:
+                        attack_memo["cast_until"] = (time.time() + msu["hit_time"] / 1000.0 / policy.server_speed
+                                                     + MODEL_CAST_MARGIN_S)
                 elif pid == GameServerPacket.SKILL_COOL_TIME and policy is not None:  # real cooldowns
                     policy.apply_skill_cool_time(packets.parse_skill_cool_time(body))
                 elif pid == GameServerPacket.DIE:
@@ -660,7 +584,13 @@ def game_server_flow(ip: str, port: int, login_name: str,
                     if policy.wants_cooldown_sync() and time.time() - last_cooldown_sync >= MODEL_COOLDOWN_SYNC_S:
                         crypto.send_raw(gs, packets.build_request_skill_cool_time())
                         last_cooldown_sync = time.time()
-                    if got_coords and state != "DEAD" and time.time() - last_decision >= decision_interval:
+                    # A pickup makes the character walk to the item; the next decision would cancel that walk
+                    # (casters kill from afar, so their loot lies far away). Let the walk finish first.
+                    picking_up = (time.time() < attack_memo.get("pickup_until", 0.0)
+                                  and any(si["object_id"] == attack_memo.get("loot") for si in pending_loot))
+                    casting = time.time() < attack_memo.get("cast_until", 0.0)
+                    if (got_coords and state != "DEAD" and not picking_up and not casting
+                            and time.time() - last_decision >= decision_interval):
                         last_decision = time.time()
                         # A target that takes no hit for a while is unreachable (geodata, walls): drop it,
                         # otherwise the policy keeps attacking it forever.
@@ -827,9 +757,9 @@ def parse_args():
                         help="Training character_id whose skill panel to use (default: best skill overlap)")
     parser.add_argument("--decision-interval", type=float, default=0.5,
                         help="Seconds between two model decisions (default: 0.5)")
-    parser.add_argument("--server-speed", type=float, default=5.0,
-                        help="Server TimeScale (General.ini): converts the server's game-time skill "
-                             "cooldowns to real time (default: 5)")
+    parser.add_argument("--server-speed", type=float, default=1.0,
+                        help="Server TimeScale (General.ini); must match the server: converts the server's "
+                             "game-time cooldowns and cast times to real time (default: 1 = no acceleration)")
     parser.add_argument("--device", choices=("cpu", "gpu"), default="cpu",
                         help="Where the model runs: cpu or gpu (CUDA) (default: cpu)")
     parser.add_argument("--max-kills", type=int, default=5, help="Stop after this many kills (default: 5)")
@@ -840,6 +770,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    logging.basicConfig(level=logging.INFO, format="[%(name)s] %(message)s")
     npc_data.load_npc_names()
     item_data.load_item_data()
     skill_data.load_skill_data()
@@ -853,14 +784,10 @@ def main():
               f"(seq_len {policy.seq_len}, trained epoch {policy.meta['training'].get('epoch')})")
     run_stats: dict = {}
     started = time.time()
-    ls_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    ls_sock.settimeout(10.0)
     try:
         print(f"[+] Connecting to {args.server_ip}:{LOGIN_PORT} as '{args.account}'...")
-        ls_sock.connect((args.server_ip, LOGIN_PORT))
-        p1, p2, gs_ip, gs_port, ln, l1, l2 = login_server_flow(ls_sock, args.account, args.password)
-        ls_sock.close()
-        game_server_flow(gs_ip, gs_port, ln, p1, p2, l1, l2,
+        ticket = login(args.server_ip, args.account, args.password, port=LOGIN_PORT, server_index=SERVER_ID)
+        game_server_flow(GameConnection(ticket, char_slot=CHAR_SLOT),
                          policy=policy, decision_interval=args.decision_interval,
                          max_kills=args.max_kills, run_stats=run_stats)
     except Exception as e:
@@ -868,10 +795,6 @@ def main():
         import traceback
         traceback.print_exc()
     finally:
-        try:
-            ls_sock.close()
-        except Exception:
-            pass
         _report_run(args, policy, run_stats, time.time() - started)
 
 

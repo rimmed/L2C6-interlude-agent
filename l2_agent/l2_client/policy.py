@@ -86,6 +86,11 @@ class Decision:
     skill_id: int | None
     #: softmax probability of ``action`` among the executable actions
     confidence: float
+    #: the same choice as indices into the model heads (what a trajectory stores): ``action_id`` in
+    #: ``action_to_id``, ``pointer_slot`` into ``mobs_matrix``, ``skill_slot`` into ``skills_matrix``
+    action_id: int = -1
+    pointer_slot: int | None = None
+    skill_slot: int | None = None
 
     def describe(self) -> str:
         parts = [f"{self.action} ({self.confidence:.0%})"]
@@ -94,6 +99,25 @@ class Decision:
         if self.skill_id is not None:
             parts.append(f"skill={skill_data.get_skill_name(self.skill_id) or '?'} ({self.skill_id})")
         return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class Observation:
+    """The model input of one decision step plus what is needed to turn head outputs into actions."""
+
+    #: unbatched model inputs: ``player_state`` (L, F_p), ``delta_t`` (L,), ``mobs_matrix`` (L, K, F_m),
+    #: ``skills_matrix`` (L, N, F_s), ``seq_mask`` (L,)
+    feeds: dict[str, np.ndarray]
+    #: radar object ids behind the real ``mobs_matrix`` slots of the last row, closest first
+    mob_ids: tuple[int, ...]
+    #: executable action name -> whether it can be carried out right now
+    valid: dict[str, bool]
+    #: ``skills_matrix`` slots whose skill can be cast right now
+    usable_slots: tuple[int, ...]
+    #: the skill panel (slot -> skill id) the slots refer to
+    panel: tuple[int, ...]
+    #: ``time.time()`` of the observation
+    t: float
 
 
 @dataclass(frozen=True)
@@ -119,26 +143,32 @@ class CombatPolicy:
 
     def __init__(
         self,
-        model_path: str | Path,
+        model_path: str | Path | None,
         character_id: int | None = None,
         providers: list[str] | None = None,
         server_speed: float = 1.0,
         device: str = "cpu",
         max_target_dz: float | None = MAX_TARGET_DZ,
+        metadata_path: str | Path | None = None,
+        excluded_skills: frozenset[int] = frozenset(),
     ):
         """
-        :param model_path: ``.onnx`` file; its ``.json`` metadata must sit next to it
+        :param model_path: ``.onnx`` file; its ``.json`` metadata must sit next to it. ``None`` builds
+            an encoder only (:meth:`observe` works, :meth:`act` does not) from ``metadata_path``
         :param character_id: training ``character_id`` whose skill panel to use; ``None`` picks the
             panel that overlaps most with the character's skills (see :meth:`bind_character`)
         :param providers: onnxruntime execution providers; overrides ``device`` when given
         :param device: ``"cpu"`` or ``"gpu"`` (CUDA); a GPU session that silently falls back to the
             CPU raises instead, so a benchmark can never measure the wrong device
         :param max_target_dz: leave out monsters with a larger height difference (``None`` keeps all)
+        :param metadata_path: feature-layout ``.json``; defaults to the one next to ``model_path``
+        :param excluded_skills: skill ids never offered for casting (e.g. crafting or Relax, which
+            the panel of a training character may contain but which are useless in a fight)
         """
-        import onnxruntime as ort  # imported lazily: the scripted bot must run without it
-
-        model_path = Path(model_path)
-        meta_path = model_path.with_suffix(".json")
+        self.excluded_skills = frozenset(excluded_skills)
+        if model_path is None and metadata_path is None:
+            raise ValueError("either model_path or metadata_path is required")
+        meta_path = Path(metadata_path) if metadata_path is not None else Path(model_path).with_suffix(".json")
         if not meta_path.is_file():
             raise FileNotFoundError(f"model metadata not found: {meta_path} (re-run l2_NN/export_onnx.py)")
         self.meta: dict[str, Any] = json.loads(meta_path.read_text())
@@ -147,6 +177,20 @@ class CombatPolicy:
                 f"{meta_path}: metadata_version {self.meta.get('metadata_version')} is not supported "
                 f"(expected {SUPPORTED_METADATA_VERSION})"
             )
+
+        self.session = None
+        self.device = "none"
+        if model_path is not None:
+            self._open_session(Path(model_path), providers, device)
+
+        #: Wall-clock milliseconds of every ``session.run`` (pure inference) and of every whole
+        #: :meth:`decide` call (feature encoding + inference + masking), in call order.
+        self.inference_ms: list[float] = []
+        self.decide_ms: list[float] = []
+        self._init_layout(character_id, server_speed, max_target_dz)
+
+    def _open_session(self, model_path: Path, providers: list[str] | None, device: str) -> None:
+        import onnxruntime as ort  # imported lazily: the scripted bot must run without it
 
         if providers is None:
             if device == "gpu":
@@ -162,10 +206,7 @@ class CombatPolicy:
             raise RuntimeError(f"requested {providers[0]}, but the session runs on {self.session.get_providers()}")
         self.device = "gpu" if self.session.get_providers()[0] == "CUDAExecutionProvider" else "cpu"
 
-        #: Wall-clock milliseconds of every ``session.run`` (pure inference) and of every whole
-        #: :meth:`decide` call (feature encoding + inference + masking), in call order.
-        self.inference_ms: list[float] = []
-        self.decide_ms: list[float] = []
+    def _init_layout(self, character_id: int | None, server_speed: float, max_target_dz: float | None) -> None:
         self.seq_len: int = self.meta["seq_len"]
         self.max_mobs: int = self.meta["max_mobs"]
         self.max_skills: int = self.meta["max_skills"]
@@ -307,6 +348,11 @@ class CombatPolicy:
     # Decision
     # ------------------------------------------------------------------
 
+    @property
+    def executable_actions(self) -> list[tuple[str, int]]:
+        """``(action name, action id)`` of every action the bot can execute."""
+        return list(self._executable)
+
     def decide(
         self,
         char,
@@ -319,6 +365,21 @@ class CombatPolicy:
     ) -> Decision:
         """Append the decision row, run the network and return the best executable action."""
         started = time.perf_counter()
+        decision = self.act(self.observe(char, current_target_id, pos, has_loot=has_loot, has_potion=has_potion, now=now))
+        self.decide_ms.append((time.perf_counter() - started) * 1000.0)
+        return decision
+
+    def observe(
+        self,
+        char,
+        current_target_id: int,
+        pos: tuple[int, int],
+        *,
+        has_loot: bool,
+        has_potion: bool,
+        now: float | None = None,
+    ) -> Observation:
+        """Append the decision row and return the model input plus the executable-action masks."""
         now = time.time() if now is None else now
 
         # A training session runs from selected_target to killed/pickup; once the fight is over
@@ -329,11 +390,9 @@ class CombatPolicy:
         self._session_engaged = self._session_engaged or engaged
 
         frame = self._snapshot(char, current_target_id, pos, now)
-        logits_action, logits_pointer, logits_skill = self._run()
-
         has_mobs = bool(frame.mob_ids)
         target_alive = bool(current_target_id) and current_target_id in char.radar.entries
-        usable_slots = [i for i, sid in enumerate(self.panel) if self._skill_usable(sid, now)]
+        usable_slots = tuple(i for i, sid in enumerate(self.panel) if self._skill_usable(sid, now))
         valid = {
             "moved": True,
             "selected_target": has_mobs,
@@ -342,25 +401,33 @@ class CombatPolicy:
             "picked_up": has_loot,
             "used_item": has_potion,
         }
+        return Observation(feeds=self._window(), mob_ids=frame.mob_ids, valid=valid, usable_slots=usable_slots,
+                           panel=tuple(self.panel), t=now)
 
-        candidates = [(name, idx) for name, idx in self._executable if valid[name]]
+    def act(self, obs: Observation) -> Decision:
+        """Run the network on ``obs`` and return the best executable action."""
+        if self.session is None:
+            raise RuntimeError("this CombatPolicy has no model (model_path=None); use it as an encoder only")
+        logits_action, logits_pointer, logits_skill = self._infer(obs.feeds)
+
+        candidates = [(name, idx) for name, idx in self._executable if obs.valid[name]]
         scores = np.array([logits_action[idx] for _, idx in candidates], dtype=np.float64)
         probs = _softmax(scores)
         best = int(np.argmax(probs))
-        action = candidates[best][0]
+        action, action_id = candidates[best]
 
-        mob_id = None
-        if has_mobs:
-            slots = len(frame.mob_ids)
-            mob_id = frame.mob_ids[int(np.argmax(logits_pointer[:slots]))]
+        mob_id = pointer_slot = None
+        if obs.mob_ids:
+            pointer_slot = int(np.argmax(logits_pointer[: len(obs.mob_ids)]))
+            mob_id = obs.mob_ids[pointer_slot]
 
-        skill_id = None
-        if usable_slots:
-            slot = max(usable_slots, key=lambda i: logits_skill[i])
-            skill_id = self.panel[slot]
+        skill_id = skill_slot = None
+        if obs.usable_slots:
+            skill_slot = max(obs.usable_slots, key=lambda i: logits_skill[i])
+            skill_id = obs.panel[skill_slot]
 
-        self.decide_ms.append((time.perf_counter() - started) * 1000.0)
-        return Decision(action=action, mob_object_id=mob_id, skill_id=skill_id, confidence=float(probs[best]))
+        return Decision(action=action, mob_object_id=mob_id, skill_id=skill_id, confidence=float(probs[best]),
+                        action_id=action_id, pointer_slot=pointer_slot, skill_slot=skill_slot)
 
     def timing_summary(self, warmup: int = 10) -> dict[str, Any]:
         """
@@ -388,7 +455,7 @@ class CombatPolicy:
 
         return {
             "device": self.device,
-            "providers": self.session.get_providers(),
+            "providers": self.session.get_providers() if self.session is not None else [],
             "warmup_calls_skipped": min(warmup, len(self.inference_ms)),
             "first_call_ms": self.inference_ms[0] if self.inference_ms else None,
             "inference_ms": stats(self.inference_ms),
@@ -400,7 +467,8 @@ class CombatPolicy:
     # ------------------------------------------------------------------
 
     def _skill_usable(self, skill_id: int, now: float) -> bool:
-        return skill_id in self._known_skills and self._cooldown_until.get(skill_id, 0.0) <= now
+        return (skill_id in self._known_skills and skill_id not in self.excluded_skills
+                and self._cooldown_until.get(skill_id, 0.0) <= now)
 
     def _snapshot(self, char, current_target_id: int, pos: tuple[int, int], now: float) -> _Frame:
         """Encode the current state and append it to the session history."""
@@ -494,7 +562,8 @@ class CombatPolicy:
             matrix[slot] = [row[name] for name in self._skill_names]
         return matrix
 
-    def _run(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def _window(self) -> dict[str, np.ndarray]:
+        """The last ``seq_len`` rows as unbatched, left-padded model inputs."""
         frames = list(self._frames)
         real, pad = len(frames), self.seq_len - len(frames)
 
@@ -515,14 +584,17 @@ class CombatPolicy:
         if self.hide_last_target and real:
             mobs[-1, :, self._mob_at["is_current_target"]] = 0.0
 
-        feeds = {
-            "player_state": player[None],
-            "delta_t": delta_t[None],
-            "mobs_matrix": mobs[None],
-            "skills_matrix": skills[None],
-            "seq_mask": seq_mask[None],
+        return {
+            "player_state": player,
+            "delta_t": delta_t,
+            "mobs_matrix": mobs,
+            "skills_matrix": skills,
+            "seq_mask": seq_mask,
         }
+
+    def _infer(self, feeds: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        batched = {name: value[None] for name, value in feeds.items()}
         started = time.perf_counter()
-        action, pointer, skill = self.session.run(list(self.meta["outputs"]), feeds)
+        action, pointer, skill = self.session.run(list(self.meta["outputs"]), batched)
         self.inference_ms.append((time.perf_counter() - started) * 1000.0)
         return action[0], pointer[0], skill[0]

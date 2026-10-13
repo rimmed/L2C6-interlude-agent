@@ -1,0 +1,374 @@
+"""
+L2 autonomous combat actor: plays one agent character and records its combat trajectories.
+
+The actor logs in (a fresh account gets a random agent character from the RL-environment server:
+random class and level, matching gear, farm-zone teleport), then repeats combat episodes - select a
+monster, fight it, loot - and stores every decision step as a transition (state, action, reward,
+next state, done) in a local buffer. When the character dies the server revives it in its farm zone;
+the actor ends the episode and simply waits for that.
+
+Run (from ``l2_agent/``)::
+
+    # trained model on the CPU, a new random agent character, stop after 100 episodes
+    uv run python -m l2_actor --model checkpoints/combat_policy.onnx --max-episodes 100
+
+    # keep playing the same character
+    uv run python -m l2_actor --account rlactor7k2p9q --password 'actor!2026' --model checkpoints/combat_policy.onnx
+
+Output (``--output-dir``, default ``trajectories/``):
+
+* ``transitions_<actor>.jsonl`` - one transition per line, layout in ``l2_actor/buffer.py``;
+* ``episodes_<actor>.jsonl``    - one summary per finished episode (return, length, reason, kills).
+
+The server's ``TimeScale`` must be passed as ``--server-speed`` (default 1 = no acceleration).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import logging
+import random
+import signal
+import string
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+if __package__ in (None, ""):
+    # ``uv run l2_actor/actor.py``: make the sibling packages importable.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from l2_actor.buffer import JsonlBuffer, Transition, TransitionBuffer
+from l2_actor.executor import NON_COMBAT_SKILL_IDS, ActionExecutor, ExecutorConfig, find_healing_potion
+from l2_actor.reward import RewardConfig
+from l2_actor.world import WorldState
+from l2_client import packets
+from l2_client.connection import GameConnection, login
+from l2_client.policy import CombatPolicy, Decision, Observation
+from l2_client.tools.data import item_data, npc_data, skill_data
+
+log = logging.getLogger("l2_actor")
+
+AGENT_ROOT = Path(__file__).resolve().parents[1]
+DATAPACK = AGENT_ROOT.parent / "L2J_Mobius" / "L2J_Mobius_CT_0_Interlude" / "dist" / "game" / "data" / "stats"
+
+
+@dataclass
+class ActorConfig:
+    """Settings of one actor process (see ``parse_args`` for the meaning of each field)."""
+
+    server_ip: str = "192.168.1.200"
+    login_port: int = 2106
+    account: str | None = None
+    password: str = "actor!2026"
+    char_slot: int = 0
+    model: str = "checkpoints/combat_policy.onnx"
+    device: str = "cpu"
+    server_speed: float = 1.0
+    decision_interval: float = 0.5
+    output_dir: str = "trajectories"
+    flush_every: int = 256
+    store_next_state: bool = True
+    max_episodes: int = 0
+    max_steps: int = 0
+    max_minutes: float = 0.0
+    setup_timeout: float = 20.0
+    settle_time: float = 6.0
+    respawn_timeout: float = 60.0
+    seed: int | None = None
+
+
+class Actor:
+    """One character, one connection, one trajectory buffer."""
+
+    def __init__(self, cfg: ActorConfig, buffer: TransitionBuffer | None = None):
+        self.cfg = cfg
+        self.rng = random.Random(cfg.seed)
+        self.account = cfg.account or "rlactor" + "".join(self.rng.choices(string.ascii_lowercase + string.digits, k=6))
+        self.actor_id = self.account
+        out = Path(cfg.output_dir)
+        self.buffer = buffer or JsonlBuffer(out / f"transitions_{self.actor_id}.jsonl", flush_every=cfg.flush_every)
+        self.episodes_path = out / f"episodes_{self.actor_id}.jsonl"
+        self.reward = RewardConfig()
+
+        self.conn: GameConnection | None = None
+        self.encoder: CombatPolicy | None = None
+        self.world: WorldState | None = None
+        self.executor: ActionExecutor | None = None
+        self.model_name = Path(cfg.model).name
+
+        self._pending: Transition | None = None
+        self._last_decision = 0.0
+        self._restart_requested = False
+        self.started = time.time()
+        self.episode_id = 0
+        self.episode_step = 0
+        self.episode_return = 0.0
+        self.episode_started = 0.0
+        self.total_steps = 0
+        self.totals = {"episodes": 0, "kills": 0, "deaths": 0, "transitions": 0, "return": 0.0}
+
+    # ------------------------------------------------------------------
+    # Setup
+    # ------------------------------------------------------------------
+
+    def connect(self) -> None:
+        """Log in, enter the world and wait until the server finished setting the agent up."""
+        cfg = self.cfg
+        npc_data.load_npc_names(str(DATAPACK / "npcs"))
+        item_data.load_item_data(str(DATAPACK / "items"))
+        skill_data.load_skill_data(str(DATAPACK / "skills"))
+
+        # The model decides; its .json (feature layout, skill panels) must sit next to the .onnx.
+        self.encoder = CombatPolicy(cfg.model, server_speed=cfg.server_speed, device=cfg.device,
+                                    excluded_skills=NON_COMBAT_SKILL_IDS)
+        log.info("Model: %s on %s", cfg.model, self.encoder.device)
+
+        ticket = login(cfg.server_ip, self.account, cfg.password, port=cfg.login_port)
+        self.conn = GameConnection(ticket, char_slot=cfg.char_slot)
+        self.conn.enter_world()
+        self.world = WorldState(self.encoder, self.conn.send, cfg.server_speed)
+        self.executor = ActionExecutor(self.conn.send, self.world, self.encoder,
+                                       ExecutorConfig(), rng=self.rng)
+
+        # 1) the character data; 2) the RL-environment setup (level boost, class transfer, gear,
+        # farm-zone teleport) runs right after login - give it time to land before acting.
+        deadline = time.time() + cfg.setup_timeout
+        while not self.world.ready:
+            if time.time() > deadline:
+                raise TimeoutError("no UserInfo / SkillList from the server")
+            self._pump(0.2)
+        settle_until = time.time() + cfg.settle_time
+        while time.time() < settle_until:
+            teleports = self.world.teleports
+            self._pump(0.2)
+            if self.world.teleports > teleports:  # in the farm zone; let the nearby objects arrive
+                settle_until = min(settle_until, time.time() + 1.5)
+        if self.world.home is None:  # no teleport (standard server): roam around the login position
+            self.world.home = self.world.pos
+        self.encoder.bind_character(self.world.char)
+        char = self.world.char
+        log.info("Playing '%s' (account %s): level %d, class %d, at %s", self.conn.character_name, self.account,
+                 char.level, char.class_id, self.world.pos)
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
+
+    def run(self) -> dict[str, Any]:
+        """Play until a limit is reached or the process is interrupted; return the run summary."""
+        try:
+            self.connect()
+            self.episode_started = time.time()
+            while not self._limit_reached():
+                self._pump(0.05)
+                self._tick(time.time())
+        except KeyboardInterrupt:
+            log.info("Interrupted")
+        finally:
+            signal.signal(signal.SIGINT, signal.SIG_IGN)  # a second Ctrl+C must not lose buffered data
+            self._shutdown()
+        return self.summary()
+
+    def _pump(self, timeout: float) -> None:
+        now = time.time()
+        for body in self.conn.poll(timeout):
+            for event in self.world.handle(body, now):
+                self._on_event(event, now)
+
+    def _tick(self, now: float) -> None:
+        world = self.world
+        world.char.radar.prune(*world.xy)
+        if world.dead:
+            self._respawn_fallback(now)
+            return
+        self.executor.sync_cooldowns(now)
+        self.executor.drop_stuck_target(now)
+        if now - self._last_decision >= self.cfg.decision_interval and not self.executor.busy(now):
+            self._step(now)
+
+    def _step(self, now: float) -> None:
+        world = self.world
+        obs = self.encoder.observe(world.char, world.target_id, world.xy, has_loot=bool(world.pending_loot),
+                                   has_potion=find_healing_potion(world.char) is not None, now=now)
+        if self._pending is not None:
+            self._finish(self._pending, next_state=obs.feeds)
+
+        decision = self.encoder.act(obs)
+        executed = self.executor.execute(decision, now)
+        log.debug("[ep %d step %d] %s -> %s", self.episode_id, self.episode_step, decision.describe(), executed)
+
+        self._pending = Transition(
+            actor_id=self.actor_id, episode_id=self.episode_id, step=self.episode_step, t=now,
+            state=obs.feeds, action=self._action_record(decision, executed), action_mask=self._mask_record(obs),
+            info=self._info_record(),
+        )
+        self.episode_step += 1
+        self.total_steps += 1
+        self._last_decision = now
+
+    def _on_event(self, event: str, now: float) -> None:
+        if event in ("kill", "death"):
+            self.totals["kills" if event == "kill" else "deaths"] += 1
+            self._end_episode(event)
+        elif event == "skills_changed" and self.world.ready and self.encoder.panel:
+            self.encoder.bind_character(self.world.char)
+        elif event == "teleport":
+            self.encoder.reset_session()
+        elif event == "revive":
+            self._restart_requested = False
+            log.info("Revived by the server")
+
+    def _respawn_fallback(self, now: float) -> None:
+        """The RL-environment server revives agents in their zone; only a standard server needs this."""
+        if not self._restart_requested and now - self.world.dead_since > self.cfg.respawn_timeout:
+            log.warning("Not revived after %.0fs -- is RLRespawnOnDeath enabled? Requesting the town respawn.",
+                        self.cfg.respawn_timeout)
+            self.conn.send(packets.build_request_restart_point(0))
+            self._restart_requested = True
+
+    # ------------------------------------------------------------------
+    # Transitions and episodes
+    # ------------------------------------------------------------------
+
+    def _finish(self, transition: Transition, *, next_state: dict | None = None, done: bool = False,
+                truncated: bool = False, reason: str | None = None) -> None:
+        """Attach reward / next state / done to a transition and hand it to the buffer."""
+        events = self.world.events.take()
+        transition.reward, transition.reward_terms = self.reward.compute(events, self.world.char.max_hp)
+        transition.next_state = next_state if (self.cfg.store_next_state and not done and not truncated) else None
+        transition.done, transition.truncated, transition.done_reason = done, truncated, reason
+        self.buffer.add(transition)
+        self.episode_return += transition.reward
+        self.totals["transitions"] += 1
+        self.totals["return"] += transition.reward
+
+    def _end_episode(self, reason: str, *, truncated: bool = False) -> None:
+        if self._pending is not None:
+            self._finish(self._pending, done=not truncated, truncated=truncated, reason=reason)
+            self._pending = None
+        if self.episode_step:
+            char = self.world.char
+            summary = {
+                "actor_id": self.actor_id, "episode_id": self.episode_id, "reason": reason, "truncated": truncated,
+                "steps": self.episode_step, "return": round(self.episode_return, 4),
+                "duration_s": round(time.time() - self.episode_started, 2),
+                "character": self.conn.character_name, "level": char.level, "class_id": char.class_id,
+            }
+            self.episodes_path.parent.mkdir(parents=True, exist_ok=True)
+            with self.episodes_path.open("a", encoding="utf-8") as fh:
+                fh.write(json.dumps(summary) + "\n")
+            self.totals["episodes"] += 1
+            log.info("Episode %d: %s after %d steps, return %.3f (%.1fs)", self.episode_id, reason,
+                     self.episode_step, self.episode_return, summary["duration_s"])
+            self.episode_id += 1
+        self.buffer.end_episode()
+        self.episode_step = 0
+        self.episode_return = 0.0
+        self.episode_started = time.time()
+        self.encoder.reset_session()
+
+    def _limit_reached(self) -> bool:
+        cfg = self.cfg
+        return bool(
+            (cfg.max_episodes and self.totals["episodes"] >= cfg.max_episodes)
+            or (cfg.max_steps and self.total_steps >= cfg.max_steps)
+            or (cfg.max_minutes and time.time() - self.started >= cfg.max_minutes * 60)
+        )
+
+    def _shutdown(self) -> None:
+        if self.world is not None and self._pending is not None:
+            self._end_episode("stopped", truncated=True)
+        self.buffer.close()
+        if self.conn is not None:
+            self.conn.close()
+
+    # ------------------------------------------------------------------
+    # Record helpers
+    # ------------------------------------------------------------------
+
+    def _action_record(self, decision: Decision, executed: str) -> dict[str, Any]:
+        return {
+            "type": decision.action, "type_id": decision.action_id,
+            "pointer_idx": decision.pointer_slot, "skill_slot": decision.skill_slot,
+            "mob_object_id": decision.mob_object_id, "skill_id": decision.skill_id,
+            "confidence": round(decision.confidence, 4), "model": self.model_name, "executed": executed,
+        }
+
+    def _mask_record(self, obs: Observation) -> dict[str, Any]:
+        return {
+            "types": [action_id for name, action_id in self.encoder.executable_actions if obs.valid[name]],
+            "n_mobs": len(obs.mob_ids),
+            "skill_slots": list(obs.usable_slots),
+        }
+
+    def _info_record(self) -> dict[str, Any]:
+        char, world = self.world.char, self.world
+        return {
+            "character": self.conn.character_name, "level": char.level, "class_id": char.class_id,
+            "hp_ratio": round(char.cur_hp / char.max_hp, 4) if char.max_hp else None,
+            "mp_ratio": round(char.cur_mp / char.max_mp, 4) if char.max_mp else None,
+            "pos": list(world.pos), "target_id": world.target_id, "loot_on_ground": len(world.pending_loot),
+        }
+
+    def summary(self) -> dict[str, Any]:
+        minutes = (time.time() - self.started) / 60
+        result = {"actor_id": self.actor_id, "minutes": round(minutes, 2), "steps": self.total_steps, **self.totals}
+        result["return"] = round(result["return"], 4)
+        if self.encoder is not None and self.encoder.session is not None:
+            inference = self.encoder.timing_summary()["inference_ms"]
+            if inference.get("count"):
+                result["inference_ms_mean"] = round(inference["mean"], 3)
+        return result
+
+
+def parse_args(argv: list[str] | None = None) -> ActorConfig:
+    d = ActorConfig()
+    p = argparse.ArgumentParser(description="L2 autonomous combat actor (trajectory collection).",
+                                formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    p.add_argument("--server-ip", default=d.server_ip, help="Login server address")
+    p.add_argument("--login-port", type=int, default=d.login_port)
+    p.add_argument("--account", default=None,
+                   help="Account to play; default: a new random 'rlactor…' account, i.e. a new random agent character")
+    p.add_argument("--password", default=d.password)
+    p.add_argument("--char-slot", type=int, default=d.char_slot)
+    p.add_argument("--model", required=True,
+                   help="ONNX combat model (l2_NN/export_onnx.py); its .json must sit next to it")
+    p.add_argument("--device", choices=("cpu", "gpu"), default=d.device, help="Where the model runs")
+    p.add_argument("--server-speed", type=float, default=d.server_speed, help="Server TimeScale (General.ini)")
+    p.add_argument("--decision-interval", type=float, default=d.decision_interval, help="Seconds between decisions")
+    p.add_argument("--output-dir", default=d.output_dir, help="Where the .jsonl files go")
+    p.add_argument("--flush-every", type=int, default=d.flush_every, help="Flush the buffer every N transitions")
+    p.add_argument("--no-next-state", dest="store_next_state", action="store_false",
+                   help="Do not store next_state (it equals the state of the next record of the episode)")
+    p.add_argument("--max-episodes", type=int, default=0, help="Stop after N finished episodes (0 = no limit)")
+    p.add_argument("--max-steps", type=int, default=0, help="Stop after N decisions (0 = no limit)")
+    p.add_argument("--max-minutes", type=float, default=0.0, help="Stop after N minutes (0 = no limit)")
+    p.add_argument("--respawn-timeout", type=float, default=d.respawn_timeout,
+                   help="Request a town respawn if the server has not revived the character after this many seconds")
+    p.add_argument("--seed", type=int, default=None, help="Seed of the actor's own randomness (account name, roaming)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Log every decision")
+    args = p.parse_args(argv)
+    logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    return ActorConfig(
+        server_ip=args.server_ip, login_port=args.login_port, account=args.account, password=args.password,
+        char_slot=args.char_slot, model=args.model, device=args.device,
+        server_speed=args.server_speed, decision_interval=args.decision_interval, output_dir=args.output_dir,
+        flush_every=args.flush_every, store_next_state=args.store_next_state, max_episodes=args.max_episodes,
+        max_steps=args.max_steps, max_minutes=args.max_minutes, respawn_timeout=args.respawn_timeout, seed=args.seed,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    actor = Actor(parse_args(argv))
+    summary = actor.run()
+    print(json.dumps(summary, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -87,6 +87,7 @@ class GameServerPacket(IntEnum):
     SERVER_CLOSE = 0x26
     INVENTORY_UPDATE = 0x27
     TELEPORT_TO_LOCATION = 0x28
+    MAGIC_SKILL_USE = 0x48
     CREATURE_SAY = 0x4A
     SKILL_LIST = 0x58
     SYSTEM_MESSAGE = 0x64
@@ -127,6 +128,14 @@ class GameClientExPacket(IntEnum):
     """Sub-opcodes (uint16) of :attr:`GameClientPacket.EX_PACKET`."""
 
     REQUEST_AUTO_SOUL_SHOT = 0x05
+
+
+class SystemMessageId(IntEnum):
+    """SystemMessage (0x64) ids the bots react to."""
+
+    YOU_DID_DAMAGE = 35  # "You hit for $s1 damage."
+    DAMAGE_TAKEN = 36  # "$s1 hit you for $s2 damage."
+    DAMAGE_TAKEN_2 = 37  # same message for another attacker kind
 
 
 #: Game server opcode -> packet name, for logging.
@@ -687,6 +696,66 @@ def parse_teleport_to_location(body: bytes) -> dict:
         return {}
     object_id, x, y, z = struct.unpack_from("<iiii", body, 1)
     return {"object_id": object_id, "x": x, "y": y, "z": z}
+
+
+def parse_magic_skill_use(body: bytes) -> dict:
+    """
+    Parse MagicSkillUse (0x48): a creature starts casting.
+
+    ``hit_time`` and ``reuse`` are milliseconds of *game* time (divide by the server ``TimeScale``
+    for real time).
+    """
+    if len(body) < 25:
+        return {}
+    caster_id, target_id, skill_id, skill_level, hit_time, reuse = struct.unpack_from("<iiiiii", body, 1)
+    return {"caster_id": caster_id, "target_id": target_id, "skill_id": skill_id,
+            "skill_level": skill_level, "hit_time": hit_time, "reuse": reuse}
+
+
+# SystemMessage parameter types (SystemMessage.TYPE_* on the server).
+_SM_TEXT, _SM_INT, _SM_SKILL, _SM_LONG, _SM_ZONE, _SM_PLAYER = 0, 1, 4, 6, 7, 12
+
+
+def parse_system_message(body: bytes) -> dict:
+    """
+    Parse SystemMessage (0x64): ``{"msg_id": int, "params": [...]}``.
+
+    Text and player names become ``str``, numbers ``int``, skill names ``(skill_id, level)`` and zone
+    names ``(x, y, z)``; every other parameter type is a single ``int`` (item / NPC ids, ...).
+    """
+    if len(body) < 9:
+        return {}
+    msg_id, count = struct.unpack_from("<ii", body, 1)
+    pos, params = 9, []
+    for _ in range(count):
+        if pos + 4 > len(body):
+            break
+        ptype = struct.unpack_from("<i", body, pos)[0]; pos += 4
+        if ptype in (_SM_TEXT, _SM_PLAYER):
+            value, pos = _read_utf16le_string(body, pos)
+        elif ptype == _SM_LONG:
+            if pos + 8 > len(body):
+                break
+            value = struct.unpack_from("<q", body, pos)[0]; pos += 8
+        elif ptype in (_SM_SKILL, _SM_ZONE):
+            n = 2 if ptype == _SM_SKILL else 3
+            if pos + 4 * n > len(body):
+                break
+            value = struct.unpack_from(f"<{n}i", body, pos); pos += 4 * n
+        else:
+            if pos + 4 > len(body):
+                break
+            value = struct.unpack_from("<i", body, pos)[0]; pos += 4
+        params.append(value)
+    return {"msg_id": msg_id, "params": params}
+
+
+def parse_get_item(body: bytes) -> dict:
+    """Parse GetItem (0x0D): who picked up which ground item (object id)."""
+    if len(body) < 9:
+        return {}
+    picker_id, object_id = struct.unpack_from("<ii", body, 1)
+    return {"picker_id": picker_id, "object_id": object_id}
 
 
 def parse_revive(body: bytes) -> dict:
