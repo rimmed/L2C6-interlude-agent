@@ -47,6 +47,8 @@ _SKILL_RAW: dict[int, dict] = {}
 # Skill ids that appear in a player skill tree, i.e. skills a character can learn. Item skills
 # (herbs, potions, keys) are not in any tree, which is how they are kept off the skill panel.
 _LEARNABLE: set[int] = set()
+#: skill id -> {skill level: lowest character level (``getLevel``) at which any class tree teaches it}
+_LEARN_LEVEL: dict[int, dict[int, int]] = {}
 
 # ---------------------------------------------------------------------------
 # Combat catalog
@@ -174,8 +176,9 @@ def _read_raw(skill_elem: ET.Element, name: str, levels: int) -> dict:
 
 
 def _load_learnable(directory: str) -> None:
-    """Collect every ``skillId`` of the player skill trees."""
+    """Collect every ``skillId`` of the player skill trees and the character level each skill level needs."""
     _LEARNABLE.clear()
+    _LEARN_LEVEL.clear()
     if not os.path.isdir(directory):
         print(f"[SKILL_DATA] !! Skill tree directory not found: {directory} (no skill is learnable)")
         return
@@ -189,9 +192,16 @@ def _load_learnable(directory: str) -> None:
                 continue
             for skill in tree.getroot().iter("skill"):
                 try:
-                    _LEARNABLE.add(int(skill.get("skillId", "")))
+                    skill_id = int(skill.get("skillId", ""))
                 except ValueError:
                     continue
+                _LEARNABLE.add(skill_id)
+                try:
+                    skill_level, get_level = int(skill.get("skillLevel", "")), int(skill.get("getLevel", ""))
+                except ValueError:
+                    continue
+                levels = _LEARN_LEVEL.setdefault(skill_id, {})
+                levels[skill_level] = min(levels.get(skill_level, get_level), get_level)
 
 
 def _level_value(raw: dict, tag: str, level: int, default: float = 0.0) -> float:
@@ -257,7 +267,15 @@ def combat_skill_ids() -> list[int]:
 
 
 def best_level_for(skill_id: int, character_level: int) -> int:
-    """Highest level of ``skill_id`` a character of ``character_level`` can have (0 = none yet)."""
+    """
+    Highest level of ``skill_id`` a character of ``character_level`` can have (0 = none yet).
+
+    Uses the ``getLevel`` of the player skill trees (the lowest over all classes); a skill outside
+    the trees falls back to its ``magicLevel``.
+    """
+    learn = _LEARN_LEVEL.get(skill_id)
+    if learn:
+        return max((lvl for lvl, need in learn.items() if need <= character_level), default=0)
     raw = _SKILL_RAW.get(skill_id)
     if raw is None:
         return 0

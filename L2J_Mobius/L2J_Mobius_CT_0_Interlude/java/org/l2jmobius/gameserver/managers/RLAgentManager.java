@@ -68,6 +68,7 @@ import org.l2jmobius.gameserver.model.item.instance.Item;
 import org.l2jmobius.gameserver.model.item.type.ArmorType;
 import org.l2jmobius.gameserver.model.item.type.CrystalType;
 import org.l2jmobius.gameserver.model.item.type.WeaponType;
+import org.l2jmobius.gameserver.model.skill.holders.SkillHolder;
 import org.l2jmobius.gameserver.network.GameClient;
 import org.l2jmobius.gameserver.network.clientpackets.CharacterCreate;
 import org.l2jmobius.gameserver.network.serverpackets.ExAutoSoulShot;
@@ -623,7 +624,8 @@ public class RLAgentManager
 	private static GearPool buildGearPool(CrystalType grade, Archetype archetype)
 	{
 		// Sealed A/S pieces lack the set bonus until unsealed, test and time-limited (shadow) items are not real gear.
-		final Predicate<ItemTemplate> usable = item -> (item.getCrystalType() == grade) && (item.getReferencePrice() > 0) && (item.getDuration() <= 0) && !item.isQuestItem() && !item.isHeroItem() && !item.isPvpItem() && !item.isCommon() && !item.getName().contains("Test") && !item.getName().startsWith("Sealed ");
+		// Items whose skill is missing from the datapack (e.g. the "- Light" weapons with skill 3498) fail on login.
+		final Predicate<ItemTemplate> usable = item -> (item.getCrystalType() == grade) && (item.getReferencePrice() > 0) && (item.getDuration() <= 0) && !item.isQuestItem() && !item.isHeroItem() && !item.isPvpItem() && !item.isCommon() && !item.getName().contains("Test") && !item.getName().startsWith("Sealed ") && hasKnownSkills(item);
 		
 		final List<ItemTemplate> weapons = new ArrayList<>();
 		for (Weapon weapon : ItemData.getInstance().getAllWeapons())
@@ -677,6 +679,22 @@ public class RLAgentManager
 		
 		LOGGER.info(RLAgentManager.class.getSimpleName() + ": " + grade + " " + archetype + " gear pool: " + weapons.size() + " weapons, " + shields.size() + " shields, " + helmets.size() + " helmets, " + gloves.size() + " gloves, " + boots.size() + " boots, " + bodies.size() + " bodies, " + legs.size() + " legs.");
 		return new GearPool(weapons, shields, helmets, gloves, boots, bodies, legs);
+	}
+	
+	private static boolean hasKnownSkills(ItemTemplate item)
+	{
+		final SkillHolder[] skills = item.getSkills();
+		if (skills != null)
+		{
+			for (SkillHolder holder : skills)
+			{
+				if (holder.getSkill() == null)
+				{
+					return false;
+				}
+			}
+		}
+		return true;
 	}
 	
 	private static boolean fitsArchetype(Weapon weapon, Archetype archetype)
