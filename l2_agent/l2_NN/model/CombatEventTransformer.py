@@ -118,6 +118,8 @@ class CombatEventTransformer(nn.Module):
         # Pointer heads: the target monster and the skill are chosen by their features, not by slot index.
         self.head_pointer_idx = PointerHead(d_model, entity_dim=64)
         self.head_skill_slot = PointerHead(d_model, entity_dim=64)
+        # State value for RL (V-trace); not part of the ONNX policy the actors run.
+        self.head_value = nn.Sequential(nn.Linear(d_model, 64), nn.ReLU(), nn.Linear(64, 1))
 
     def _generate_causal_mask(self, L: int, device: torch.device) -> torch.Tensor:
         """Генерує причинно-наслідкову (Causal) маску, щоб t не дивився в майбутнє."""
@@ -175,7 +177,8 @@ class CombatEventTransformer(nn.Module):
         return {
             "logits_action_type": logits_action_type,
             "logits_pointer_idx": logits_pointer_idx,
-            "logits_skill_slot": logits_skill_slot
+            "logits_skill_slot": logits_skill_slot,
+            "value": self.head_value(last_step_repr).squeeze(-1),  # [B]
         }
 
     def compute_loss(

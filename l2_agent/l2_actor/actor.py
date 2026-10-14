@@ -15,10 +15,18 @@ Run (from ``l2_agent/``)::
     # keep playing the same character
     uv run python -m l2_actor --account rlactor7k2p9q --password 'actor!2026' --model checkpoints/combat_policy.onnx
 
+    # RL: send the trajectories to the trainer (l2_NN/train_rl.py) and play its latest policy
+    uv run python -m l2_actor --redis redis://192.168.1.10:6379/0 --model redis --server-speed 5
+
 Output (``--output-dir``, default ``trajectories/``):
 
-* ``transitions_<actor>.jsonl`` - one transition per line, layout in ``l2_actor/buffer.py``;
+* ``transitions_<actor>.jsonl`` - one transition per line, layout in ``l2_actor/buffer.py``
+  (with ``--redis`` the transitions go to Redis instead, layout in ``l2_actor/replay.py``);
 * ``episodes_<actor>.jsonl``    - one summary per finished episode (return, length, reason, kills).
+
+With ``--redis`` the actor samples its actions from the policy (exploration; ``--greedy`` turns
+that off) and checks for a newer published policy every ``--model-poll`` seconds; the new weights
+are swapped in without leaving the game.
 
 The server's ``TimeScale`` must be passed as ``--server-speed`` (default 1 = no acceleration).
 """
@@ -37,10 +45,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+
 if __package__ in (None, ""):
     # ``uv run l2_actor/actor.py``: make the sibling packages importable.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from l2_actor import replay
 from l2_actor.buffer import JsonlBuffer, Transition, TransitionBuffer
 from l2_actor.executor import ActionExecutor, ExecutorConfig, find_healing_potion
 from l2_actor.reward import RewardConfig
@@ -66,6 +77,13 @@ class ActorConfig:
     password: str = "actor!2026"
     char_slot: int = 0
     model: str = "checkpoints/combat_policy.onnx"
+    redis: str | None = None
+    #: sample actions from the policy; ``None`` = sample with ``redis`` (RL), argmax without
+    sample: bool | None = None
+    segment_len: int = 64
+    max_queue: int = 20_000
+    model_poll: float = 10.0
+    model_wait: float = 600.0
     device: str = "cpu"
     server_speed: float = 1.0
     decision_interval: float = 0.5
@@ -90,8 +108,18 @@ class Actor:
         self.account = cfg.account or "rlactor" + "".join(self.rng.choices(string.ascii_lowercase + string.digits, k=6))
         self.actor_id = self.account
         out = Path(cfg.output_dir)
-        self.buffer = buffer or JsonlBuffer(out / f"transitions_{self.actor_id}.jsonl", flush_every=cfg.flush_every)
+        self.redis = replay.connect(cfg.redis) if cfg.redis else None
+        if cfg.model == "redis" and self.redis is None:
+            raise ValueError("--model redis needs --redis")
+        # The Redis buffer needs the model's label space, so it is created once the model is loaded.
+        self.buffer = buffer
+        if buffer is None and self.redis is None:
+            self.buffer = JsonlBuffer(out / f"transitions_{self.actor_id}.jsonl", flush_every=cfg.flush_every)
         self.episodes_path = out / f"episodes_{self.actor_id}.jsonl"
+        self.sample = cfg.sample if cfg.sample is not None else self.redis is not None
+        self.np_rng = np.random.default_rng(cfg.seed)
+        self.model_version: int | None = None
+        self._last_model_poll = 0.0
         self.reward = RewardConfig()
 
         self.conn: GameConnection | None = None
@@ -123,8 +151,15 @@ class Actor:
         skill_data.load_skill_data(str(DATAPACK / "skills"))
 
         # The model decides; its .json (feature layout, skill panels) must sit next to the .onnx.
-        self.encoder = CombatPolicy(cfg.model, server_speed=cfg.server_speed, device=cfg.device)
-        log.info("Model: %s on %s", cfg.model, self.encoder.device)
+        model_path = self._download_model() if cfg.model == "redis" else cfg.model
+        self.encoder = CombatPolicy(model_path, server_speed=cfg.server_speed, device=cfg.device)
+        log.info("Model: %s (version %s) on %s, %s actions", model_path, self.model_version, self.encoder.device,
+                 "sampled" if self.sample else "greedy")
+        if self.buffer is None:
+            self.buffer = replay.RedisBuffer(
+                self.redis, actor_id=self.actor_id, n_actions=len(self.encoder.meta["action_to_id"]),
+                max_skills=self.encoder.meta["max_skills"], segment_len=cfg.segment_len, max_queue=cfg.max_queue,
+            )
 
         ticket = login(cfg.server_ip, self.account, cfg.password, port=cfg.login_port)
         self.conn = GameConnection(ticket, char_slot=cfg.char_slot)
@@ -152,6 +187,50 @@ class Actor:
         char = self.world.char
         log.info("Playing '%s' (account %s): level %d, class %d, at %s", self.conn.character_name, self.account,
                  char.level, char.class_id, self.world.pos)
+        self._update_header()
+
+    def _download_model(self) -> Path:
+        """Wait for the trainer's policy in Redis and store it under ``output_dir/models/``."""
+        deadline = time.time() + self.cfg.model_wait
+        while (published := replay.fetch_model(self.redis)) is None:
+            if time.time() > deadline:
+                raise TimeoutError(f"no model published in Redis within {self.cfg.model_wait:.0f}s")
+            log.info("Waiting for the trainer to publish a model...")
+            time.sleep(5.0)
+        version, onnx_bytes, meta = published
+        folder = Path(self.cfg.output_dir) / "models"
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"combat_policy_{self.actor_id}.onnx"
+        path.write_bytes(onnx_bytes)
+        path.with_suffix(".json").write_text(json.dumps(meta))
+        self.model_version = version
+        self.model_name = f"redis:v{version}"
+        return path
+
+    def _poll_model(self, now: float) -> None:
+        """Swap in a newer published policy (keeps the game state and the event history)."""
+        if self.redis is None or self.cfg.model != "redis" or now - self._last_model_poll < self.cfg.model_poll:
+            return
+        self._last_model_poll = now
+        try:
+            published = replay.fetch_model(self.redis, self.model_version)
+        except Exception as exc:  # a Redis hiccup must not stop the game
+            log.warning("Model poll failed: %s", exc)
+            return
+        if published is None:
+            return
+        version, onnx_bytes, meta = published
+        self.encoder.reload(onnx_bytes, meta)
+        log.info("Loaded model version %d (was %s)", version, self.model_version)
+        self.model_version = version
+        self.model_name = f"redis:v{version}"
+        self._update_header()
+
+    def _update_header(self) -> None:
+        if isinstance(self.buffer, replay.RedisBuffer):
+            char = self.world.char
+            self.buffer.header.update(model_version=self.model_version, character=self.conn.character_name,
+                                      level=char.level, class_id=char.class_id)
 
     # ------------------------------------------------------------------
     # Main loop
@@ -187,6 +266,7 @@ class Actor:
         self.executor.sync_cooldowns(now)
         self.executor.drop_stuck_target(now)
         if now - self._last_decision >= self.cfg.decision_interval and not self.executor.busy(now):
+            self._poll_model(now)
             self._step(now)
 
     def _step(self, now: float) -> None:
@@ -196,7 +276,7 @@ class Actor:
         if self._pending is not None:
             self._finish(self._pending, next_state=obs.feeds)
 
-        decision = self.encoder.act(obs)
+        decision = self.encoder.act(obs, sample=self.sample, rng=self.np_rng)
         executed = self.executor.execute(decision, now)
         log.debug("[ep %d step %d] %s -> %s", self.episode_id, self.episode_step, decision.describe(), executed)
 
@@ -265,6 +345,7 @@ class Actor:
                      self.episode_step, self.episode_return, summary["duration_s"])
             self.episode_id += 1
         self.buffer.end_episode()
+        self._update_header()
         self.episode_step = 0
         self.episode_return = 0.0
         self.episode_started = time.time()
@@ -281,7 +362,8 @@ class Actor:
     def _shutdown(self) -> None:
         if self.world is not None and self._pending is not None:
             self._end_episode("stopped", truncated=True)
-        self.buffer.close()
+        if self.buffer is not None:
+            self.buffer.close()
         if self.conn is not None:
             self.conn.close()
 
@@ -294,7 +376,8 @@ class Actor:
             "type": decision.action, "type_id": decision.action_id,
             "pointer_idx": decision.pointer_slot, "skill_slot": decision.skill_slot,
             "mob_object_id": decision.mob_object_id, "skill_id": decision.skill_id,
-            "confidence": round(decision.confidence, 4), "model": self.model_name, "executed": executed,
+            "confidence": round(decision.confidence, 4), "logp": decision.logp, "model": self.model_name,
+            "model_version": self.model_version, "executed": executed,
         }
 
     def _mask_record(self, obs: Observation) -> dict[str, Any]:
@@ -317,6 +400,9 @@ class Actor:
         minutes = (time.time() - self.started) / 60
         result = {"actor_id": self.actor_id, "minutes": round(minutes, 2), "steps": self.total_steps, **self.totals}
         result["return"] = round(result["return"], 4)
+        if isinstance(self.buffer, replay.RedisBuffer):
+            result.update(sent_segments=self.buffer.sent_segments, sent_steps=self.buffer.sent_steps,
+                          sent_mb=round(self.buffer.sent_bytes / 2**20, 2), model_version=self.model_version)
         if self.encoder is not None and self.encoder.session is not None:
             inference = self.encoder.timing_summary()["inference_ms"]
             if inference.get("count"):
@@ -335,7 +421,20 @@ def parse_args(argv: list[str] | None = None) -> ActorConfig:
     p.add_argument("--password", default=d.password)
     p.add_argument("--char-slot", type=int, default=d.char_slot)
     p.add_argument("--model", required=True,
-                   help="ONNX combat model (l2_NN/export_onnx.py); its .json must sit next to it")
+                   help="ONNX combat model (l2_NN/export_onnx.py; its .json must sit next to it), "
+                        "or 'redis' for the trainer's latest published policy")
+    p.add_argument("--redis", default=None,
+                   help="Redis URL (redis://host:6379/0): send the trajectories to the RL trainer instead of .jsonl")
+    p.add_argument("--greedy", dest="sample", action="store_false", default=None,
+                   help="Take the most likely action instead of sampling (default: sample with --redis)")
+    p.add_argument("--sample", dest="sample", action="store_true", help="Sample actions even without --redis")
+    p.add_argument("--segment-len", type=int, default=d.segment_len, help="Steps per segment sent to Redis")
+    p.add_argument("--max-queue", type=int, default=d.max_queue,
+                   help="Trim the Redis replay list to this many segments (protects Redis when no trainer runs)")
+    p.add_argument("--model-poll", type=float, default=d.model_poll,
+                   help="Seconds between checks for a newer published model (--model redis)")
+    p.add_argument("--model-wait", type=float, default=d.model_wait,
+                   help="How long to wait for the first published model (--model redis)")
     p.add_argument("--device", choices=("cpu", "gpu"), default=d.device, help="Where the model runs")
     p.add_argument("--server-speed", type=float, default=d.server_speed, help="Server TimeScale (General.ini)")
     p.add_argument("--decision-interval", type=float, default=d.decision_interval, help="Seconds between decisions")
@@ -355,7 +454,9 @@ def parse_args(argv: list[str] | None = None) -> ActorConfig:
                         format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     return ActorConfig(
         server_ip=args.server_ip, login_port=args.login_port, account=args.account, password=args.password,
-        char_slot=args.char_slot, model=args.model, device=args.device,
+        char_slot=args.char_slot, model=args.model, device=args.device, redis=args.redis, sample=args.sample,
+        segment_len=args.segment_len, max_queue=args.max_queue, model_poll=args.model_poll,
+        model_wait=args.model_wait,
         server_speed=args.server_speed, decision_interval=args.decision_interval, output_dir=args.output_dir,
         flush_every=args.flush_every, store_next_state=args.store_next_state, max_episodes=args.max_episodes,
         max_steps=args.max_steps, max_minutes=args.max_minutes, respawn_timeout=args.respawn_timeout, seed=args.seed,

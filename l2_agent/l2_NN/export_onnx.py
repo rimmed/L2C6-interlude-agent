@@ -95,9 +95,20 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def load_checkpoint(path: Path) -> tuple[CombatEventTransformer, dict]:
     checkpoint = torch.load(path, map_location="cpu", weights_only=True)
     model = CombatEventTransformer(**checkpoint["model_config"])
-    model.load_state_dict(checkpoint["model_state_dict"])
+    load_policy_weights(model, checkpoint["model_state_dict"])
     model.eval()
     return model, checkpoint
+
+
+def load_policy_weights(model: CombatEventTransformer, state_dict: dict) -> None:
+    """
+    Load a checkpoint; behaviour-cloning checkpoints predate the RL value head, so only
+    ``head_value.*`` may be missing (it keeps its fresh initialisation).
+    """
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    wrong = unexpected + [key for key in missing if not key.startswith("head_value.")]
+    if wrong:
+        raise RuntimeError(f"checkpoint does not match the model: {wrong}")
 
 
 def probe_inputs(config: dict, seq_len: int, batch_size: int = 4, seed: int = 0) -> tuple[torch.Tensor, ...]:
@@ -190,16 +201,17 @@ def verify(onnx_path: Path, wrapper: OnnxPolicy, inputs: tuple[torch.Tensor, ...
     return worst
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    args = parse_args(argv)
-    onnx_path = args.output or args.checkpoint.with_name("combat_policy.onnx")
+def export_policy(model: CombatEventTransformer, checkpoint: dict, onnx_path: Path, *, opset: int = 18,
+                  atol: float | None = 1e-4) -> dict:
+    """
+    Write ``onnx_path`` and its ``.json`` metadata for ``model`` (on the CPU, any mode).
+
+    ``checkpoint`` supplies ``model_config``, ``action_to_id`` and the training ``args`` (see
+    :func:`build_metadata`). With ``atol`` the graph is checked against PyTorch with onnxruntime.
+    Used by this script and by the RL trainer, which publishes every new policy this way.
+    """
     onnx_path.parent.mkdir(parents=True, exist_ok=True)
-    meta_path = onnx_path.with_suffix(".json")
-
-    model, checkpoint = load_checkpoint(args.checkpoint)
     metadata = build_metadata(checkpoint, onnx_path)
-    print(f"Loaded {args.checkpoint} (epoch {checkpoint.get('epoch')}, seq_len {metadata['seq_len']})")
-
     wrapper = OnnxPolicy(model).eval()
     # The probe batch must not satisfy batch * nhead == seq_len: PyTorch's attention compares the
     # (batch * nhead, L, L) mask against an (L, L) one, and torch.export turns that coincidental
@@ -215,20 +227,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         input_names=list(INPUT_NAMES),
         output_names=list(OUTPUT_NAMES),
         dynamic_shapes=dynamic_shapes,
-        opset_version=args.opset,
+        opset_version=opset,
         dynamo=True,
         external_data=False,  # one self-contained file; the model is ~1 MB
+        verbose=False,
     )
-    meta_path.write_text(json.dumps(metadata, indent=2))
-    print(f"Wrote {onnx_path} ({onnx_path.stat().st_size / 1024:.0f} KiB) and {meta_path}")
+    onnx_path.with_suffix(".json").write_text(json.dumps(metadata, indent=2))
 
-    if not args.no_verify:
-        worst = verify(onnx_path, wrapper, inputs, args.atol)
+    if atol is not None:
+        worst = verify(onnx_path, wrapper, inputs, atol)
         # Other batch sizes (1 = the client's case) prove the batch axis really is dynamic.
         for batch_size in (1, 4, 32):
             probe = probe_inputs(checkpoint["model_config"], metadata["seq_len"], batch_size=batch_size, seed=batch_size)
-            worst = max(worst, verify(onnx_path, wrapper, probe, args.atol))
-        print(f"Verified with onnxruntime: max |torch - onnx| = {worst:.2e}")
+            worst = max(worst, verify(onnx_path, wrapper, probe, atol))
+        metadata["verified_max_abs_diff"] = worst
+    return metadata
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    onnx_path = args.output or args.checkpoint.with_name("combat_policy.onnx")
+    model, checkpoint = load_checkpoint(args.checkpoint)
+    print(f"Loaded {args.checkpoint} (epoch {checkpoint.get('epoch')})")
+    metadata = export_policy(model, checkpoint, onnx_path, opset=args.opset, atol=None if args.no_verify else args.atol)
+    print(f"Wrote {onnx_path} ({onnx_path.stat().st_size / 1024:.0f} KiB) and {onnx_path.with_suffix('.json')}")
+    if "verified_max_abs_diff" in metadata:
+        print(f"Verified with onnxruntime: max |torch - onnx| = {metadata['verified_max_abs_diff']:.2e}")
     return 0
 
 

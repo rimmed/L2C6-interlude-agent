@@ -57,6 +57,9 @@ from .tools.data import skill_data
 #: is the game answering the player and is never a valid command.
 EXECUTABLE_ACTIONS = ("moved", "selected_target", "attacked", "used_skill", "picked_up", "used_item")
 
+#: Actions whose execution uses the pointed monster; the pointer head is part of their probability.
+POINTER_ACTIONS = ("selected_target", "attacked", "used_skill", "moved")
+
 #: The logged InCombat flag is the server's attack stance: it switches on with the first hit (not
 #: with target selection) and lapses this long after the last combat action.
 IN_COMBAT_TIMEOUT_S = 15.0
@@ -94,6 +97,9 @@ class Decision:
     action_id: int = -1
     pointer_slot: int | None = None
     skill_slot: int | None = None
+    #: log-probability of the whole decision under the policy that made it: action type, plus the
+    #: pointer for :data:`POINTER_ACTIONS`, plus the skill slot for ``used_skill`` (RL importance weights)
+    logp: float = 0.0
 
     def describe(self) -> str:
         parts = [f"{self.action} ({self.confidence:.0%})"]
@@ -133,6 +139,11 @@ class _Frame:
     mobs: np.ndarray  # (K, F_mob)
     skills: np.ndarray  # (N, F_skill)
     mob_ids: tuple[int, ...]  # object ids of the real mob slots, closest first
+
+
+def _log_softmax(logits: np.ndarray) -> np.ndarray:
+    shifted = np.asarray(logits, dtype=np.float64) - np.max(logits)
+    return shifted - np.log(np.exp(shifted).sum())
 
 
 def _softmax(logits: np.ndarray) -> np.ndarray:
@@ -180,6 +191,8 @@ class CombatPolicy:
 
         self.session = None
         self.device = "none"
+        self._providers: list[str] | None = None
+        self._rng = np.random.default_rng()
         if model_path is not None:
             self._open_session(Path(model_path), providers, device)
 
@@ -190,7 +203,7 @@ class CombatPolicy:
         self._check_skill_encoding(meta_path)
         self._init_layout(server_speed, max_target_dz)
 
-    def _open_session(self, model_path: Path, providers: list[str] | None, device: str) -> None:
+    def _open_session(self, model: Path | bytes, providers: list[str] | None, device: str) -> None:
         import onnxruntime as ort  # imported lazily: the scripted bot must run without it
 
         if providers is None:
@@ -202,7 +215,8 @@ class CombatPolicy:
                 providers = ["CPUExecutionProvider"]
             else:
                 raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
-        self.session = ort.InferenceSession(str(model_path), providers=providers)
+        self.session = ort.InferenceSession(model if isinstance(model, bytes) else str(model), providers=providers)
+        self._providers = providers
         if providers[0] not in self.session.get_providers()[:1]:
             raise RuntimeError(f"requested {providers[0]}, but the session runs on {self.session.get_providers()}")
         self.device = "gpu" if self.session.get_providers()[0] == "CUDAExecutionProvider" else "cpu"
@@ -405,30 +419,64 @@ class CombatPolicy:
         return Observation(feeds=self._window(), mob_ids=frame.mob_ids, valid=valid, usable_slots=usable_slots,
                            panel=tuple(self.panel), t=now)
 
-    def act(self, obs: Observation) -> Decision:
-        """Run the network on ``obs`` and return the best executable action."""
+    def act(self, obs: Observation, *, sample: bool = False, rng: np.random.Generator | None = None) -> Decision:
+        """
+        Run the network on ``obs`` and choose an executable action.
+
+        :param sample: draw every head from its (masked) distribution instead of taking the argmax;
+            RL actors sample to explore, evaluation takes the argmax
+        :param rng: random generator for sampling
+        """
         if self.session is None:
             raise RuntimeError("this CombatPolicy has no model (model_path=None); use it as an encoder only")
+        rng = rng if rng is not None else self._rng
         logits_action, logits_pointer, logits_skill = self._infer(obs.feeds)
 
+        def choose(logp: np.ndarray) -> int:
+            return int(rng.choice(len(logp), p=np.exp(logp))) if sample else int(np.argmax(logp))
+
         candidates = [(name, idx) for name, idx in self._executable if obs.valid[name]]
-        scores = np.array([logits_action[idx] for _, idx in candidates], dtype=np.float64)
-        probs = _softmax(scores)
-        best = int(np.argmax(probs))
-        action, action_id = candidates[best]
+        logp_action = _log_softmax(np.array([logits_action[idx] for _, idx in candidates]))
+        k = choose(logp_action)
+        action, action_id = candidates[k]
+        logp = float(logp_action[k])
 
         mob_id = pointer_slot = None
         if obs.mob_ids:
-            pointer_slot = int(np.argmax(logits_pointer[: len(obs.mob_ids)]))
+            logp_pointer = _log_softmax(logits_pointer[: len(obs.mob_ids)])
+            pointer_slot = choose(logp_pointer)
             mob_id = obs.mob_ids[pointer_slot]
+            if action in POINTER_ACTIONS:
+                logp += float(logp_pointer[pointer_slot])
 
         skill_id = skill_slot = None
         if obs.usable_slots:
-            skill_slot = max(obs.usable_slots, key=lambda i: logits_skill[i])
+            logp_skill = _log_softmax(np.array([logits_skill[i] for i in obs.usable_slots]))
+            j = choose(logp_skill)
+            skill_slot = obs.usable_slots[j]
             skill_id = obs.panel[skill_slot]
+            if action == "used_skill":
+                logp += float(logp_skill[j])
 
-        return Decision(action=action, mob_object_id=mob_id, skill_id=skill_id, confidence=float(probs[best]),
-                        action_id=action_id, pointer_slot=pointer_slot, skill_slot=skill_slot)
+        return Decision(action=action, mob_object_id=mob_id, skill_id=skill_id,
+                        confidence=float(np.exp(logp_action[k])), action_id=action_id,
+                        pointer_slot=pointer_slot, skill_slot=skill_slot, logp=logp)
+
+    def reload(self, onnx_bytes: bytes, meta: dict[str, Any]) -> None:
+        """
+        Swap in new model weights (e.g. published by the RL trainer) without losing the game state.
+
+        The input layout must be unchanged: a model with another window, panel or feature layout
+        needs a new CombatPolicy.
+        """
+        for key in ("seq_len", "max_mobs", "max_skills", "hide_last_target", "features", "constants",
+                    "action_to_id", "skill_encoding"):
+            if meta.get(key) != self.meta.get(key):
+                raise ValueError(f"new model changes '{key}'; restart the actor instead of reloading")
+        if self.session is None:
+            raise RuntimeError("an encoder-only CombatPolicy cannot load a model")
+        self._open_session(onnx_bytes, self._providers, self.device)
+        self.meta = meta
 
     def timing_summary(self, warmup: int = 10) -> dict[str, Any]:
         """
