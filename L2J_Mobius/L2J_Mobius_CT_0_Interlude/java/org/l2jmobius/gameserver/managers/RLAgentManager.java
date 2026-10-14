@@ -43,6 +43,7 @@ import org.l2jmobius.gameserver.data.sql.CharInfoTable;
 import org.l2jmobius.gameserver.data.xml.ExperienceData;
 import org.l2jmobius.gameserver.data.xml.ItemData;
 import org.l2jmobius.gameserver.data.xml.PlayerTemplateData;
+import org.l2jmobius.gameserver.data.xml.SkillData;
 import org.l2jmobius.gameserver.model.Location;
 import org.l2jmobius.gameserver.model.actor.Player;
 import org.l2jmobius.gameserver.model.actor.appearance.PlayerAppearance;
@@ -80,7 +81,7 @@ import org.l2jmobius.gameserver.util.RLAgentNameGenerator;
  * <li>an agent account without characters gets a random character on login ({@link #onAccountAuthenticated});</li>
  * <li>on its first login an agent is boosted to a random level, promoted along a random class path, taught all skills and equipped with a grade-appropriate set for its archetype;</li>
  * <li>shots and consumables are topped up and automatic shot use is enabled on every login and respawn;</li>
- * <li>agents are teleported to the farm zone of their level bracket and revived there when they die.</li>
+ * <li>agents are teleported to a farm area of their level (spread over the monster spawns, see {@link RLFarmAreas}) and revived there when they die.</li>
  * </ul>
  * Nothing is registered when {@code EnableRLAgentAutoSetup} is off, so the server then behaves as a standard L2J server.
  */
@@ -145,6 +146,7 @@ public class RLAgentManager
 	/** Players whose setup is running; their own level-up events are ignored meanwhile. */
 	private final Set<Integer> _inSetup = ConcurrentHashMap.newKeySet();
 	private final Map<Integer, ScheduledFuture<?>> _respawnTasks = new ConcurrentHashMap<>();
+	private final RLFarmAreas _farmAreas = new RLFarmAreas();
 	
 	// Listeners
 	private final ListenersContainer _listenerContainer = Containers.Players();
@@ -170,6 +172,7 @@ public class RLAgentManager
 	
 	private final Consumer<OnPlayerLogout> _playerLogoutEvent = event ->
 	{
+		_farmAreas.release(event.getPlayer());
 		final ScheduledFuture<?> task = _respawnTasks.remove(event.getPlayer().getObjectId());
 		if (task != null)
 		{
@@ -182,7 +185,15 @@ public class RLAgentManager
 		final Player player = event.getPlayer();
 		if ((event.getNewLevel() > event.getOldLevel()) && isAgent(player) && !_inSetup.contains(player.getObjectId()))
 		{
-			ThreadPool.schedule(() -> runSafely(player, "level-up progression", () -> progress(player, false)), LEVEL_CHANGE_DELAY);
+			ThreadPool.schedule(() -> runSafely(player, "level-up progression", () ->
+			{
+				progress(player, false);
+				// A level-up can lift the agent out of its area's level window.
+				if (RLAgentEnvironmentConfig.RL_TELEPORT_TO_FARM_ZONE && RLAgentEnvironmentConfig.RL_FARM_AUTO && !player.isDead() && _farmAreas.outgrown(player))
+				{
+					teleportToFarmZone(player);
+				}
+			}), LEVEL_CHANGE_DELAY);
 		}
 	};
 	
@@ -688,7 +699,8 @@ public class RLAgentManager
 		{
 			for (SkillHolder holder : skills)
 			{
-				if (holder.getSkill() == null)
+				// Checked via the level table: SkillHolder.getSkill() logs a stack trace for every missing skill.
+				if (SkillData.getInstance().getMaxLevel(holder.getSkillId()) < holder.getSkillLevel())
 				{
 					return false;
 				}
@@ -773,14 +785,18 @@ public class RLAgentManager
 	
 	private void teleportToFarmZone(Player player)
 	{
-		final Location anchor = farmZoneAnchor(player);
-		if (anchor == null)
+		Location destination = RLAgentEnvironmentConfig.RL_FARM_AUTO ? _farmAreas.pickSpot(player) : null;
+		if (destination == null)
 		{
-			return;
+			final Location anchor = farmZoneAnchor(player);
+			if (anchor == null)
+			{
+				return;
+			}
+			
+			final int spread = RLAgentEnvironmentConfig.RL_FARM_ZONE_SPREAD;
+			destination = new Location(anchor.getX() + Rnd.get(-spread, spread), anchor.getY() + Rnd.get(-spread, spread), anchor.getZ());
 		}
-		
-		final int spread = RLAgentEnvironmentConfig.RL_FARM_ZONE_SPREAD;
-		final Location destination = new Location(anchor.getX() + Rnd.get(-spread, spread), anchor.getY() + Rnd.get(-spread, spread), anchor.getZ());
 		player.teleToLocation(destination, false);
 		
 		// A headless client may never send Appearing; finish the teleport for it.

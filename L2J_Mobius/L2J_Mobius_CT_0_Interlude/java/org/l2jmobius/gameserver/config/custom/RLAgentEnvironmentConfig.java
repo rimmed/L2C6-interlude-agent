@@ -77,6 +77,15 @@ public class RLAgentEnvironmentConfig
 	public static boolean RL_TELEPORT_ON_LOGIN;
 	public static List<FarmZone> RL_FARM_ZONES;
 	public static int RL_FARM_ZONE_SPREAD;
+	/** Pick farm spots from the monster spawns ({@code auto}) instead of the fixed {@link #RL_FARM_ZONES} anchors. */
+	public static boolean RL_FARM_AUTO;
+	public static int RL_FARM_LEVEL_BELOW;
+	public static int RL_FARM_LEVEL_ABOVE;
+	/** Percent of an area's monsters that must lie in the level window. */
+	public static int RL_FARM_MIN_SHARE;
+	public static int RL_FARM_MIN_MONSTERS;
+	public static int RL_FARM_MOBS_PER_AGENT;
+	public static List<String> RL_FARM_EXCLUDED_SPAWN_FOLDERS;
 	public static boolean RL_RESPAWN_ON_DEATH;
 	public static int RL_RESPAWN_DELAY;
 	
@@ -116,6 +125,20 @@ public class RLAgentEnvironmentConfig
 		RL_TELEPORT_ON_LOGIN = config.getBoolean("RLTeleportOnLogin", true);
 		RL_FARM_ZONES = parseFarmZones(config.getString("RLFarmZones", "1-80:start"));
 		RL_FARM_ZONE_SPREAD = Math.max(0, config.getInt("RLFarmZoneSpread", 150));
+		RL_FARM_AUTO = config.getString("RLFarmZoneMode", "auto").trim().equalsIgnoreCase("auto");
+		RL_FARM_LEVEL_BELOW = Math.max(0, config.getInt("RLFarmLevelBelow", 2));
+		RL_FARM_LEVEL_ABOVE = Math.max(0, config.getInt("RLFarmLevelAbove", 1));
+		RL_FARM_MIN_SHARE = Math.min(100, Math.max(0, config.getInt("RLFarmMinShare", 70)));
+		RL_FARM_MIN_MONSTERS = Math.max(1, config.getInt("RLFarmMinMonsters", 4));
+		RL_FARM_MOBS_PER_AGENT = Math.max(1, config.getInt("RLFarmMobsPerAgent", 5));
+		RL_FARM_EXCLUDED_SPAWN_FOLDERS = new ArrayList<>();
+		for (String folder : config.getString("RLFarmExcludedSpawnFolders", "Castles,Catacombs,SevenSigns").split(","))
+		{
+			if (!folder.isBlank())
+			{
+				RL_FARM_EXCLUDED_SPAWN_FOLDERS.add(folder.trim());
+			}
+		}
 		RL_RESPAWN_ON_DEATH = config.getBoolean("RLRespawnOnDeath", true);
 		RL_RESPAWN_DELAY = Math.max(0, config.getInt("RLRespawnDelay", 4000));
 	}
