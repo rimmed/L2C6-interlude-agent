@@ -2360,7 +2360,7 @@ public abstract class Creature extends WorldObject
 	 * Disables a skill for a given time.<br>
 	 * If delay is lesser or equal than zero, skill will be disabled "forever".
 	 * @param skill the skill to disable
-	 * @param delay delay in milliseconds
+	 * @param delay delay in milliseconds of game time (divided by the TimeScale like every other timer)
 	 */
 	public void disableSkill(Skill skill, long delay)
 	{
@@ -2369,7 +2369,7 @@ public abstract class Creature extends WorldObject
 			return;
 		}
 		
-		_disabledSkills.put(skill.getReuseHashCode(), delay > 0 ? System.currentTimeMillis() + delay : Long.MAX_VALUE);
+		_disabledSkills.put(skill.getReuseHashCode(), delay > 0 ? System.currentTimeMillis() + TimeScale.scaleDelay(delay) : Long.MAX_VALUE);
 	}
 	
 	/**
