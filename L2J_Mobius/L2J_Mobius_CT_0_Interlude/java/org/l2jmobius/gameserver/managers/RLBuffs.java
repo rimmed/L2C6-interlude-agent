@@ -202,7 +202,7 @@ final class RLBuffs
 		int danceSlots = PlayerConfig.DANCES_MAX_AMOUNT;
 		for (BuffEntry entry : entries)
 		{
-			if ((level < entry.minLevel()) || (level > entry.maxLevel()) || (entry.mageOnly() && !player.isMageClass()) || (entry.fighterOnly() && player.isMageClass()))
+			if ((level < entry.minLevel()) || (level > entry.maxLevel()) || (entry.mageOnly() && !RLAgentManager.isMageBuild(player)) || (entry.fighterOnly() && RLAgentManager.isMageBuild(player)))
 			{
 				continue;
 			}

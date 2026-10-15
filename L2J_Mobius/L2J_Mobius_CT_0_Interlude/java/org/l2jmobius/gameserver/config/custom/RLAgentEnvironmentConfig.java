@@ -134,6 +134,11 @@ public class RLAgentEnvironmentConfig
 	public static List<BuffEntry> RL_BUFF_FULL;
 	public static int RL_BUFF_REFRESH_INTERVAL;
 	public static List<PotionEntry> RL_BUFF_POTIONS;
+	/** Class family ({@code Prophet}, {@code Elder}, {@code Shaman}) -> build name -> weight. */
+	public static Map<String, Map<String, Integer>> RL_BUILDS;
+	public static int RL_UNDEAD_MIN_LEVEL;
+	public static int RL_FARM_UNDEAD_LEVEL_BELOW;
+	public static int RL_FARM_UNDEAD_MIN_SHARE;
 	public static boolean RL_RESPAWN_ON_DEATH;
 	public static int RL_RESPAWN_DELAY;
 	
@@ -209,6 +214,13 @@ public class RLAgentEnvironmentConfig
 		{
 			RL_BUFF_POTIONS.add(new PotionEntry(entry.skillId(), config.getInt("RLBuffPotionCount", 20), entry.minLevel(), entry.maxLevel(), entry.mageOnly(), entry.fighterOnly()));
 		}
+		RL_BUILDS = new LinkedHashMap<>();
+		RL_BUILDS.put("Prophet", parseWeights(config.getString("RLBuilds.Prophet", "undead_mage:40;melee_heavy:30;melee_light:30")));
+		RL_BUILDS.put("Elder", parseWeights(config.getString("RLBuilds.Elder", "undead_mage:70;melee_light:30")));
+		RL_BUILDS.put("Shaman", parseWeights(config.getString("RLBuilds.Shaman", "caster:60;melee_heavy:40")));
+		RL_UNDEAD_MIN_LEVEL = config.getInt("RLUndeadMinLevel", 30);
+		RL_FARM_UNDEAD_LEVEL_BELOW = Math.max(0, config.getInt("RLFarmUndeadLevelBelow", 5));
+		RL_FARM_UNDEAD_MIN_SHARE = Math.min(100, Math.max(0, config.getInt("RLFarmUndeadMinShare", 50)));
 		RL_RESPAWN_ON_DEATH = config.getBoolean("RLRespawnOnDeath", true);
 		RL_RESPAWN_DELAY = Math.max(0, config.getInt("RLRespawnDelay", 4000));
 	}

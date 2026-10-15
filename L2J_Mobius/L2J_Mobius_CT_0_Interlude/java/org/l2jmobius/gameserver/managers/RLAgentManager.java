@@ -99,6 +99,30 @@ public class RLAgentManager
 	private static final String VAR_GEAR_GRADE = "RL_GEAR_GRADE";
 	/** Archetype of the equipment set given last, so a changed weapon rule re-equips existing agents. */
 	private static final String VAR_GEAR_ARCHETYPE = "RL_GEAR_ARCHETYPE";
+	/** Build of a support class (see {@link Build}). */
+	private static final String VAR_BUILD = "RL_BUILD";
+	
+	/**
+	 * How a support class plays solo. Prophets, Elders, Bishops and their Oracle / Cleric base classes are strong casters only against undead, so they either hunt undead with spells or fight other monsters in melee; Warcryers and Overlords either cast (drains, poisons) or fight with a blunt in heavy armor.
+	 */
+	enum Build
+	{
+		/** Magic weapon and robe, mage buffs, only farm areas of undead monsters. */
+		UNDEAD_MAGE(true),
+		/** Magic weapon and robe, mage buffs, any monsters. */
+		CASTER(true),
+		/** One-handed blunt, shield and heavy armor, fighter buffs. */
+		MELEE_HEAVY(false),
+		/** One-handed blunt, shield and light armor, fighter buffs. */
+		MELEE_LIGHT(false);
+		
+		final boolean _mage;
+		
+		Build(boolean mage)
+		{
+			_mage = mage;
+		}
+	}
 	
 	// Shots indexed by CrystalType ordinal (NONE, D, C, B, A, S).
 	private static final int[] SOULSHOTS = { 1835, 1463, 1464, 1465, 1466, 1467 };
@@ -140,6 +164,10 @@ public class RLAgentManager
 		WARRIOR(ArmorType.HEAVY, false),
 		/** Dwarves: blunts, which several of their combat skills (e.g. Stun Attack, Hammer Crush) require. */
 		DWARF(ArmorType.HEAVY, true),
+		/** Support classes in melee: one-handed blunt and shield in heavy armor ... */
+		SUPPORT_HEAVY(ArmorType.HEAVY, true),
+		/** ... or in light armor. */
+		SUPPORT_LIGHT(ArmorType.LIGHT, true),
 		FIGHTER(ArmorType.HEAVY, true);
 		
 		final ArmorType _armorType;
@@ -445,10 +473,12 @@ public class RLAgentManager
 			learnSkills(player);
 		}
 		
+		assignBuild(player);
+		
 		if (RLAgentEnvironmentConfig.RL_AUTO_EQUIP)
 		{
 			final CrystalType grade = gradeForLevel(player.getLevel());
-			final String archetype = archetypeOf(player.getPlayerClass()).name();
+			final String archetype = archetypeFor(player).name();
 			if (forceEquip || !grade.name().equals(player.getVariables().getString(VAR_GEAR_GRADE, "")) || !archetype.equals(player.getVariables().getString(VAR_GEAR_ARCHETYPE, "")))
 			{
 				equip(player, grade);
@@ -547,6 +577,124 @@ public class RLAgentManager
 		return grade;
 	}
 	
+	/** The equipment archetype of an agent: its build's for a support class, its class's otherwise. */
+	private static Archetype archetypeFor(Player player)
+	{
+		final Build build = buildOf(player);
+		if (build != null)
+		{
+			return switch (build)
+			{
+				case UNDEAD_MAGE, CASTER -> Archetype.MAGE;
+				case MELEE_HEAVY -> Archetype.SUPPORT_HEAVY;
+				case MELEE_LIGHT -> Archetype.SUPPORT_LIGHT;
+			};
+		}
+		return archetypeOf(player.getPlayerClass());
+	}
+	
+	/** Class family of the builds ({@code RLBuilds.<family>}), {@code null} for a class without builds. */
+	private static String buildFamily(PlayerClass playerClass)
+	{
+		if (playerClass.equalsOrChildOf(PlayerClass.PROPHET))
+		{
+			return "Prophet";
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.CLERIC) || playerClass.equalsOrChildOf(PlayerClass.ORACLE) || playerClass.equalsOrChildOf(PlayerClass.SHILLIEN_ORACLE))
+		{
+			return "Elder";
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.ORC_SHAMAN))
+		{
+			return "Shaman";
+		}
+		return null;
+	}
+	
+	/** The agent's build, {@code null} for a class without builds. */
+	static Build buildOf(Player player)
+	{
+		if (buildFamily(player.getPlayerClass()) == null)
+		{
+			return null;
+		}
+		try
+		{
+			return Build.valueOf(player.getVariables().getString(VAR_BUILD, ""));
+		}
+		catch (IllegalArgumentException e)
+		{
+			return null;
+		}
+	}
+	
+	/** {@code true} when the agent plays as a caster: its build says so, or (without builds) its class is a mage. */
+	static boolean isMageBuild(Player player)
+	{
+		final Build build = buildOf(player);
+		return (build != null) ? build._mage : player.isMageClass();
+	}
+	
+	/**
+	 * Picks a build for a support class, or a new one when the current build no longer fits (a class transfer to another family, undead hunting below {@code RLUndeadMinLevel}).
+	 */
+	private static void assignBuild(Player player)
+	{
+		final String family = buildFamily(player.getPlayerClass());
+		if (family == null)
+		{
+			return;
+		}
+		
+		final Map<String, Integer> weights = RLAgentEnvironmentConfig.RL_BUILDS.getOrDefault(family, Map.of());
+		final Build current = buildOf(player);
+		if ((current != null) && weights.containsKey(current.name().toLowerCase()) && ((current != Build.UNDEAD_MAGE) || (player.getLevel() >= RLAgentEnvironmentConfig.RL_UNDEAD_MIN_LEVEL)))
+		{
+			return;
+		}
+		
+		final List<Build> builds = new ArrayList<>();
+		final List<Integer> buildWeights = new ArrayList<>();
+		int total = 0;
+		for (Entry<String, Integer> entry : weights.entrySet())
+		{
+			final Build build;
+			try
+			{
+				build = Build.valueOf(entry.getKey().toUpperCase());
+			}
+			catch (IllegalArgumentException e)
+			{
+				continue;
+			}
+			if ((entry.getValue() <= 0) || ((build == Build.UNDEAD_MAGE) && (player.getLevel() < RLAgentEnvironmentConfig.RL_UNDEAD_MIN_LEVEL)))
+			{
+				continue;
+			}
+			builds.add(build);
+			buildWeights.add(entry.getValue());
+			total += entry.getValue();
+		}
+		if (builds.isEmpty())
+		{
+			player.getVariables().remove(VAR_BUILD);
+			return;
+		}
+		
+		int pick = Rnd.get(total);
+		Build chosen = builds.get(builds.size() - 1);
+		for (int i = 0; i < builds.size(); i++)
+		{
+			pick -= buildWeights.get(i);
+			if (pick < 0)
+			{
+				chosen = builds.get(i);
+				break;
+			}
+		}
+		player.getVariables().set(VAR_BUILD, chosen.name());
+	}
+	
 	private static Archetype archetypeOf(PlayerClass playerClass)
 	{
 		if (playerClass.isMage())
@@ -590,7 +738,7 @@ public class RLAgentManager
 	
 	private void equip(Player player, CrystalType grade)
 	{
-		final GearPool pool = _gearPools.computeIfAbsent(grade, g -> new EnumMap<>(Archetype.class)).computeIfAbsent(archetypeOf(player.getPlayerClass()), archetype -> buildGearPool(grade, archetype));
+		final GearPool pool = _gearPools.computeIfAbsent(grade, g -> new EnumMap<>(Archetype.class)).computeIfAbsent(archetypeFor(player), archetype -> buildGearPool(grade, archetype));
 		if (pool.weapons().isEmpty())
 		{
 			LOGGER.warning(getClass().getSimpleName() + ": No " + grade + " weapon for " + player.getPlayerClass() + ".");
@@ -625,7 +773,7 @@ public class RLAgentManager
 		}
 		
 		player.getVariables().set(VAR_GEAR_GRADE, grade.name());
-		player.getVariables().set(VAR_GEAR_ARCHETYPE, archetypeOf(player.getPlayerClass()).name());
+		player.getVariables().set(VAR_GEAR_ARCHETYPE, archetypeFor(player).name());
 		player.sendItemList(false);
 		player.broadcastUserInfo();
 	}
@@ -783,6 +931,7 @@ public class RLAgentManager
 			case TWO_HANDED -> !weapon.isMagicWeapon() && ((type == WeaponType.SWORD) || (type == WeaponType.BLUNT)) && (weapon.getBodyPart() == BodyPart.LR_HAND);
 			case WARRIOR -> (type == WeaponType.DUAL) || (type == WeaponType.POLE);
 			case DWARF -> !weapon.isMagicWeapon() && (type == WeaponType.BLUNT);
+			case SUPPORT_HEAVY, SUPPORT_LIGHT -> !weapon.isMagicWeapon() && (type == WeaponType.BLUNT) && (weapon.getBodyPart() == BodyPart.R_HAND);
 			case FIGHTER -> !weapon.isMagicWeapon() && ((type == WeaponType.SWORD) || (type == WeaponType.BLUNT)) && (weapon.getBodyPart() == BodyPart.R_HAND);
 		};
 	}
@@ -797,7 +946,7 @@ public class RLAgentManager
 		final int gradeIndex = (weapon == null) ? 0 : Math.min(weapon.getCrystalType().ordinal(), SOULSHOTS.length - 1);
 		final int shotId;
 		final int shotCount;
-		if (player.isMageClass())
+		if (isMageBuild(player))
 		{
 			shotId = RLAgentEnvironmentConfig.RL_USE_BLESSED_SPIRITSHOTS ? BLESSED_SPIRITSHOTS[gradeIndex] : SPIRITSHOTS[gradeIndex];
 			shotCount = RLAgentEnvironmentConfig.RL_SPIRITSHOT_COUNT;
@@ -822,7 +971,7 @@ public class RLAgentManager
 		for (PotionEntry potion : RLAgentEnvironmentConfig.RL_BUFF_POTIONS)
 		{
 			final int level = player.getLevel();
-			if ((level >= potion.minLevel()) && (level <= potion.maxLevel()) && (!potion.mageOnly() || player.isMageClass()) && (!potion.fighterOnly() || !player.isMageClass()))
+			if ((level >= potion.minLevel()) && (level <= potion.maxLevel()) && (!potion.mageOnly() || isMageBuild(player)) && (!potion.fighterOnly() || !isMageBuild(player)))
 			{
 				topUp(player, potion.itemId(), potion.count());
 			}

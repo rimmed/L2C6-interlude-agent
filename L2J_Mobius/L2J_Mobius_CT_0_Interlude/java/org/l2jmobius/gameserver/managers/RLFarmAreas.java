@@ -38,12 +38,14 @@ import org.l2jmobius.gameserver.model.Location;
 import org.l2jmobius.gameserver.model.World;
 import org.l2jmobius.gameserver.model.actor.Npc;
 import org.l2jmobius.gameserver.model.actor.Player;
+import org.l2jmobius.gameserver.model.actor.enums.creature.Race;
 import org.l2jmobius.gameserver.model.actor.instance.Monster;
 import org.l2jmobius.gameserver.model.spawns.Spawn;
 
 /**
  * Farm areas of the RL agents, built from the server's own monster spawns.<br>
  * An area is a spawn territory (or, for point spawns, a grid cell) of ordinary monsters. An area suits an agent of level L when no monster is above {@code L + RLFarmLevelAbove} and most monsters are at least {@code L - RLFarmLevelBelow}.<br>
+ * Undead hunters (support casters, {@link RLAgentManager.Build#UNDEAD_MAGE}) prefer areas where undead are the majority, with a wider window below their level ({@code RLFarmUndeadLevelBelow}).<br>
  * Every agent is assigned to one area at a time, and an area takes at most one agent per {@code RLFarmMobsPerAgent} fitting monsters, so hundreds of agents spread over the map instead of competing for the same monsters.
  */
 final class RLFarmAreas
@@ -66,10 +68,44 @@ final class RLFarmAreas
 	 * @param key territory name or grid cell
 	 * @param spawns the monster spawns of the area
 	 * @param amounts monster count per level
+	 * @param undeadAmounts undead monster count per level
 	 * @param maxLevel highest monster level
 	 */
-	private record Area(String key, List<Spawn> spawns, Map<Integer, Integer> amounts, int maxLevel)
+	private record Area(String key, List<Spawn> spawns, Map<Integer, Integer> amounts, Map<Integer, Integer> undeadAmounts, int maxLevel)
 	{
+		/** Undead monsters fitting an undead hunter of {@code level} (a wider window below), 0 when the area does not suit it. */
+		int fittingUndead(int level)
+		{
+			if (maxLevel > (level + RLAgentEnvironmentConfig.RL_FARM_LEVEL_ABOVE))
+			{
+				return 0;
+			}
+			
+			final int lowest = level - RLAgentEnvironmentConfig.RL_FARM_UNDEAD_LEVEL_BELOW;
+			int inWindow = 0;
+			for (Map.Entry<Integer, Integer> entry : amounts.entrySet())
+			{
+				if (entry.getKey() >= lowest)
+				{
+					inWindow += entry.getValue();
+				}
+			}
+			int undead = 0;
+			for (Map.Entry<Integer, Integer> entry : undeadAmounts.entrySet())
+			{
+				if (entry.getKey() >= lowest)
+				{
+					undead += entry.getValue();
+				}
+			}
+			return ((undead >= RLAgentEnvironmentConfig.RL_FARM_MIN_MONSTERS) && ((undead * 100) >= (inWindow * RLAgentEnvironmentConfig.RL_FARM_UNDEAD_MIN_SHARE))) ? undead : 0;
+		}
+		
+		int fitting(int level, boolean undead)
+		{
+			return undead ? fittingUndead(level) : fittingMonsters(level);
+		}
+
 		/** Monsters of the area within the level window of {@code level}, 0 when the area does not suit that level. */
 		int fittingMonsters(int level)
 		{
@@ -95,9 +131,9 @@ final class RLFarmAreas
 			return fitting;
 		}
 		
-		int capacity(int level)
+		int capacity(int level, boolean undead)
 		{
-			return Math.max(1, fittingMonsters(level) / RLAgentEnvironmentConfig.RL_FARM_MOBS_PER_AGENT);
+			return Math.max(1, fitting(level, undead) / RLAgentEnvironmentConfig.RL_FARM_MOBS_PER_AGENT);
 		}
 	}
 	
@@ -114,20 +150,26 @@ final class RLFarmAreas
 	synchronized Location pickSpot(Player player)
 	{
 		final int level = player.getLevel();
+		// Undead hunters (support casters) go where undead live; without such an area, anywhere that fits.
+		final boolean undead = RLAgentManager.buildOf(player) == RLAgentManager.Build.UNDEAD_MAGE;
 		Area area = null;
 		final String current = _assignments.get(player.getObjectId());
 		if (current != null)
 		{
 			final Area assigned = _byKey.get(current);
-			if ((assigned != null) && (assigned.fittingMonsters(level) > 0))
+			if ((assigned != null) && ((undead && (assigned.fittingUndead(level) > 0)) || (!undead && (assigned.fittingMonsters(level) > 0))))
 			{
 				area = assigned;
 			}
 		}
 		
+		if ((area == null) && undead)
+		{
+			area = leastCrowded(level, player.getObjectId(), true);
+		}
 		if (area == null)
 		{
-			area = leastCrowded(level, player.getObjectId());
+			area = leastCrowded(level, player.getObjectId(), false);
 			if (area == null)
 			{
 				_assignments.remove(player.getObjectId());
@@ -147,7 +189,8 @@ final class RLFarmAreas
 		areas();
 		final String key = _assignments.get(player.getObjectId());
 		final Area area = key == null ? null : _byKey.get(key);
-		return (area == null) || (area.fittingMonsters(player.getLevel()) == 0);
+		final boolean undead = RLAgentManager.buildOf(player) == RLAgentManager.Build.UNDEAD_MAGE;
+		return (area == null) || ((area.fittingMonsters(player.getLevel()) == 0) && (!undead || (area.fittingUndead(player.getLevel()) == 0)));
 	}
 	
 	void release(Player player)
@@ -155,7 +198,7 @@ final class RLFarmAreas
 		_assignments.remove(player.getObjectId());
 	}
 	
-	private Area leastCrowded(int level, int objectId)
+	private Area leastCrowded(int level, int objectId, boolean undead)
 	{
 		final Map<String, Integer> crowd = new HashMap<>();
 		for (Map.Entry<Integer, String> entry : _assignments.entrySet())
@@ -174,12 +217,12 @@ final class RLFarmAreas
 		int totalWeight = 0;
 		for (Area area : areas())
 		{
-			if (area.fittingMonsters(level) == 0)
+			if (area.fitting(level, undead) == 0)
 			{
 				continue;
 			}
 			
-			final int capacity = area.capacity(level);
+			final int capacity = area.capacity(level, undead);
 			final int agents = crowd.getOrDefault(area.key(), 0);
 			if (agents < capacity)
 			{
@@ -334,14 +377,19 @@ final class RLFarmAreas
 		for (Map.Entry<String, List<Spawn>> entry : grouped.entrySet())
 		{
 			final Map<Integer, Integer> amounts = new HashMap<>();
+			final Map<Integer, Integer> undeadAmounts = new HashMap<>();
 			int maxLevel = 0;
 			for (Spawn spawn : entry.getValue())
 			{
 				final int level = spawn.getTemplate().getLevel();
 				amounts.merge(level, Math.max(1, spawn.getAmount()), Integer::sum);
+				if (spawn.getTemplate().getRace() == Race.UNDEAD)
+				{
+					undeadAmounts.merge(level, Math.max(1, spawn.getAmount()), Integer::sum);
+				}
 				maxLevel = Math.max(maxLevel, level);
 			}
-			areas.add(new Area(entry.getKey(), List.copyOf(entry.getValue()), Map.copyOf(amounts), maxLevel));
+			areas.add(new Area(entry.getKey(), List.copyOf(entry.getValue()), Map.copyOf(amounts), Map.copyOf(undeadAmounts), maxLevel));
 		}
 		
 		LOGGER.info(RLFarmAreas.class.getSimpleName() + ": " + areas.size() + " farm areas from monster spawns (" + skipped + " other spawns ignored), level window -" + RLAgentEnvironmentConfig.RL_FARM_LEVEL_BELOW + "/+" + RLAgentEnvironmentConfig.RL_FARM_LEVEL_ABOVE + ", " + RLAgentEnvironmentConfig.RL_FARM_MOBS_PER_AGENT + " monsters per agent.");
