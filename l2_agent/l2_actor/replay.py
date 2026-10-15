@@ -42,8 +42,9 @@ array               shape / dtype    content
 ``type_mask``       T,A bool         executable action types at that step
 ``n_mobs``          T int16          valid pointer slots ``0..n_mobs-1``
 ``skill_mask``      T,N bool         castable skill slots
-``header``          uint8            UTF-8 JSON: ``actor_id``, ``episode_id``, ``segment``,
-                                     ``model_version``, ``terminal``, ``done_reason``, character info
+``header``          uint8            UTF-8 JSON: ``actor_id``, ``episode_id`` (a life), ``segment``,
+                                     ``model_version``, ``terminal``, ``done_reason``, ``kills`` in
+                                     the segment, character info
 ==================  ===============  ==================================================================
 """
 
@@ -220,7 +221,7 @@ class RedisBuffer(TransitionBuffer):
     def _send(self, transitions: list[Transition], bootstrap: dict | None, reason: str | None) -> None:
         episode = self._episode
         header = {**self.header, "actor_id": self.actor_id, "segment": episode.segment, "done_reason": reason,
-                  "sent_at": time.time()}
+                  "kills": sum(1 for t in transitions if t.reward_terms.get("kill", 0) > 0), "sent_at": time.time()}
         blob = encode_segment(transitions, bootstrap, header, n_actions=self.n_actions, max_skills=self.max_skills)
         pipe = self.client.pipeline(transaction=False)
         pipe.rpush(REPLAY_KEY, blob)

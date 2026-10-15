@@ -11,8 +11,9 @@ Record layout (one JSON object per line)
 field              content
 =================  ==========================================================================
 ``actor_id``       id of the actor process (account name)
-``episode_id``     combat episode counter of this actor (an episode ends on a kill or a death)
-``step``           step index inside the episode
+``episode_id``     life counter of this actor: the RL episode is one life, a kill is a reward
+                   inside it and only a death ends it (``episodes_*.jsonl`` summarises the fights)
+``step``           step index inside the life
 ``t``              unix time of the observation
 ``state``          model input of the step: ``player_state`` (L x F_p), ``delta_t`` (L),
                    ``mobs_matrix`` (L x K x F_m), ``skills_matrix`` (L x N x F_s), ``seq_mask`` (L);
@@ -23,8 +24,9 @@ field              content
 ``action_mask``    what was allowed: ``types`` (valid action ids), ``n_mobs`` (valid pointer
                    slots ``0..n_mobs-1``), ``skill_slots`` (castable skill slots)
 ``reward``         scalar reward of the step, ``reward_terms`` its components (see ``reward.py``)
-``next_state``     ``state`` of the next step (``null`` for terminal and truncated steps)
-``done``           the episode ended with this step; ``done_reason`` is ``kill`` or ``death``
+``next_state``     ``state`` of the next step (``null`` for terminal and truncated steps and for
+                   the killing step - its successor is the next record of the life)
+``done``           the life ended with this step; ``done_reason`` is ``death``
 ``truncated``      the episode was cut off (actor stopped, target lost) - not a terminal state
 ``info``           diagnostics: character, level, class, HP/MP ratios, position, target
 =================  ==========================================================================

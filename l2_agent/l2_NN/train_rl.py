@@ -13,9 +13,10 @@ This process:
 3. adds a behaviour-cloning term on the human demonstrations (the parquet dataset of ``train.py``)
    whose weight decays from ``--bc-start`` to ``--bc-end`` over ``--bc-decay`` updates, so the policy
    does not forget how humans fight before the rewards teach it something better;
-4. publishes the policy to Redis (ONNX + metadata, a new version) every ``--publish-every`` updates;
-5. logs to ``<save-dir>/metrics.jsonl`` and keeps ``latest.pth`` / ``best.pth`` (best = highest mean
-   return of the last ``--return-window`` finished episodes). The checkpoints have the layout of
+4. publishes the policy to Redis (ONNX + metadata, a new version) every ``--publish-interval`` seconds,
+   exported in a child process so learning does not stop for the export;
+5. logs to ``<save-dir>/metrics.jsonl`` and keeps ``latest.pth`` / ``best.pth`` (best = highest reward
+   per 100 steps over the latest segments; an episode is one life, so lives vary a lot in length). The checkpoints have the layout of
    ``train.py``'s, so ``export_onnx.py`` exports them as well.
 
 The probability of one decision is a product over the heads (``l2_client.policy.CombatPolicy.act``):
@@ -37,13 +38,13 @@ Usage (from ``l2_agent/``)::
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 import math
 import os
 import queue
 import random
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -106,7 +107,7 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
     g = p.add_argument_group("optimisation")
     g.add_argument("--batch-segments", type=int, default=32, help="Segments per batch (up to 64 steps each)")
-    g.add_argument("--lr", type=float, default=3e-5)
+    g.add_argument("--lr", type=float, default=1e-5)
     g.add_argument("--weight-decay", type=float, default=0.01)
     g.add_argument("--grad-clip", type=float, default=1.0)
     g.add_argument("--max-updates", type=int, default=0, help="Stop after N updates (0 = run until Ctrl+C)")
@@ -132,10 +133,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     g.add_argument("--num-workers", type=int, default=4, help="DataLoader workers of the demonstrations")
 
     g = p.add_argument_group("publishing, logging")
-    g.add_argument("--publish-every", type=int, default=100, help="Publish the policy every N updates")
+    g.add_argument("--publish-interval", type=float, default=30.0, help="Publish the policy every N seconds")
     g.add_argument("--save-every", type=int, default=500, help="Write latest.pth every N updates")
     g.add_argument("--log-every", type=int, default=20)
-    g.add_argument("--return-window", type=int, default=100, help="Episodes in the mean return that picks best.pth")
+    g.add_argument("--return-window", type=int, default=100, help="Lives in the mean return per life (logged)")
     return p.parse_args(argv)
 
 
@@ -361,7 +362,10 @@ def rl_loss(model: CombatEventTransformer, batch: dict[str, torch.Tensor], point
         "pg_loss": pg_loss.detach().item(), "value_loss": value_loss.detach().item(),
         "entropy": ent_mean.detach().item(),
         # 1% margin: the learner's fp32 logits differ from the actor's ONNX ones by float noise
-        "rho_mean": float(rho.mean()), "rho_clipped": float((rho > args.rho_bar * 1.01).float().mean()),
+        # rho_clipped: share of steps whose value-target weight is actually clipped; rho_far: share whose
+        # policy probability moved by more than ~20 % since the actor played it (the real lag signal)
+        "rho_mean": float(rho.mean()), "rho_clipped": float((rho > args.rho_bar).float().mean()),
+        "rho_far": float((rho.log().abs() > 0.2).float().mean()),
         "kl_approx": float((batch["logp"] - logp.detach())[valid].mean()),
         "value_mean": float(values.detach()[valid].mean()), "vs_mean": float(targets["vs"][valid].mean()),
         "steps": int(count),
@@ -451,6 +455,9 @@ class Trainer:
         self.stop = threading.Event()
         self.ingest = Ingest(args.redis, self.incoming, self.stop)
         self._episode_returns: dict[tuple[str, int], float] = {}
+        #: (reward sum, steps) of the latest segments: reward per step does not depend on how long lives are
+        self._reward_window: deque[tuple[float, int]] = deque(maxlen=2000)
+        self._publisher: subprocess.Popen | None = None
         self.demos = demo_batches(args, self.init_args, self.action_to_id)
         # Demonstrations come in today's mob layout; an older model may know fewer mob features.
         model_mob = (checkpoint.get("features") or {}).get("mob") or dl.mob_feature_names(self.model_config["mob_features"])
@@ -472,17 +479,26 @@ class Trainer:
             self._track_episode(segment)
 
     def _track_episode(self, segment: replay.Segment) -> None:
+        """An episode is one life of a character (kills are rewards inside it, a death ends it)."""
         h = segment.header
+        rewards = segment.arrays["reward"]
+        self._reward_window.append((float(rewards.sum()), int(rewards.shape[0])))
+        self.totals["kills"] += int(h.get("kills", 0))
         key = (str(h.get("actor_id")), int(h.get("episode_id", -1)))
-        total = self._episode_returns.pop(key, 0.0) + float(segment.arrays["reward"].sum())
+        total = self._episode_returns.pop(key, 0.0) + float(rewards.sum())
         reason = h.get("done_reason")
         if reason is None:
             self._episode_returns[key] = total
             return
         self.totals["episodes"] += 1
-        if reason in ("kill", "death"):
-            self.totals["kills" if reason == "kill" else "deaths"] += 1
+        if reason == "death":
+            self.totals["deaths"] += 1
         self.returns.append(total)
+
+    def reward_per_100_steps(self) -> float:
+        reward = sum(r for r, _ in self._reward_window)
+        steps = sum(n for _, n in self._reward_window)
+        return 100.0 * reward / steps if steps else math.nan
 
     # -- learning ------------------------------------------------------------------------
 
@@ -541,16 +557,37 @@ class Trainer:
                          "totals": dict(self.totals), "model_version": self.version},
         }
 
-    def publish(self) -> None:
-        started = time.perf_counter()
-        cpu_model = copy.deepcopy(self.model).float().cpu().eval()
-        onnx_path = self.args.save_dir / "publish" / "combat_policy.onnx"
-        meta = export_policy(cpu_model, {**self._checkpoint_dict(), "model_state_dict": None}, onnx_path,
-                             atol=1e-3)
-        meta["rl_update"] = self.update
-        self.version = replay.publish_model(self.redis, onnx_path.read_bytes(), meta)
-        print(f"Published model version {self.version} (update {self.update}, "
-              f"{time.perf_counter() - started:.1f}s)", flush=True)
+    def publish(self, background: bool = False) -> bool:
+        """
+        Export the current weights to ONNX and publish them.
+
+        ``background`` exports in a child process (``--publish-worker``): the ONNX exporter (torch
+        dynamo) uses global torch state, so exporting in a thread of the training process breaks
+        training. Returns ``False`` when an earlier export is still running (nothing is started).
+        """
+        if self._publisher is not None and self._publisher.poll() is None:
+            return False
+        folder = self.args.save_dir / "publish"
+        folder.mkdir(parents=True, exist_ok=True)
+        snapshot = {**self._checkpoint_dict(), "optimizer_state_dict": None,
+                    "model_state_dict": {k: v.detach().float().cpu() for k, v in self.model.state_dict().items()}}
+        if not background:
+            publish_snapshot(snapshot, self.args.redis, folder / "combat_policy.onnx")
+            self.version = int(self.redis.get(replay.MODEL_VERSION_KEY) or 0)
+            return True
+        path = folder / "pending.pth"
+        torch.save(snapshot, path)
+        self._publisher = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--publish-worker", str(path),
+                                            self.args.redis, str(folder / "combat_policy.onnx")])
+        return True
+
+    def poll_publisher(self) -> None:
+        """Pick up the version of a finished background publish."""
+        if self._publisher is not None and self._publisher.poll() is not None:
+            if self._publisher.returncode != 0:
+                print(f"Publishing failed (exit code {self._publisher.returncode})", flush=True)
+            self._publisher = None
+            self.version = int(self.redis.get(replay.MODEL_VERSION_KEY) or 0)
 
     def save(self, name: str) -> None:
         path = self.args.save_dir / name
@@ -569,9 +606,11 @@ class Trainer:
         print(f"Waiting for {args.min_buffer_steps} transitions from the actors...", flush=True)
         window: list[dict[str, float]] = []
         window_started = time.perf_counter()
+        last_publish = time.time()
         try:
             while not args.max_updates or self.update < args.max_updates:
                 self.drain()
+                self.poll_publisher()
                 self.totals["stale_dropped"] += self.buffer.drop_stale(self.version, args.max_staleness)
                 ratio = self.totals["trained_steps"] / max(1, self.totals["steps"])
                 if self.buffer.steps < args.min_buffer_steps or ratio > args.max_replay_ratio:
@@ -582,14 +621,15 @@ class Trainer:
                 if self.update % args.log_every == 0:
                     self.log(window, time.perf_counter() - window_started)
                     window, window_started = [], time.perf_counter()
-                if self.update % args.publish_every == 0:
-                    self.publish()
+                if time.time() - last_publish >= args.publish_interval and self.publish(background=True):
+                    last_publish = time.time()
                 if self.update % args.save_every == 0:
                     self.save("latest.pth")
-                    if len(self.returns) >= min(10, args.return_window) and self.mean_return() > self.best_return:
-                        self.best_return = self.mean_return()
+                    score = self.reward_per_100_steps()
+                    if len(self._reward_window) >= 200 and score > self.best_return:
+                        self.best_return = score
                         self.save("best.pth")
-                        print(f"New best mean return {self.best_return:.3f} -> best.pth", flush=True)
+                        print(f"New best reward per 100 steps {score:+.3f} -> best.pth", flush=True)
         except KeyboardInterrupt:
             print("Interrupted", flush=True)
         finally:
@@ -605,7 +645,8 @@ class Trainer:
             "time": time.time(), "update": self.update, "version": self.version, "warmup": window[-1]["warmup"],
             "updates_per_s": len(window) / max(seconds, 1e-9), "buffer_steps": self.buffer.steps,
             "queue": self.incoming.qsize(), "replay_ratio": self.totals["trained_steps"] / max(1, self.totals["steps"]),
-            "mean_return": self.mean_return(), "lr": self.optimizer.param_groups[0]["lr"],
+            "mean_return": self.mean_return(), "reward_per_100_steps": self.reward_per_100_steps(),
+            "lr": self.optimizer.param_groups[0]["lr"],
             **self.totals, **avg,
         }
         with self.metrics_path.open("a", encoding="utf-8") as fh:
@@ -614,15 +655,34 @@ class Trainer:
         print(
             f"upd {self.update:6d} v{self.version} {'[value warm-up] ' if record['warmup'] else ''}"
             f"pg {avg['pg_loss']:+.4f} V {avg['value_loss']:.4f} H {avg['entropy']:.3f}{bc} "
-            f"rho {avg['rho_mean']:.2f} ({avg['rho_clipped']:.0%} clip) | "
+            f"rho {avg['rho_mean']:.2f} ({avg['rho_far']:.0%} far) | "
             f"buf {self.buffer.steps} recv {self.totals['steps']} ratio {record['replay_ratio']:.1f} | "
-            f"ep {self.totals['episodes']} K/D {self.totals['kills']}/{self.totals['deaths']} "
-            f"R {record['mean_return']:+.3f} | {record['updates_per_s']:.1f} upd/s",
+            f"lives {self.totals['episodes']} K/D {self.totals['kills']}/{self.totals['deaths']} "
+            f"R/life {record['mean_return']:+.3f} R/100 {record['reward_per_100_steps']:+.3f} | "
+            f"{record['updates_per_s']:.1f} upd/s",
             flush=True,
         )
 
 
+def publish_snapshot(snapshot: dict, redis_url: str, onnx_path: Path) -> int:
+    """Export a checkpoint dict to ONNX and publish it to Redis; returns the new version."""
+    started = time.perf_counter()
+    model = CombatEventTransformer(**snapshot["model_config"])
+    load_policy_weights(model, snapshot["model_state_dict"])
+    meta = export_policy(model.eval(), snapshot, onnx_path, atol=1e-3)
+    meta["rl_update"] = snapshot["rl_state"]["update"]
+    version = replay.publish_model(replay.connect(redis_url), onnx_path.read_bytes(), meta)
+    print(f"Published model version {version} (update {meta['rl_update']}, {time.perf_counter() - started:.1f}s)",
+          flush=True)
+    return version
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if argv[:1] == ["--publish-worker"]:  # child process of Trainer.publish(background=True)
+        snapshot_path, redis_url, onnx_path = argv[1:4]
+        publish_snapshot(torch.load(snapshot_path, map_location="cpu", weights_only=True), redis_url, Path(onnx_path))
+        return 0
     args = parse_args(argv)
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise SystemExit("--device cuda requested but CUDA is not available")

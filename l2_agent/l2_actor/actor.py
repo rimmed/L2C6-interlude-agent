@@ -136,9 +136,14 @@ class Actor:
         #: when to ask for a fresh ItemList: the server tops up shots, arrows and potions after login / revive
         self._item_list_at = 0.0
         self.started = time.time()
+        #: fights (kill / death) - the episode summaries; the history window restarts with each fight
         self.episode_id = 0
         self.episode_step = 0
+        #: lives - the RL episodes: a kill is a reward inside a life, only a death (or stopping) ends it
+        self.life_id = 0
+        self.life_step = 0
         self.episode_return = 0.0
+        self.episode_terms: dict[str, float] = {}
         self.episode_started = 0.0
         self.total_steps = 0
         self.totals = {"episodes": 0, "kills": 0, "deaths": 0, "transitions": 0, "return": 0.0}
@@ -291,18 +296,27 @@ class Actor:
         log.debug("[ep %d step %d] %s -> %s", self.episode_id, self.episode_step, decision.describe(), executed)
 
         self._pending = Transition(
-            actor_id=self.actor_id, episode_id=self.episode_id, step=self.episode_step, t=now,
+            actor_id=self.actor_id, episode_id=self.life_id, step=self.life_step, t=now,
             state=obs.feeds, action=self._action_record(decision, executed), action_mask=self._mask_record(obs),
             info=self._info_record(),
         )
         self.episode_step += 1
+        self.life_step += 1
         self.total_steps += 1
         self._last_decision = now
 
     def _on_event(self, event: str, now: float) -> None:
-        if event in ("kill", "death"):
-            self.totals["kills" if event == "kill" else "deaths"] += 1
-            self._end_episode(event)
+        if event == "kill":
+            self.totals["kills"] += 1
+            # The kill reward goes to the step that killed; the life (RL episode) goes on, so the step
+            # is not terminal - its value is bootstrapped from the next observation.
+            if self._pending is not None:
+                self._finish(self._pending)
+                self._pending = None
+            self._end_fight("kill")
+        elif event == "death":
+            self.totals["deaths"] += 1
+            self._end_episode("death")
         elif event == "skills_changed" and self.world.ready and self.encoder.panel:
             self.encoder.bind_character(self.world.char)
         elif event == "teleport":
@@ -333,18 +347,31 @@ class Actor:
         transition.done, transition.truncated, transition.done_reason = done, truncated, reason
         self.buffer.add(transition)
         self.episode_return += transition.reward
+        for name, value in transition.reward_terms.items():
+            self.episode_terms[name] = self.episode_terms.get(name, 0.0) + value
         self.totals["transitions"] += 1
         self.totals["return"] += transition.reward
 
     def _end_episode(self, reason: str, *, truncated: bool = False) -> None:
+        """End of a life: a death (terminal) or the actor stopping (truncated)."""
         if self._pending is not None:
             self._finish(self._pending, done=not truncated, truncated=truncated, reason=reason)
             self._pending = None
+        self._end_fight(reason, truncated=truncated)
+        self.buffer.end_episode()
+        self.life_id += 1
+        self.life_step = 0
+        self._update_header()
+
+    def _end_fight(self, reason: str, *, truncated: bool = False) -> None:
+        """Write the summary of one fight and restart the history window, like a logged combat session."""
         if self.episode_step:
             char = self.world.char
             summary = {
-                "actor_id": self.actor_id, "episode_id": self.episode_id, "reason": reason, "truncated": truncated,
+                "actor_id": self.actor_id, "episode_id": self.episode_id, "life_id": self.life_id, "reason": reason,
+                "truncated": truncated,
                 "steps": self.episode_step, "return": round(self.episode_return, 4),
+                "reward_terms": {name: round(value, 4) for name, value in self.episode_terms.items()},
                 "duration_s": round(time.time() - self.episode_started, 2),
                 "character": self.conn.character_name, "level": char.level, "class_id": char.class_id,
             }
@@ -355,10 +382,9 @@ class Actor:
             log.info("Episode %d: %s after %d steps, return %.3f (%.1fs)", self.episode_id, reason,
                      self.episode_step, self.episode_return, summary["duration_s"])
             self.episode_id += 1
-        self.buffer.end_episode()
-        self._update_header()
         self.episode_step = 0
         self.episode_return = 0.0
+        self.episode_terms = {}
         self.episode_started = time.time()
         self.encoder.reset_session()
 
