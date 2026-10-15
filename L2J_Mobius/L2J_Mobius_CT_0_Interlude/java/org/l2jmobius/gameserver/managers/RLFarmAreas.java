@@ -54,8 +54,10 @@ final class RLFarmAreas
 	private static final int CELL_SIZE = 2000;
 	/** Random offset around the chosen monster, so the agent does not land inside it. */
 	private static final int MONSTER_OFFSET = 100;
-	/** A spot is avoided when a monster above the level window stands this close (areas of different levels can touch). */
+	/** Radius checked around a spot for monsters above the level window (areas of different levels can touch) and aggressive ones. */
 	private static final int SAFETY_RADIUS = 1500;
+	/** Extra distance beyond an aggressive monster's aggro range. */
+	private static final int AGGRO_MARGIN = 150;
 	/** Live monsters of the area tried as the spot before the last one is taken anyway. */
 	private static final int SPOT_ATTEMPTS = 12;
 	
@@ -225,26 +227,64 @@ final class RLFarmAreas
 			}
 		}
 		
-		Location base = null;
+		Location spot = null;
 		Collections.shuffle(alive);
 		for (int i = 0; (i < alive.size()) && (i < SPOT_ATTEMPTS); i++)
 		{
-			final Npc npc = alive.get(i);
-			base = npc.getLocation();
-			if (World.getInstance().getVisibleObjectsInRange(npc, Monster.class, SAFETY_RADIUS, m -> !m.isDead() && m.getTemplate().isType("Monster") && (m.getLevel() > (level + RLAgentEnvironmentConfig.RL_FARM_LEVEL_ABOVE))).isEmpty())
+			spot = spotNear(alive.get(i));
+			if (isSafe(alive.get(i), spot, level))
 			{
-				break;
+				return spot;
 			}
 		}
-		
-		if (base == null)
+		if (spot != null)
 		{
-			final Spawn spawn = area.spawns().get(Rnd.get(area.spawns().size()));
-			base = spawn.isTerritoryBased() ? spawn.getSpawnTerritory().getRandomPoint() : spawn.getSpawnLocation();
+			return spot; // no safe spot among the tried monsters: the last one
 		}
 		
-		final int x = base.getX() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET);
-		final int y = base.getY() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET);
+		final Spawn spawn = area.spawns().get(Rnd.get(area.spawns().size()));
+		final Location base = spawn.isTerritoryBased() ? spawn.getSpawnTerritory().getRandomPoint() : spawn.getSpawnLocation();
+		return onGround(base, base.getX(), base.getY());
+	}
+	
+	/** A point next to the monster; next to an aggressive one, just outside its aggro range so it does not attack at once. */
+	private static Location spotNear(Npc npc)
+	{
+		final Location base = npc.getLocation();
+		if (!npc.isAggressive())
+		{
+			return onGround(base, base.getX() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET), base.getY() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET));
+		}
+		
+		final double angle = Rnd.nextDouble() * 2 * Math.PI;
+		final int distance = npc.getAggroRange() + AGGRO_MARGIN;
+		return onGround(base, base.getX() + (int) (Math.cos(angle) * distance), base.getY() + (int) (Math.sin(angle) * distance));
+	}
+	
+	/** A spot is unsafe when a monster above the level window is near, or an aggressive monster would reach it at once. */
+	private static boolean isSafe(Npc anchor, Location spot, int level)
+	{
+		for (Monster monster : World.getInstance().getVisibleObjectsInRange(anchor, Monster.class, SAFETY_RADIUS))
+		{
+			if (monster.isDead() || !monster.getTemplate().isType("Monster"))
+			{
+				continue;
+			}
+			if (monster.getLevel() > (level + RLAgentEnvironmentConfig.RL_FARM_LEVEL_ABOVE))
+			{
+				return false;
+			}
+			if (monster.isAggressive() && (Math.hypot(monster.getX() - spot.getX(), monster.getY() - spot.getY()) < monster.getAggroRange()))
+			{
+				return false;
+			}
+		}
+		return true;
+	}
+	
+	/** {@code (x, y)} on the ground near {@code base}, or {@code base} itself when the ground there is far off (a cliff, a wall). */
+	private static Location onGround(Location base, int x, int y)
+	{
 		final int z = GeoEngine.getInstance().getHeight(x, y, base.getZ());
 		return Math.abs(z - base.getZ()) > 200 ? new Location(base.getX(), base.getY(), base.getZ()) : new Location(x, y, z);
 	}

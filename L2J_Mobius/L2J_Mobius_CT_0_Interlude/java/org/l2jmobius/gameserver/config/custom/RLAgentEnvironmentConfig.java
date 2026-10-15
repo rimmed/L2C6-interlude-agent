@@ -63,6 +63,8 @@ public class RLAgentEnvironmentConfig
 	public static int RL_NAME_SUFFIX_LENGTH;
 	public static int RL_MIN_LEVEL;
 	public static int RL_MAX_LEVEL;
+	public static double RL_LEVEL_MEAN;
+	public static double RL_LEVEL_STDDEV;
 	public static boolean RL_AUTO_LEARN_SKILLS;
 	public static boolean RL_AUTO_CLASS_TRANSFER;
 	public static boolean RL_AUTO_EQUIP;
@@ -70,6 +72,7 @@ public class RLAgentEnvironmentConfig
 	public static Map<Integer, CrystalType> RL_GRADE_LEVELS;
 	public static int RL_SOULSHOT_COUNT;
 	public static int RL_SPIRITSHOT_COUNT;
+	public static int RL_ARROW_COUNT;
 	public static boolean RL_USE_BLESSED_SPIRITSHOTS;
 	public static boolean RL_AUTO_ENABLE_SHOTS;
 	public static List<ItemHolder> RL_CONSUMABLES;
@@ -111,13 +114,16 @@ public class RLAgentEnvironmentConfig
 		}
 		RL_NAME_SUFFIX_LENGTH = Math.max(3, config.getInt("RLNameSuffixLength", 6));
 		RL_MIN_LEVEL = Math.max(1, config.getInt("RLMinLevel", 1));
-		RL_MAX_LEVEL = Math.max(RL_MIN_LEVEL, config.getInt("RLMaxLevel", 52));
+		RL_MAX_LEVEL = Math.max(RL_MIN_LEVEL, config.getInt("RLMaxLevel", 80));
+		RL_LEVEL_MEAN = config.getDouble("RLLevelMean", 40);
+		RL_LEVEL_STDDEV = Math.max(0, config.getDouble("RLLevelStdDev", 15));
 		RL_AUTO_LEARN_SKILLS = config.getBoolean("RLAutoLearnSkills", true);
 		RL_AUTO_CLASS_TRANSFER = config.getBoolean("RLAutoClassTransfer", true);
 		RL_AUTO_EQUIP = config.getBoolean("RLAutoEquip", true);
 		RL_GRADE_LEVELS = parseGradeLevels(config.getString("RLGradeLevels", "D:20;C:40;B:52;A:61;S:76"));
 		RL_SOULSHOT_COUNT = config.getInt("RLSoulshotCount", 2000);
 		RL_SPIRITSHOT_COUNT = config.getInt("RLSpiritshotCount", 1000);
+		RL_ARROW_COUNT = config.getInt("RLArrowCount", 3000);
 		RL_USE_BLESSED_SPIRITSHOTS = config.getBoolean("RLUseBlessedSpiritshots", true);
 		RL_AUTO_ENABLE_SHOTS = config.getBoolean("RLAutoEnableShots", true);
 		RL_CONSUMABLES = parseItems(config.getString("RLConsumables", "1061:50;1539:50"));

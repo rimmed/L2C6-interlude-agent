@@ -96,11 +96,15 @@ public class RLAgentManager
 	private static final String VAR_SETUP_DONE = "RL_SETUP_DONE";
 	/** Grade of the equipment set given last, so a level-up only re-equips when the grade changes. */
 	private static final String VAR_GEAR_GRADE = "RL_GEAR_GRADE";
+	/** Archetype of the equipment set given last, so a changed weapon rule re-equips existing agents. */
+	private static final String VAR_GEAR_ARCHETYPE = "RL_GEAR_ARCHETYPE";
 	
 	// Shots indexed by CrystalType ordinal (NONE, D, C, B, A, S).
 	private static final int[] SOULSHOTS = { 1835, 1463, 1464, 1465, 1466, 1467 };
 	private static final int[] SPIRITSHOTS = { 2509, 2510, 2511, 2512, 2513, 2514 };
 	private static final int[] BLESSED_SPIRITSHOTS = { 3947, 3948, 3949, 3950, 3951, 3952 };
+	// Arrows of the same grades: Wooden, Bone, Fine Steel, Silver, Mithril, Shining. A bow fires only arrows of its grade.
+	private static final int[] ARROWS = { 17, 1341, 1342, 1343, 1344, 1345 };
 	
 	// Levels of the 1st, 2nd and 3rd class transfer.
 	private static final int[] CLASS_TRANSFER_LEVELS = { 20, 40, 76 };
@@ -125,6 +129,16 @@ public class RLAgentManager
 		ARCHER(ArmorType.LIGHT, false),
 		DAGGER(ArmorType.LIGHT, false),
 		MONK(ArmorType.LIGHT, false),
+		/** Gladiator, Bladedancer: dual swords only. */
+		DUALIST(ArmorType.HEAVY, false),
+		/** Warlord: polearms. */
+		POLEARM(ArmorType.HEAVY, false),
+		/** Destroyer: two-handed swords and blunts. */
+		TWO_HANDED(ArmorType.HEAVY, false),
+		/** Warrior before the 2nd class transfer: dual swords or polearms (Gladiator or Warlord ahead). */
+		WARRIOR(ArmorType.HEAVY, false),
+		/** Dwarves: blunts, which several of their combat skills (e.g. Stun Attack, Hammer Crush) require. */
+		DWARF(ArmorType.HEAVY, true),
 		FIGHTER(ArmorType.HEAVY, true);
 		
 		final ArmorType _armorType;
@@ -377,7 +391,23 @@ public class RLAgentManager
 	private void boostLevel(Player player)
 	{
 		final int maxLevel = Math.min(RLAgentEnvironmentConfig.RL_MAX_LEVEL, ExperienceData.getInstance().getMaxLevel() - 1);
-		final int targetLevel = Rnd.get(Math.min(RLAgentEnvironmentConfig.RL_MIN_LEVEL, maxLevel), maxLevel);
+		final int minLevel = Math.min(RLAgentEnvironmentConfig.RL_MIN_LEVEL, maxLevel);
+		final int targetLevel;
+		if (RLAgentEnvironmentConfig.RL_LEVEL_STDDEV > 0)
+		{
+			// Gaussian around RLLevelMean, redrawn until it falls into the level range (a truncated normal distribution).
+			int level;
+			do
+			{
+				level = (int) Math.round(RLAgentEnvironmentConfig.RL_LEVEL_MEAN + (Rnd.nextGaussian() * RLAgentEnvironmentConfig.RL_LEVEL_STDDEV));
+			}
+			while ((level < minLevel) || (level > maxLevel));
+			targetLevel = level;
+		}
+		else
+		{
+			targetLevel = Rnd.get(minLevel, maxLevel);
+		}
 		if (player.getLevel() >= targetLevel)
 		{
 			return;
@@ -411,7 +441,8 @@ public class RLAgentManager
 		if (RLAgentEnvironmentConfig.RL_AUTO_EQUIP)
 		{
 			final CrystalType grade = gradeForLevel(player.getLevel());
-			if (forceEquip || !grade.name().equals(player.getVariables().getString(VAR_GEAR_GRADE, "")))
+			final String archetype = archetypeOf(player.getPlayerClass()).name();
+			if (forceEquip || !grade.name().equals(player.getVariables().getString(VAR_GEAR_GRADE, "")) || !archetype.equals(player.getVariables().getString(VAR_GEAR_ARCHETYPE, "")))
 			{
 				equip(player, grade);
 			}
@@ -526,6 +557,26 @@ public class RLAgentManager
 		{
 			return Archetype.MONK;
 		}
+		if (playerClass.equalsOrChildOf(PlayerClass.GLADIATOR) || playerClass.equalsOrChildOf(PlayerClass.BLADEDANCER))
+		{
+			return Archetype.DUALIST;
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.WARLORD))
+		{
+			return Archetype.POLEARM;
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.ORC_RAIDER))
+		{
+			return Archetype.TWO_HANDED;
+		}
+		if (playerClass == PlayerClass.WARRIOR)
+		{
+			return Archetype.WARRIOR;
+		}
+		if (playerClass.equalsOrChildOf(PlayerClass.DWARVEN_FIGHTER))
+		{
+			return Archetype.DWARF;
+		}
 		return Archetype.FIGHTER;
 	}
 	
@@ -566,6 +617,7 @@ public class RLAgentManager
 		}
 		
 		player.getVariables().set(VAR_GEAR_GRADE, grade.name());
+		player.getVariables().set(VAR_GEAR_ARCHETYPE, archetypeOf(player.getPlayerClass()).name());
 		player.sendItemList(false);
 		player.broadcastUserInfo();
 	}
@@ -718,6 +770,11 @@ public class RLAgentManager
 			case ARCHER -> type == WeaponType.BOW;
 			case DAGGER -> type == WeaponType.DAGGER;
 			case MONK -> (type == WeaponType.DUALFIST) || (type == WeaponType.FIST);
+			case DUALIST -> type == WeaponType.DUAL;
+			case POLEARM -> type == WeaponType.POLE;
+			case TWO_HANDED -> !weapon.isMagicWeapon() && ((type == WeaponType.SWORD) || (type == WeaponType.BLUNT)) && (weapon.getBodyPart() == BodyPart.LR_HAND);
+			case WARRIOR -> (type == WeaponType.DUAL) || (type == WeaponType.POLE);
+			case DWARF -> !weapon.isMagicWeapon() && (type == WeaponType.BLUNT);
 			case FIGHTER -> !weapon.isMagicWeapon() && ((type == WeaponType.SWORD) || (type == WeaponType.BLUNT)) && (weapon.getBodyPart() == BodyPart.R_HAND);
 		};
 	}
@@ -744,6 +801,11 @@ public class RLAgentManager
 		}
 		
 		topUp(player, shotId, shotCount);
+		if ((weapon != null) && (weapon.getItemType() == WeaponType.BOW))
+		{
+			// The server equips matching arrows by itself when the bow attacks.
+			topUp(player, ARROWS[gradeIndex], RLAgentEnvironmentConfig.RL_ARROW_COUNT);
+		}
 		for (ItemHolder consumable : RLAgentEnvironmentConfig.RL_CONSUMABLES)
 		{
 			topUp(player, consumable.getId(), consumable.getCount());
