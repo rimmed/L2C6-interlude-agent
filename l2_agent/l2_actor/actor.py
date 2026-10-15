@@ -40,6 +40,7 @@ import random
 import signal
 import string
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -99,6 +100,8 @@ class ActorConfig:
     seed: int | None = None
     #: drink shop buff potions (run / attack / casting speed) when no such buff is on the character
     buff_potions: bool = True
+    #: onnxruntime threads of the model (``None`` = all cores; ``l2_actor.fleet`` uses 1)
+    threads: int | None = None
 
 
 class Actor:
@@ -135,6 +138,7 @@ class Actor:
         self._restart_requested = False
         #: when to ask for a fresh ItemList: the server tops up shots, arrows and potions after login / revive
         self._item_list_at = 0.0
+        self._stop = threading.Event()
         self.started = time.time()
         #: fights (kill / death) - the episode summaries; the history window restarts with each fight
         self.episode_id = 0
@@ -161,7 +165,7 @@ class Actor:
 
         # The model decides; its .json (feature layout, skill panels) must sit next to the .onnx.
         model_path = self._download_model() if cfg.model == "redis" else cfg.model
-        self.encoder = CombatPolicy(model_path, server_speed=cfg.server_speed, device=cfg.device)
+        self.encoder = CombatPolicy(model_path, server_speed=cfg.server_speed, device=cfg.device, threads=cfg.threads)
         log.info("Model: %s (version %s) on %s, %s actions", model_path, self.model_version, self.encoder.device,
                  "sampled" if self.sample else "greedy")
         if self.buffer is None:
@@ -257,7 +261,8 @@ class Actor:
         except KeyboardInterrupt:
             log.info("Interrupted")
         finally:
-            signal.signal(signal.SIGINT, signal.SIG_IGN)  # a second Ctrl+C must not lose buffered data
+            if threading.current_thread() is threading.main_thread():
+                signal.signal(signal.SIGINT, signal.SIG_IGN)  # a second Ctrl+C must not lose buffered data
             self._shutdown()
         return self.summary()
 
@@ -388,10 +393,15 @@ class Actor:
         self.episode_started = time.time()
         self.encoder.reset_session()
 
+    def stop(self) -> None:
+        """Ask a running actor (e.g. in another thread) to finish its episode bookkeeping and log out."""
+        self._stop.set()
+
     def _limit_reached(self) -> bool:
         cfg = self.cfg
         return bool(
-            (cfg.max_episodes and self.totals["episodes"] >= cfg.max_episodes)
+            self._stop.is_set()
+            or (cfg.max_episodes and self.totals["episodes"] >= cfg.max_episodes)
             or (cfg.max_steps and self.total_steps >= cfg.max_steps)
             or (cfg.max_minutes and time.time() - self.started >= cfg.max_minutes * 60)
         )

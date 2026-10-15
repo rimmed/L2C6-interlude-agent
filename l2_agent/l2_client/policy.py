@@ -164,6 +164,7 @@ class CombatPolicy:
         max_target_dz: float | None = MAX_TARGET_DZ,
         metadata_path: str | Path | None = None,
         excluded_skills: frozenset[int] = frozenset(),
+        threads: int | None = None,
     ):
         """
         :param model_path: ``.onnx`` file; its ``.json`` metadata must sit next to it. ``None`` builds
@@ -175,6 +176,8 @@ class CombatPolicy:
         :param metadata_path: feature-layout ``.json``; defaults to the one next to ``model_path``
         :param excluded_skills: skill ids never offered for casting (e.g. crafting or Relax, which
             the panel of a training character may contain but which are useless in a fight)
+        :param threads: onnxruntime intra-op threads (``None`` = its default, one per core); many
+            actors in one process need 1, or every session starts a pool of all cores
         """
         self.excluded_skills = frozenset(excluded_skills)
         if model_path is None and metadata_path is None:
@@ -192,6 +195,7 @@ class CombatPolicy:
         self.session = None
         self.device = "none"
         self._providers: list[str] | None = None
+        self._threads = threads
         self._rng = np.random.default_rng()
         if model_path is not None:
             self._open_session(Path(model_path), providers, device)
@@ -215,7 +219,12 @@ class CombatPolicy:
                 providers = ["CPUExecutionProvider"]
             else:
                 raise ValueError(f"device must be 'cpu' or 'gpu', got {device!r}")
-        self.session = ort.InferenceSession(model if isinstance(model, bytes) else str(model), providers=providers)
+        options = ort.SessionOptions()
+        if self._threads is not None:
+            options.intra_op_num_threads = self._threads
+            options.inter_op_num_threads = self._threads
+        self.session = ort.InferenceSession(model if isinstance(model, bytes) else str(model), sess_options=options,
+                                            providers=providers)
         self._providers = providers
         if providers[0] not in self.session.get_providers()[:1]:
             raise RuntimeError(f"requested {providers[0]}, but the session runs on {self.session.get_providers()}")

@@ -144,3 +144,13 @@ class JsonlBuffer(TransitionBuffer):
         self.written += len(self._pending)
         log.debug("Flushed %d transition(s) to %s (%d total)", len(self._pending), self.path, self.written)
         self._pending.clear()
+
+
+class NullBuffer(TransitionBuffer):
+    """Keeps nothing: for evaluation runs that only need the episode summaries."""
+
+    def add(self, transition: Transition) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass

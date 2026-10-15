@@ -115,6 +115,20 @@ Several actors can run at once: each uses its own account and writes its own fil
    `--resume checkpoints/rl/latest.pth`. `export_onnx.py -c checkpoints/rl/best.pth` exports an RL
    checkpoint like a behaviour-cloning one.
 
+**Many actors on one machine.** `python -m l2_actor.fleet` runs `--actors` actors in worker
+processes of `--per-proc` threads (default 10), one onnxruntime thread per model session, logins
+spaced `--stagger` seconds apart, crashed actors restarted with the same account. Accounts are
+`<prefix>0000`, `<prefix>0001`, ... so a restarted fleet plays the same characters:
+
+```bash
+uv run python -m l2_actor.fleet --actors 800 --redis redis://<trainer-host>:6379/0 --model redis --server-speed 5
+```
+
+It prints one summary line every `--report` seconds (actors online, episodes, kills / deaths,
+transitions, model versions in use); per-process logs go to `<output-dir>/fleet_logs/`. On a
+20-core machine 10 actors per process ran 800 actors at about half the CPU; one process per 25
+actors already lost connections at 600 (the threads starve on the GIL).
+
 **What travels.** An actor sends a *segment* (up to `--segment-len` steps, 64 by default) of one
 episode as soon as it is full, or when the episode ends. A segment holds the model inputs of every
 step, the chosen indices, the behaviour `logp`, the rewards and the masks (`replay.py` has the full
