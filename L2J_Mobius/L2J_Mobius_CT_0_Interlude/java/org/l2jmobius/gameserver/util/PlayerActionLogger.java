@@ -20,438 +20,363 @@
  */
 package org.l2jmobius.gameserver.util;
 
-import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.List;
-import org.l2jmobius.gameserver.model.actor.holders.creature.TimeStamp;
-import java.util.Date;
-import java.util.logging.Logger;
+import java.util.Map;
 import java.util.Queue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.logging.Handler;
+import java.util.logging.Logger;
 
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
+import org.l2jmobius.gameserver.geoengine.GeoEngine;
+import org.l2jmobius.gameserver.managers.RLAgentManager;
+import org.l2jmobius.gameserver.model.World;
 import org.l2jmobius.gameserver.model.WorldObject;
+import org.l2jmobius.gameserver.model.actor.Attackable;
 import org.l2jmobius.gameserver.model.actor.Creature;
-import org.l2jmobius.gameserver.model.actor.Player;
 import org.l2jmobius.gameserver.model.actor.Npc;
-import org.l2jmobius.gameserver.model.actor.enums.creature.Race;
-import org.l2jmobius.gameserver.model.item.Weapon;
+import org.l2jmobius.gameserver.model.actor.Player;
+import org.l2jmobius.gameserver.model.actor.holders.creature.TimeStamp;
+import org.l2jmobius.gameserver.model.actor.holders.npc.AggroInfo;
 import org.l2jmobius.gameserver.model.item.instance.Item;
+import org.l2jmobius.gameserver.model.itemcontainer.Inventory;
 import org.l2jmobius.gameserver.model.skill.BuffInfo;
 import org.l2jmobius.gameserver.model.skill.Skill;
-import org.l2jmobius.gameserver.model.itemcontainer.Inventory;
-import org.l2jmobius.gameserver.model.World;
-import org.l2jmobius.gameserver.geoengine.GeoEngine;
-import org.l2jmobius.gameserver.model.actor.Attackable;
 
+/**
+ * Player action log (format 2): one compact, human-readable line per action.
+ * <p>
+ * {@code <date> <time> <character> <EVENT> <payload> [| me ...] [| sel ...] [| env ...] [| cd ...]}
+ * <ul>
+ * <li>references: {@code Name#objectId(npcId Llvl) hp cur/max} for monsters and NPCs, {@code Name#objectId(pc Llvl) hp cur/max} for players, {@code Name#objectId(item itemId)} for items, {@code -} for none;</li>
+ * <li>{@code me L18 hp 711/711 mp 231/231 cp 368/368 @x,y,z h<heading> wt<load %>} plus the flags {@code sit cast atk dead combat} when set;</li>
+ * <li>{@code sel d<distance> los|nolos h<target heading>}: the selected target, relative to the character;</li>
+ * <li>{@code env items <ground items within 1000>; <npcId>#<objectId> L<lvl> d<distance> hp<hp %> [by:<players>]; ...}: the 10 nearest monsters within 3000, {@code by:} lists the other players on a monster's aggro list;</li>
+ * <li>{@code cd <skillId>:<ms>,...}: skill reuse still running.</li>
+ * </ul>
+ * RL agents are not logged.
+ * Character state that rarely changes is written on its own lines, only when it changed: {@code STATS} (level, exp, sp and combat stats), {@code EQUIP} (paperdoll) and {@code SKILLS} (known skills). A parser keeps the last state per character.
+ */
 public class PlayerActionLogger
 {
 	private static final Logger LOGGER = Logger.getLogger("playeraction");
-	private static final SimpleDateFormat SHOT_TIMESTAMP_FORMAT = new SimpleDateFormat("HH:mm:ss,SSS");
 	private static final long BUFF_DEBUFF_LOG_COOLDOWN = 5000; // 5 seconds
-	private static final java.util.Map<Integer, Long> _buffDebuffLogTimes = new java.util.concurrent.ConcurrentHashMap<>();
+	private static final Map<Integer, Long> _buffDebuffLogTimes = new ConcurrentHashMap<>();
 	private static final long SKILLS_LOG_COOLDOWN = 30000; // 30 seconds
-	private static final java.util.Map<Integer, Long> _skillsLogTimes = new java.util.concurrent.ConcurrentHashMap<>();
+	private static final Map<Integer, Long> _skillsLogTimes = new ConcurrentHashMap<>();
 	private static final long DAMAGE_LOG_COOLDOWN = 100; // 100 ms dedup window
-	private static final java.util.Map<Long, Long> _damageLogTimes = new java.util.concurrent.ConcurrentHashMap<>();
+	private static final Map<Long, Long> _damageLogTimes = new ConcurrentHashMap<>();
 	private static final long TARGET_SELECT_LOG_COOLDOWN = 1000; // 1s dedup window for target select
-	private static final java.util.Map<Long, Long> _targetSelectLogTimes = new java.util.concurrent.ConcurrentHashMap<>();
+	private static final Map<Long, Long> _targetSelectLogTimes = new ConcurrentHashMap<>();
+	
+	/** Monsters listed in the {@code env} block: the nearest ones within this range. */
+	private static final int ENV_RANGE = 3000;
+	private static final int ENV_MAX_MONSTERS = 10;
+	private static final int GROUND_ITEM_RANGE = 1000;
+	
+	/** Last {@code STATS} / {@code EQUIP} / {@code SKILLS} text written per character, so a line is only written on change. */
+	private static final Map<Integer, String> _lastStats = new ConcurrentHashMap<>();
+	private static final Map<Integer, String> _lastEquip = new ConcurrentHashMap<>();
+	private static final Map<Integer, String> _lastSkills = new ConcurrentHashMap<>();
+	
+	private static final String[] SLOT_NAMES =
+	{
+		"weapon",
+		"shield",
+		"head",
+		"chest",
+		"gloves",
+		"legs",
+		"feet",
+		"neck",
+		"rear",
+		"lear",
+		"rfinger",
+		"lfinger"
+	};
+	private static final int[] SLOTS =
+	{
+		Inventory.PAPERDOLL_RHAND,
+		Inventory.PAPERDOLL_LHAND,
+		Inventory.PAPERDOLL_HEAD,
+		Inventory.PAPERDOLL_CHEST,
+		Inventory.PAPERDOLL_GLOVES,
+		Inventory.PAPERDOLL_LEGS,
+		Inventory.PAPERDOLL_FEET,
+		Inventory.PAPERDOLL_NECK,
+		Inventory.PAPERDOLL_REAR,
+		Inventory.PAPERDOLL_LEAR,
+		Inventory.PAPERDOLL_RFINGER,
+		Inventory.PAPERDOLL_LFINGER
+	};
 	
 	static
 	{
-		Runtime.getRuntime().addShutdownHook(new Thread(() ->
-		{
-			final Logger logger = Logger.getLogger("playeraction");
-			for (java.util.logging.Handler handler : logger.getHandlers())
-			{
-				handler.flush();
-			}
-		}, "PlayerActionLogger-ShutdownHook"));
+		Runtime.getRuntime().addShutdownHook(new Thread(PlayerActionLogger::flush, "PlayerActionLogger-ShutdownHook"));
 	}
 	
 	public static void flush()
 	{
-		final Logger logger = Logger.getLogger("playeraction");
-		for (java.util.logging.Handler handler : logger.getHandlers())
+		for (Handler handler : LOGGER.getHandlers())
 		{
 			handler.flush();
 		}
 	}
 	
+	/** RL agents are not logged: hundreds of them would flood the log, and their trajectories go through the RL pipeline. */
+	private static boolean isAgent(Player player)
+	{
+		return RLAgentEnvironmentConfig.RL_AGENT_ENABLED && RLAgentManager.getInstance().isAgent(player);
+	}
+	
 	// ========================================================================
-	// Helper: Build the standard suffix blocks (Player + Nav + Env + CD).
-	// These are appended to every log line after the action-specific prefix.
+	// Line parts
 	// ========================================================================
 	
-	/**
-	 * Builds the suffix that is appended to every action log line:
-	 * [CharStatus: HP:... MP:... CP:... Exp:... Sp:... Lvl:...]
-	 * [CharStats: P.Atk:... M.Atk:... P.Def:... M.Def:... Accur:... Crit.rate:... Evasion:... Atk.Speed:... Cast.Speed:... STR:... INT:... DEX:... CON:... WIT:...]
-	 * [Weapon:... Shield:... Head:... Chest:... Gloves:... Legs:... Feet:... Neck:... REar:... LEar:... RFinger:... LFinger:...]
-	 * [Pos:X,Y,Z Head:... Sit:... Cast:... Atk:... Dead:... Wt:...%]
-	 * [Nav: Dist:... LoS:... THead:...]
-	 * [Env:NearbyMon:X GroundItems:Y InCombat:...] [CD:...]
-	 */
-	private static String buildLogSuffix(Player player, WorldObject targetRef, boolean castingState)
+	/** {@code Name#objectId(npcId Llvl) hp cur/max}, {@code Name#objectId(pc Llvl) hp cur/max}, {@code Name#objectId(item itemId)} or {@code -}. */
+	private static String ref(WorldObject object)
 	{
-		return getCharStatus(player) + " " + getCharStats(player) + " " + getEquipmentInfo(player) + " " + getSpatialInfo(player, castingState) + " " + getNavInfo(player, targetRef) + " " + getEnvironmentRadar(player) + " " + getCooldownInfo(player);
-	}
-	
-	private static String getCharStatus(Player player)
-	{
-		return "[CharStatus: HP:" + String.format("%.1f", player.getStatus().getCurrentHp()) + "/" + player.getMaxHp() +
-			" MP:" + String.format("%.1f", player.getStatus().getCurrentMp()) + "/" + player.getMaxMp() +
-			" CP:" + String.format("%.1f", player.getStatus().getCurrentCp()) + "/" + player.getMaxCp() +
-			" Exp:" + player.getExp() + " Sp:" + player.getSp() +
-			" Lvl:" + player.getLevel() + "]";
-	}
-	
-	private static String getCharStats(Player player)
-	{
-		return "[CharStats: P.Atk:" + (int) player.getPAtk(player) +
-			" M.Atk:" + (int) player.getMAtk(player, null) +
-			" P.Def:" + (int) player.getPDef(player) +
-			" M.Def:" + (int) player.getMDef(player, null) +
-			" Accur:" + player.getAccuracy() +
-			" Crit.rate:" + player.getCriticalHit(player, null) +
-			" Evasion:" + player.getEvasionRate(player) +
-			" Atk.Speed:" + player.getPAtkSpd() +
-			" Cast.Speed:" + player.getMAtkSpd() +
-			" STR:" + player.getSTR() +
-			" INT:" + player.getINT() +
-			" DEX:" + player.getDEX() +
-			" CON:" + player.getCON() +
-			" WIT:" + player.getWIT() + "]";
-	}
-	
-	private static String getCooldownInfo(Player player)
-	{
-		final StringBuilder sb = new StringBuilder();
-		final java.util.Map<Integer, TimeStamp> stamps = player.getSkillReuseTimeStamps();
-		if ((stamps == null) || stamps.isEmpty())
+		if (object == null)
 		{
-			return "[CD:None]";
+			return "-";
 		}
 		
-		sb.append("[CD:");
-		boolean first = true;
-		for (java.util.Map.Entry<Integer, TimeStamp> entry : stamps.entrySet())
+		final StringBuilder sb = new StringBuilder(64);
+		sb.append(object.getName()).append('#').append(object.getObjectId());
+		if (object.isNpc())
 		{
-			final TimeStamp ts = entry.getValue();
-			final long remaining = ts.getRemaining();
-			if (remaining > 0)
-			{
-				if (!first) sb.append(",");
-				sb.append(ts.getSkillId()).append(":").append(remaining);
-				first = false;
-			}
+			final Npc npc = (Npc) object;
+			sb.append('(').append(npc.getId()).append(" L").append(npc.getLevel()).append(") hp ").append((int) npc.getCurrentHp()).append('/').append(npc.getMaxHp());
 		}
-		
-		if (first) sb.append("None");
-		sb.append("]");
+		else if (object.isPlayer())
+		{
+			final Player player = object.asPlayer();
+			sb.append("(pc L").append(player.getLevel()).append(") hp ").append((int) player.getCurrentHp()).append('/').append(player.getMaxHp());
+		}
+		else if (object.isItem())
+		{
+			sb.append("(item ").append(((Item) object).getId()).append(')');
+		}
+		else if (object instanceof Creature)
+		{
+			final Creature creature = (Creature) object;
+			sb.append("(L").append(creature.getLevel()).append(") hp ").append((int) creature.getCurrentHp()).append('/').append(creature.getMaxHp());
+		}
 		return sb.toString();
 	}
 	
-	private static String getBuffDebuffInfo(Player player)
+	private static String me(Player player, boolean casting)
 	{
-		final StringBuilder sb = new StringBuilder();
-		
-		// Log buffs
-		final Queue<BuffInfo> buffs = player.getEffectList().getBuffs();
-		if (!buffs.isEmpty())
+		final StringBuilder sb = new StringBuilder(128);
+		sb.append("me L").append(player.getLevel());
+		sb.append(" hp ").append((int) player.getCurrentHp()).append('/').append(player.getMaxHp());
+		sb.append(" mp ").append((int) player.getCurrentMp()).append('/').append(player.getMaxMp());
+		sb.append(" cp ").append((int) player.getCurrentCp()).append('/').append(player.getMaxCp());
+		sb.append(" @").append(player.getX()).append(',').append(player.getY()).append(',').append(player.getZ());
+		sb.append(" h").append(player.getHeading());
+		sb.append(" wt").append(String.format("%.1f", (player.getMaxLoad() > 0) ? ((double) player.getCurrentLoad() / player.getMaxLoad()) * 100 : 0));
+		if (player.isSitting())
 		{
-			sb.append(" Buffs[");
-			boolean first = true;
-			for (BuffInfo buff : buffs)
-			{
-				if (!first) sb.append(",");
-				final Skill skill = buff.getSkill();
-				sb.append(skill.getName()).append("(").append(skill.getId()).append(")").append(":").append(buff.getTime()).append("s");
-				first = false;
-			}
-			sb.append("]");
+			sb.append(" sit");
 		}
-		
-		// Log debuffs
-		final Queue<BuffInfo> debuffs = player.getEffectList().getDebuffs();
-		if (!debuffs.isEmpty())
+		if (casting)
 		{
-			sb.append(" Debuffs[");
-			boolean first = true;
-			for (BuffInfo debuff : debuffs)
-			{
-				if (!first) sb.append(",");
-				final Skill skill = debuff.getSkill();
-				sb.append(skill.getName()).append("(").append(skill.getId()).append(")").append(":").append(debuff.getTime()).append("s");
-				first = false;
-			}
-			sb.append("]");
+			sb.append(" cast");
 		}
-		
-		return sb.toString();
-	}
-
-	private static String getEquipmentInfo(Player player)
-	{
-		final StringBuilder sb = new StringBuilder();
-		final Item head = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_HEAD);
-		final Item chest = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_CHEST);
-		final Item gloves = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_GLOVES);
-		final Item legs = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_LEGS);
-		final Item feet = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_FEET);
-		final Weapon weapon = player.getActiveWeaponItem();
-		final Item shield = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_LHAND);
-		final Item rEar = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_REAR);
-		final Item lEar = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_LEAR);
-		final Item rFinger = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_RFINGER);
-		final Item lFinger = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_LFINGER);
-		final Item neck = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_NECK);
-
-		sb.append("[Weapon:").append(weapon != null ? weapon.getName() : "None");
-		sb.append(" Shield:").append(shield != null ? shield.getTemplate().getName() : "None");
-		sb.append(" Head:").append(head != null ? head.getTemplate().getName() : "None");
-		sb.append(" Chest:").append(chest != null ? chest.getTemplate().getName() : "None");
-		sb.append(" Gloves:").append(gloves != null ? gloves.getTemplate().getName() : "None");
-		sb.append(" Legs:").append(legs != null ? legs.getTemplate().getName() : "None");
-		sb.append(" Feet:").append(feet != null ? feet.getTemplate().getName() : "None");
-		sb.append(" Neck:").append(neck != null ? neck.getTemplate().getName() : "None");
-		sb.append(" REar:").append(rEar != null ? rEar.getTemplate().getName() : "None");
-		sb.append(" LEar:").append(lEar != null ? lEar.getTemplate().getName() : "None");
-		sb.append(" RFinger:").append(rFinger != null ? rFinger.getTemplate().getName() : "None");
-		sb.append(" LFinger:").append(lFinger != null ? lFinger.getTemplate().getName() : "None");
-		sb.append("]");
+		if (player.isAttackingNow())
+		{
+			sb.append(" atk");
+		}
+		if (player.isAlikeDead())
+		{
+			sb.append(" dead");
+		}
+		if (player.isInCombat())
+		{
+			sb.append(" combat");
+		}
 		return sb.toString();
 	}
 	
-	private static String getSpatialInfo(Player player, boolean castingState)
-	{
-		return "[Pos:" + player.getX() + "," + player.getY() + "," + player.getZ() +
-			" Head:" + player.getHeading() +
-			" Sit:" + player.isSitting() +
-			" Cast:" + castingState +
-			" Atk:" + player.isAttackingNow() +
-			" Dead:" + player.isAlikeDead() +
-			" Wt:" + String.format("%.1f", (player.getMaxLoad() > 0) ? ((double) player.getCurrentLoad() / player.getMaxLoad() * 100) : 0) + "%]";
-	}
-	
-	// ========================================================================
-	// NPC Trait Extraction
-	// ========================================================================
-	
-	/**
-	 * Builds the [Type:X] [Weak:A,B] [Resist:C,D] string for an NPC target.
-	 */
-	private static String getNpcTraits(Npc npc)
-	{
-		final StringBuilder sb = new StringBuilder();
-		
-		// Type / Race
-		final Race race = npc.getTemplate().getRace();
-		sb.append("[Type:").append(race.name()).append("]");
-		
-		final java.util.List<String> weak = new java.util.ArrayList<>();
-		final java.util.List<String> resist = new java.util.ArrayList<>();
-		
-		final int basePDef = npc.getTemplate().getBasePDef();
-		final int baseMDef = npc.getTemplate().getBaseMDef();
-		final int basePAtk = npc.getTemplate().getBasePAtk();
-		final int baseMAtk = npc.getTemplate().getBaseMAtk();
-		
-		// Physical/Magical defense assessment
-		if (basePDef >= 500) resist.add("STRONG_P_DEF");
-		else if (basePDef <= 100) weak.add("WEAK_P_DEF");
-		
-		if (baseMDef >= 500) resist.add("STRONG_M_DEF");
-		else if (baseMDef <= 100) weak.add("WEAK_M_DEF");
-		
-		// Attack power assessment
-		if (basePAtk >= 500) resist.add("STRONG_P_ATK");
-		else if (basePAtk <= 100) weak.add("WEAK_P_ATK");
-		
-		if (baseMAtk >= 500) resist.add("STRONG_M_ATK");
-		else if (baseMAtk <= 100) weak.add("WEAK_M_ATK");
-		
-		// Elemental resistances
-		checkElementalTrait(npc.getTemplate().getBaseFireRes(), "FIRE", weak, resist);
-		checkElementalTrait(npc.getTemplate().getBaseWindRes(), "WIND", weak, resist);
-		checkElementalTrait(npc.getTemplate().getBaseWaterRes(), "WATER", weak, resist);
-		checkElementalTrait(npc.getTemplate().getBaseEarthRes(), "EARTH", weak, resist);
-		checkElementalTrait(npc.getTemplate().getBaseHolyRes(), "HOLY", weak, resist);
-		checkElementalTrait(npc.getTemplate().getBaseDarkRes(), "DARK", weak, resist);
-		
-		// Weapon vulnerability based on base attack type
-		final org.l2jmobius.gameserver.model.item.type.WeaponType atkType = npc.getTemplate().getBaseAttackType();
-		if (atkType != null)
-		{
-			switch (atkType)
-			{
-				case BOW: weak.add("ARCHER_WEAKNESS"); resist.add("MELEE_RESISTANCE"); break;
-				case BLUNT: weak.add("BLUNT_WEAKNESS"); break;
-				case DAGGER: weak.add("DAGGER_WEAKNESS"); break;
-				case DUAL: case DUALFIST: case DUALDAGGER: weak.add("DUAL_WEAKNESS"); break;
-				case FIST: weak.add("FIST_WEAKNESS"); break;
-				case POLE: weak.add("POLE_WEAKNESS"); break;
-				case SWORD: weak.add("SWORD_WEAKNESS"); break;
-				default: weak.add("MELEE_WEAKNESS"); break;
-			}
-		}
-		
-		// Race-based trait heuristics
-		if (race == Race.UNDEAD) { weak.add("HOLY_WEAKNESS"); resist.add("DARK_RESISTANCE"); }
-		else if (race == Race.DEMONIC) { weak.add("HOLY_WEAKNESS"); }
-		else if (race == Race.CONSTRUCT) { resist.add("SLEEP_IMMUNITY"); }
-		else if (race == Race.PLANT) { weak.add("FIRE_WEAKNESS"); }
-		else if (race == Race.ANIMAL) { weak.add("FIRE_WEAKNESS"); }
-		else if (race == Race.BEAST) { weak.add("MELEE_WEAKNESS"); }
-		
-		// Append Weakness list
-		sb.append(" [Weak:");
-		if (weak.isEmpty()) sb.append("NONE");
-		else
-		{
-			boolean first = true;
-			for (String w : weak) { if (!first) sb.append(","); sb.append(w); first = false; }
-		}
-		sb.append("]");
-		
-		// Append Resistance list
-		sb.append(" [Resist:");
-		if (resist.isEmpty()) sb.append("NONE");
-		else
-		{
-			boolean first = true;
-			for (String r : resist) { if (!first) sb.append(","); sb.append(r); first = false; }
-		}
-		sb.append("]");
-		
-		return sb.toString();
-	}
-	
-	private static void checkElementalTrait(double resValue, String elementName, java.util.List<String> weak, java.util.List<String> resist)
-	{
-		if (resValue >= 50) resist.add(elementName + "_RESISTANCE");
-		else if (resValue <= -50) weak.add(elementName + "_WEAKNESS");
-	}
-	
-	// ========================================================================
-	// Target Details Formatting (for the prefix, not the Nav block)
-	// ========================================================================
-	
-	/**
-	 * Formats the action target descriptor (no duplication with Nav block).
-	 * For NPCs:  Monster_Name (NPC_ID:ID, Lvl:Lvl) | HP:Cur/Max (Pct%) [Type:X] [Weak:A,B] [Resist:C,D]
-	 * For Players: PlayerName (Lvl:X)
-	 * For others: just name or "None".
-	 */
-	private static String getActionTarget(WorldObject target)
+	/** The selected target relative to the character, or {@code null} without one. */
+	private static String sel(Player player, WorldObject target)
 	{
 		if (target == null)
 		{
-			return "None";
+			return null;
 		}
 		
-		if (target.isNpc())
-		{
-			final Npc npc = (Npc) target;
-			final double currentHp = npc.getCurrentHp();
-			final double maxHp = npc.getMaxHp();
-			final double hpPct = (maxHp > 0) ? (currentHp / maxHp * 100) : 0;
-			return npc.getName() + " (NPC_ID:" + npc.getId() + ", Lvl:" + npc.getLevel() + ") | HP:" + String.format("%.1f", currentHp) + "/" + String.format("%.1f", maxHp) + " (" + String.format("%.1f", hpPct) + "%) " + getNpcTraits(npc);
-		}
-		else if (target instanceof Creature)
-		{
-			return ((Creature) target).getName() + " (Lvl:" + ((Creature) target).getLevel() + ")";
-		}
-		
-		return target.getName();
-	}
-	
-	/**
-	 * Navigation block — no duplicated NPC name/id/type/weakness data.
-	 * Format: [Nav: Dist:XXX.X LoS:true/false THead:XXX]
-	 * Returns "[Nav: None]" if target is null.
-	 */
-	private static String getNavInfo(Player player, WorldObject target)
-	{
-		if (target == null)
-		{
-			return "[Nav:None]";
-		}
-		
-		final StringBuilder sb = new StringBuilder();
-		sb.append("[Nav: Dist:").append(String.format("%.1f", player.calculateDistance3D(target)));
-		sb.append(" LoS:").append(player.isInsideRadius3D(target, 1500) && GeoEngine.getInstance().canSeeTarget(player, target));
-		
+		final StringBuilder sb = new StringBuilder(32);
+		sb.append("sel d").append(String.format("%.1f", player.calculateDistance3D(target)));
+		sb.append(player.isInsideRadius3D(target, 1500) && GeoEngine.getInstance().canSeeTarget(player, target) ? " los" : " nolos");
 		if (target instanceof Creature)
 		{
-			sb.append(" THead:").append(((Creature) target).getHeading());
+			sb.append(" h").append(((Creature) target).getHeading());
 		}
-		
-		sb.append("]");
 		return sb.toString();
 	}
 	
-	private static String getEnvironmentRadar(Player player)
+	private static String env(Player player)
 	{
-	    StringBuilder sb = new StringBuilder();
-	    List<Npc> nearbyMonsters = World.getInstance().getVisibleObjectsInRange(player, Npc.class, 6000);
-	    int monsterCount = nearbyMonsters.size();
-
-	    sb.append("[Env: Monsters Count: ").append(monsterCount).append(", ");
-	
-	    if (monsterCount > 0)
-	    {
-	        for (Npc monster : nearbyMonsters)
-	        {
-	            double distance = player.calculateDistance3D(monster);
-	            sb.append("Monster: ").append(monster.getName()).append(" (NPC_ID: ").append(monster.getId()).append(", Lvl: ").append(monster.getLevel()).append(", Distance: ").append(String.format("%.2f", distance)).append("), ");
-	        }
-	        // Remove the last comma and space
-	        sb.setLength(sb.length() - 2);
-	    }
-
-	    int itemCount = World.getInstance().getVisibleObjectsInRange(player, Item.class, 1000).size();
-	    sb.append(", GroundItems: ").append(itemCount);
-	    sb.append(", InCombat: ").append(player.isInCombat());
-	    sb.append("]");
-
-	    return sb.toString();
+		final StringBuilder sb = new StringBuilder(256);
+		sb.append("env items ").append(World.getInstance().getVisibleObjectsInRange(player, Item.class, GROUND_ITEM_RANGE).size());
+		
+		final List<Attackable> monsters = new ArrayList<>(World.getInstance().getVisibleObjectsInRange(player, Attackable.class, ENV_RANGE));
+		monsters.sort((a, b) -> Double.compare(player.calculateDistance3D(a), player.calculateDistance3D(b)));
+		for (int i = 0; (i < monsters.size()) && (i < ENV_MAX_MONSTERS); i++)
+		{
+			final Attackable monster = monsters.get(i);
+			sb.append("; ").append(monster.getId()).append('#').append(monster.getObjectId());
+			sb.append(" L").append(monster.getLevel());
+			sb.append(" d").append((int) player.calculateDistance3D(monster));
+			sb.append(" hp").append((monster.getMaxHp() > 0) ? (int) Math.round((monster.getCurrentHp() * 100) / monster.getMaxHp()) : 0);
+			final String others = otherAttackers(monster, player);
+			if (!others.isEmpty())
+			{
+				sb.append(" by:").append(others);
+			}
+		}
+		return sb.toString();
 	}
 	
-	// ========================================================================
-	// Skills Updated Helper
-	// ========================================================================
-	
-	private static String getSkillsUpdatedInfo(Player player)
+	/** Players (or the owners of their summons) on the monster's aggro list, other than {@code self}. */
+	private static String otherAttackers(Attackable monster, Player self)
 	{
 		final StringBuilder sb = new StringBuilder();
-		
-		sb.append("[Active:");
-		boolean first = true;
-		for (java.util.Map.Entry<Integer, Skill> entry : player.getSkills().entrySet())
+		for (AggroInfo info : monster.getAggroList().values())
 		{
-			final Skill skill = entry.getValue();
-			if (!skill.isPassive())
+			final Creature attacker = info.getAttacker();
+			final Player player = attacker.isPlayer() ? attacker.asPlayer() : attacker.isSummon() ? attacker.asSummon().getOwner() : null;
+			if ((player == null) || (player == self) || ((info.getDamage() <= 0) && (info.getHate() <= 0)))
 			{
-				if (!first) sb.append(",");
-				sb.append(skill.getId()).append("-").append(skill.getLevel());
-				first = false;
+				continue;
 			}
-		}
-		sb.append("] ");
-		
-		sb.append("[Passive:");
-		first = true;
-		for (java.util.Map.Entry<Integer, Skill> entry : player.getSkills().entrySet())
-		{
-			final Skill skill = entry.getValue();
-			if (skill.isPassive())
+			if (sb.length() > 0)
 			{
-				if (!first) sb.append(",");
-				sb.append(skill.getId()).append("-").append(skill.getLevel());
-				first = false;
+				sb.append(',');
 			}
+			sb.append(player.getName());
 		}
-		sb.append("]");
-		
 		return sb.toString();
+	}
+	
+	/** Skill reuse still running, or {@code null}. */
+	private static String cd(Player player)
+	{
+		final Map<Integer, TimeStamp> stamps = player.getSkillReuseTimeStamps();
+		if ((stamps == null) || stamps.isEmpty())
+		{
+			return null;
+		}
+		
+		final StringBuilder sb = new StringBuilder("cd ");
+		boolean first = true;
+		for (TimeStamp stamp : stamps.values())
+		{
+			final long remaining = stamp.getRemaining();
+			if (remaining > 0)
+			{
+				if (!first)
+				{
+					sb.append(',');
+				}
+				sb.append(stamp.getSkillId()).append(':').append(remaining);
+				first = false;
+			}
+		}
+		return first ? null : sb.toString();
+	}
+	
+	/** The {@code | me | sel | env | cd} tail of an action line. */
+	private static String tail(Player player, WorldObject target, boolean casting)
+	{
+		final StringBuilder sb = new StringBuilder(512);
+		sb.append(" | ").append(me(player, casting));
+		final String sel = sel(player, target);
+		if (sel != null)
+		{
+			sb.append(" | ").append(sel);
+		}
+		sb.append(" | ").append(env(player));
+		final String cd = cd(player);
+		if (cd != null)
+		{
+			sb.append(" | ").append(cd);
+		}
+		return sb.toString();
+	}
+	
+	private static String stats(Player player)
+	{
+		return "L" + player.getLevel() + " exp " + player.getExp() + " sp " + player.getSp() + " patk " + (int) player.getPAtk(player) + " matk " + (int) player.getMAtk(player, null) + " pdef " + (int) player.getPDef(player) + " mdef " + (int) player.getMDef(player, null) + " acc " + player.getAccuracy() + " crit " + player.getCriticalHit(player, null) + " eva " + player.getEvasionRate(player) + " aspd " + player.getPAtkSpd() + " cspd " + player.getMAtkSpd() + " str " + player.getSTR() + " int " + player.getINT() + " dex " + player.getDEX() + " con " + player.getCON() + " wit " + player.getWIT();
+	}
+	
+	private static String equipment(Player player)
+	{
+		final StringBuilder sb = new StringBuilder(256);
+		for (int i = 0; i < SLOTS.length; i++)
+		{
+			final Item item = player.getInventory().getPaperdollItem(SLOTS[i]);
+			if (i > 0)
+			{
+				sb.append(' ');
+			}
+			sb.append(SLOT_NAMES[i]).append(' ');
+			if (item == null)
+			{
+				sb.append('-');
+			}
+			else
+			{
+				sb.append(item.getTemplate().getName()).append('[').append(item.getId()).append(']');
+			}
+		}
+		return sb.toString();
+	}
+	
+	private static String skills(Player player)
+	{
+		final StringBuilder active = new StringBuilder();
+		final StringBuilder passive = new StringBuilder();
+		for (Skill skill : player.getSkills().values())
+		{
+			final StringBuilder sb = skill.isPassive() ? passive : active;
+			if (sb.length() > 0)
+			{
+				sb.append(',');
+			}
+			sb.append(skill.getId()).append('-').append(skill.getLevel());
+		}
+		return "active " + (active.length() > 0 ? active : "-") + " passive " + (passive.length() > 0 ? passive : "-");
+	}
+	
+	/** Writes the {@code STATS} / {@code EQUIP} lines of a character whose state changed since its last line. */
+	private static void state(Player player)
+	{
+		final String stats = stats(player);
+		if (!stats.equals(_lastStats.put(player.getObjectId(), stats)))
+		{
+			LOGGER.info(player.getName() + " STATS " + stats);
+		}
+		final String equipment = equipment(player);
+		if (!equipment.equals(_lastEquip.put(player.getObjectId(), equipment)))
+		{
+			LOGGER.info(player.getName() + " EQUIP " + equipment);
+		}
+	}
+	
+	/** Writes an action line with its state lines and tail. */
+	private static void action(Player player, String event, WorldObject target, boolean casting)
+	{
+		state(player);
+		LOGGER.info(player.getName() + " " + event + tail(player, target, casting));
+		flush();
+	}
+	
+	private static String skillRef(Skill skill)
+	{
+		return (skill == null) ? "-" : skill.getName() + "[" + skill.getId() + "]";
 	}
 	
 	// ========================================================================
@@ -460,15 +385,19 @@ public class PlayerActionLogger
 	
 	public static void logSkillsUpdated(Player player)
 	{
-		if (player == null) return;
-		final String skillsInfo = getSkillsUpdatedInfo(player);
-		LOGGER.info("[" + player.getName() + "] [SkillsUpdated]: " + skillsInfo + " " + buildLogSuffix(player, player.getTarget(), player.isCastingNow()));
-		flush();
+		if ((player == null) || isAgent(player)) return;
+		final String skills = skills(player);
+		if (!skills.equals(_lastSkills.put(player.getObjectId(), skills)))
+		{
+			state(player);
+			LOGGER.info(player.getName() + " SKILLS " + skills);
+			flush();
+		}
 	}
-
+	
 	public static void logTargetSelect(Player player, WorldObject target)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		
 		final long key = ((long) player.getObjectId() << 32) | (target != null ? target.getObjectId() : 0);
 		final Long lastTime = _targetSelectLogTimes.get(key);
@@ -476,101 +405,81 @@ public class PlayerActionLogger
 		if ((lastTime != null) && ((now - lastTime) < TARGET_SELECT_LOG_COOLDOWN)) return;
 		_targetSelectLogTimes.put(key, now);
 		
-		LOGGER.info("[" + player.getName() + "] [selected target]: " + getActionTarget(target) + " " + buildLogSuffix(player, target, player.isCastingNow()));
-		flush();
+		action(player, "TARGET " + ref(target), target, player.isCastingNow());
 	}
-
+	
 	public static void logMove(Player player, int x, int y, int z)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		
 		WorldObject target = player.getTarget();
-		String navInfo = getNavInfo(player, target);
-		// Clear dead targets from navigation to avoid phantom target tracking
-		if ((target instanceof Creature) && ((((Creature) target).getCurrentHp() / ((Creature) target).getMaxHp()) == 0.0))
+		// Dead targets are left out, so a corpse is not tracked as a target.
+		if ((target instanceof Creature) && (((Creature) target).getCurrentHp() <= 0))
 		{
-			navInfo = "[Nav:None]";
+			target = null;
 		}
-		
-		LOGGER.info("[" + player.getName() + "] [moved to]: [" + x + "," + y + "," + z + "] " + getCharStatus(player) + " " + getCharStats(player) + " " + getEquipmentInfo(player) + " " + getSpatialInfo(player, player.isCastingNow()) + " " + navInfo + " " + getEnvironmentRadar(player) + " " + getCooldownInfo(player));
-		flush();
+		action(player, "MOVE " + x + "," + y + "," + z, target, player.isCastingNow());
 	}
-
+	
 	public static void logAttack(Player player, WorldObject target)
 	{
-		if (player == null) return;
-		LOGGER.info("[" + player.getName() + "] [attacked]: " + getActionTarget(target) + " " + buildLogSuffix(player, target, player.isCastingNow()));
-		flush();
+		if ((player == null) || isAgent(player)) return;
+		action(player, "ATTACK " + ref(target), target, player.isCastingNow());
 	}
-
+	
 	public static void logSkillUse(Player player, int skillId, String skillName, WorldObject target)
 	{
-		if (player == null) return;
-		LOGGER.info("[" + player.getName() + "] [used skill]: " + skillName + "[" + skillId + "] on " + getActionTarget(target) + " " + buildLogSuffix(player, target, player.isCastingNow()));
-		flush();
+		if ((player == null) || isAgent(player)) return;
+		action(player, "SKILL " + skillName + "[" + skillId + "] -> " + ref(target), target, player.isCastingNow());
 	}
-
+	
 	public static void logShotAutoUse(Player player, Item item, boolean enabled)
 	{
-		if ((player == null) || (item == null)) return;
-		final String state = enabled ? "enabled" : "disabled";
-		LOGGER.info("[" + player.getName() + "] " + state + " auto-use for item: " + item.getTemplate().getName() + " (Item ID: " + item.getId() + ")");
+		if ((player == null) || (item == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " AUTOSHOT " + (enabled ? "on " : "off ") + item.getTemplate().getName() + "[" + item.getId() + "]");
 		flush();
 	}
-
+	
 	public static void logItemUse(Player player, Item item)
 	{
-		if ((player == null) || (item == null)) return;
-		LOGGER.info("[" + player.getName() + "] [used item]: " + item.getTemplate().getName() + " [Remaining: " + item.getCount() + "]");
+		if ((player == null) || (item == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " ITEM " + item.getTemplate().getName() + "[" + item.getId() + "] left " + item.getCount());
 		flush();
 	}
-
+	
 	public static void logAction(Player player, String actionName, String details)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		
-		String navInfo = getNavInfo(player, player.getTarget());
-		if ((actionName != null) && actionName.toLowerCase().contains("pickup"))
+		WorldObject target = player.getTarget();
+		final boolean pickup = (actionName != null) && actionName.toLowerCase().contains("pickup");
+		if (pickup && (target instanceof Creature) && (((Creature) target).getCurrentHp() <= 0))
 		{
-			final WorldObject target = player.getTarget();
-			if ((target instanceof Creature) && ((((Creature) target).getCurrentHp() / ((Creature) target).getMaxHp()) == 0.0))
-			{
-				navInfo = "[Nav:None]";
-			}
+			target = null;
 		}
-		
-		LOGGER.info("[" + player.getName() + "] [performed action]: " + actionName + " - " + details + " " + getCharStatus(player) + " " + getCharStats(player) + " " + getEquipmentInfo(player) + " " + getSpatialInfo(player, player.isCastingNow()) + " " + navInfo + " " + getEnvironmentRadar(player) + " " + getCooldownInfo(player));
+		action(player, (pickup ? "PICKUP " : "ACTION " + actionName + " ") + details, target, player.isCastingNow());
 	}
-
+	
 	public static void logMobKillDrop(Player player, String mobName, String itemName, long itemCount, boolean autoLooted)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		
-		String killedDetails = mobName;
 		final WorldObject currentTarget = player.getTarget();
-		if ((currentTarget != null) && currentTarget.isNpc() && currentTarget.getName().equals(mobName))
-		{
-			killedDetails = getActionTarget(currentTarget);
-		}
-		
-		LOGGER.info("[" + player.getName() + "] [killed]: " + killedDetails + " [dropped]: " + itemName + "[" + itemCount + "]" + (autoLooted ? " auto-looted" : " ground") + " " + buildLogSuffix(player, player.getTarget(), false));
+		final String killed = ((currentTarget != null) && currentTarget.isNpc() && currentTarget.getName().equals(mobName)) ? ref(currentTarget) : mobName;
+		state(player);
+		LOGGER.info(player.getName() + " KILL " + killed + " drop " + itemName + "[" + itemCount + "] " + (autoLooted ? "auto" : "ground") + tail(player, currentTarget, false));
 	}
-
+	
 	public static void logShotUsage(Player player, String shotName, long remainingCount)
 	{
-		if (player == null) return;
-		final String timestamp;
-		synchronized (SHOT_TIMESTAMP_FORMAT)
-		{
-			timestamp = SHOT_TIMESTAMP_FORMAT.format(new Date());
-		}
-		LOGGER.info("[" + timestamp + "] [" + player.getName() + "] used " + shotName + " | Remaining: " + remainingCount);
+		if ((player == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " SHOT " + shotName + " left " + remainingCount);
 		flush();
 	}
-
+	
 	public static void logDamageTaken(Player player, double damage, Creature attacker, Skill skill)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		
 		final long key = ((long) player.getObjectId() << 32) | (attacker != null ? attacker.getObjectId() : 0);
 		final Long lastTime = _damageLogTimes.get(key);
@@ -578,17 +487,12 @@ public class PlayerActionLogger
 		if ((lastTime != null) && ((now - lastTime) < DAMAGE_LOG_COOLDOWN)) return;
 		_damageLogTimes.put(key, now);
 		
-		final String skillName = skill != null ? skill.getName() : "N/A";
-		String damageStr = (int) damage + "";
-		if (damage == 0) damageStr = "0 (MISS/BLOCK)";
-		
-		LOGGER.info("[" + player.getName() + "] [took damage]: " + damageStr + " from: " + getActionTarget(attacker) + " skill: " + skillName + " " + buildLogSuffix(player, attacker, player.isCastingNow()));
-		flush();
+		action(player, "HIT " + (damage == 0 ? "miss" : String.valueOf((int) damage)) + " <- " + ref(attacker) + " skill " + skillRef(skill), attacker, player.isCastingNow());
 	}
-
+	
 	public static void logDamageInflicted(Player player, double damage, Creature target, Skill skill)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		
 		final long key = ((long) player.getObjectId() << 32) | (target != null ? target.getObjectId() : 0);
 		final Long lastTime = _damageLogTimes.get(key);
@@ -596,37 +500,50 @@ public class PlayerActionLogger
 		if ((lastTime != null) && ((now - lastTime) < DAMAGE_LOG_COOLDOWN)) return;
 		_damageLogTimes.put(key, now);
 		
-		final String skillName = skill != null ? skill.getName() : "N/A";
-		String damageStr = (int) damage + "";
-		if (damage == 0) damageStr = "0 (MISS/BLOCK)";
-		
-		LOGGER.info("[" + player.getName() + "] [inflicted damage]: " + damageStr + " to: " + getActionTarget(target) + " skill: " + skillName + " " + buildLogSuffix(player, target, false));
-		flush();
+		action(player, "DMG " + (damage == 0 ? "miss" : String.valueOf((int) damage)) + " -> " + ref(target) + " skill " + skillRef(skill), target, false);
 	}
-
+	
 	public static void logBuffsDebuffs(Player player)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		final int playerId = player.getObjectId();
 		final Long lastTime = _buffDebuffLogTimes.get(playerId);
 		final long now = System.currentTimeMillis();
 		if ((lastTime != null) && ((now - lastTime) < BUFF_DEBUFF_LOG_COOLDOWN)) return;
 		_buffDebuffLogTimes.put(playerId, now);
 		
-		LOGGER.info("[" + player.getName() + "] [active effects]: " + getBuffDebuffInfo(player) + " " + buildLogSuffix(player, player.getTarget(), player.isCastingNow()));
+		action(player, "EFFECTS buffs " + effects(player.getEffectList().getBuffs()) + " debuffs " + effects(player.getEffectList().getDebuffs()), player.getTarget(), player.isCastingNow());
 	}
-
+	
+	private static String effects(Queue<BuffInfo> infos)
+	{
+		if (infos.isEmpty())
+		{
+			return "-";
+		}
+		final StringBuilder sb = new StringBuilder();
+		for (BuffInfo info : infos)
+		{
+			if (sb.length() > 0)
+			{
+				sb.append(',');
+			}
+			sb.append(skillRef(info.getSkill())).append(':').append(info.getTime()).append('s');
+		}
+		return sb.toString();
+	}
+	
 	public static void logEffectApplied(Player player, BuffInfo info)
 	{
-		if ((player == null) || (info == null) || (info.getSkill() == null)) return;
+		if ((player == null) || (info == null) || (info.getSkill() == null) || isAgent(player)) return;
 		final Skill skill = info.getSkill();
-		final String effectType = skill.isDebuff() ? "Debuff" : "Buff";
-		LOGGER.info("[" + player.getName() + "] [effect applied]: " + effectType + " - " + skill.getName() + "[" + skill.getId() + "] duration:" + info.getTime() + "s " + buildLogSuffix(player, player.getTarget(), player.isCastingNow()));
+		state(player);
+		LOGGER.info(player.getName() + " EFFECT " + (skill.isDebuff() ? "debuff " : "buff ") + skillRef(skill) + " " + info.getTime() + "s" + tail(player, player.getTarget(), player.isCastingNow()));
 	}
-
+	
 	public static void logSkills(Player player)
 	{
-		if (player == null) return;
+		if ((player == null) || isAgent(player)) return;
 		final int playerId = player.getObjectId();
 		final Long lastTime = _skillsLogTimes.get(playerId);
 		final long now = System.currentTimeMillis();
@@ -636,76 +553,48 @@ public class PlayerActionLogger
 	}
 	
 	// -------------------------------------------------------------------------
-	// 1. ECONOMY: Item Purchases / Sales
+	// Economy, progression, travel, life state
 	// -------------------------------------------------------------------------
-
+	
 	public static void logItemPurchase(Player player, String itemName, int itemId, long count, long price, String npcName, int npcId)
 	{
-		if (player == null) return;
-		final String timestamp;
-		synchronized (SHOT_TIMESTAMP_FORMAT) { timestamp = SHOT_TIMESTAMP_FORMAT.format(new Date()); }
-		LOGGER.info("[" + timestamp + "] [" + player.getName() + "] BUY Item: " + itemName + " (ID: " + itemId + "), Count: " + count + ", Price: " + price + " Adena (NPC: " + npcName + ", ID: " + npcId + ")");
+		if ((player == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " BUY " + itemName + "[" + itemId + "] x" + count + " price " + price + " npc " + npcName + "[" + npcId + "]");
 		flush();
 	}
-
+	
 	public static void logItemSell(Player player, String itemName, int itemId, long count, long price, String npcName, int npcId)
 	{
-		if (player == null) return;
-		final String timestamp;
-		synchronized (SHOT_TIMESTAMP_FORMAT) { timestamp = SHOT_TIMESTAMP_FORMAT.format(new Date()); }
-		LOGGER.info("[" + timestamp + "] [" + player.getName() + "] SELL Item: " + itemName + " (ID: " + itemId + "), Count: " + count + ", Price: " + price + " Adena (NPC: " + npcName + ", ID: " + npcId + ")");
+		if ((player == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " SELL " + itemName + "[" + itemId + "] x" + count + " price " + price + " npc " + npcName + "[" + npcId + "]");
 		flush();
 	}
-
-	// -------------------------------------------------------------------------
-	// 2. CHARACTER PROGRESSION: Skill Learning
-	// -------------------------------------------------------------------------
-
+	
 	public static void logSkillLearned(Player player, String skillName, int skillId, int skillLevel, int spCost, long adenaCost)
 	{
-		if (player == null) return;
-		final String timestamp;
-		synchronized (SHOT_TIMESTAMP_FORMAT) { timestamp = SHOT_TIMESTAMP_FORMAT.format(new Date()); }
-		final StringBuilder costStr = new StringBuilder();
-		if (spCost > 0) costStr.append(spCost).append(" SP");
-		if (adenaCost > 0) { if (costStr.length() > 0) costStr.append("/"); costStr.append(adenaCost).append(" Adena"); }
-		if (costStr.length() == 0) costStr.append("0 SP");
-		LOGGER.info("[" + timestamp + "] [" + player.getName() + "] learned skill: " + skillName + " (ID: " + skillId + ", Level: " + skillLevel + ") [Cost: " + costStr.toString() + "]");
+		if ((player == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " LEARN " + skillName + "[" + skillId + "] L" + skillLevel + " cost " + spCost + "sp" + (adenaCost > 0 ? " " + adenaCost + "a" : ""));
 		flush();
 	}
-
-	// -------------------------------------------------------------------------
-	// 3. MOVEMENT & TRAVEL: Teleportation
-	// -------------------------------------------------------------------------
-
+	
 	public static void logTeleport(Player player, int fromX, int fromY, int fromZ, int toX, int toY, int toZ, String method)
 	{
-		if (player == null) return;
-		final String timestamp;
-		synchronized (SHOT_TIMESTAMP_FORMAT) { timestamp = SHOT_TIMESTAMP_FORMAT.format(new Date()); }
-		LOGGER.info("[" + timestamp + "] [" + player.getName() + "] teleported from [" + fromX + "," + fromY + "," + fromZ + "] to [" + toX + "," + toY + "," + toZ + "] via [Method: " + method + "]");
+		if ((player == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " TELEPORT " + fromX + "," + fromY + "," + fromZ + " -> " + toX + "," + toY + "," + toZ + " via " + method);
 		flush();
 	}
-
-	// -------------------------------------------------------------------------
-	// 4. LIFE STATE: Death & Resurrection
-	// -------------------------------------------------------------------------
-
+	
 	public static void logDeath(Player player, String killerName, int killerId)
 	{
-		if (player == null) return;
-		final String timestamp;
-		synchronized (SHOT_TIMESTAMP_FORMAT) { timestamp = SHOT_TIMESTAMP_FORMAT.format(new Date()); }
-		LOGGER.info("[" + timestamp + "] [" + player.getName() + "] DIED at [" + player.getX() + "," + player.getY() + "," + player.getZ() + "]. Killer: " + killerName + " (ID: " + killerId + ")");
+		if ((player == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " DIED @" + player.getX() + "," + player.getY() + "," + player.getZ() + " killer " + killerName + "[" + killerId + "]");
 		flush();
 	}
-
+	
 	public static void logResurrection(Player player, String method)
 	{
-		if (player == null) return;
-		final String timestamp;
-		synchronized (SHOT_TIMESTAMP_FORMAT) { timestamp = SHOT_TIMESTAMP_FORMAT.format(new Date()); }
-		LOGGER.info("[" + timestamp + "] [" + player.getName() + "] RESURRECTED at [" + player.getX() + "," + player.getY() + "," + player.getZ() + "] via [Method: " + method + "]");
+		if ((player == null) || isAgent(player)) return;
+		LOGGER.info(player.getName() + " REVIVED @" + player.getX() + "," + player.getY() + "," + player.getZ() + " via " + method);
 		flush();
 	}
 }

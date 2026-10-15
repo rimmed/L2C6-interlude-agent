@@ -269,13 +269,19 @@ PLAYER_OBJECT_TYPES: Final[frozenset[str]] = frozenset(
 GENERIC_NPC_OBJECT_TYPES: Final[frozenset[str]] = frozenset({"", "monster", "npc", "l2npc", "creature"})
 
 # The Arrow type of one ``nearby_objects`` element, used to rebuild the list.
-ENV_STRUCT_SQL: Final = "STRUCT(type VARCHAR, name VARCHAR, id BIGINT, lvl BIGINT, distance DOUBLE)"
+# ``object_id`` / ``hp_pct`` / ``attackers`` (other players hitting the monster) exist in format-2 logs only.
+ENV_STRUCT_SQL: Final = (
+    "STRUCT(type VARCHAR, name VARCHAR, id BIGINT, lvl BIGINT, distance DOUBLE, object_id BIGINT, hp_pct DOUBLE, "
+    "attackers VARCHAR[])"
+)
 
 # ``selected_target`` lines carry the target name up to the character-status block
 # (or, for a monster, the ``| HP:`` block that follows it). Everything after that —
 # notably the ``[Env: …]`` trailer — must never be searched for ``NPC_ID``.
 TARGET_HEADER_REGEX: Final = r"^\[selected target\]: (.*?)(?:\[CharStatus|\| HP:|\[Env:)"
 TARGET_NPC_ID_REGEX: Final = r"\(NPC_ID:(\d+)"
+# Format 2 (``playeraction_v2.py``): ``TARGET Name#objectId(npcId Llvl) hp ..`` - the npc id follows the object id.
+TARGET_V2_NPC_ID_REGEX: Final = r"^TARGET .+?#(?:\d+|\?)\((\d+) L\d+\)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -452,7 +458,7 @@ def clean_environment(con: duckdb.DuckDBPyConnection, actions: Path, cfg: Cleani
         f"""
         CREATE OR REPLACE TABLE cleaned_env AS
         WITH exploded AS (
-            SELECT r.rid, e.type, e.name, e.id, e.lvl, e.distance
+            SELECT r.rid, e.type, e.name, e.id, e.lvl, e.distance, e.object_id, e.hp_pct, e.attackers
             FROM rows r, UNNEST(r.{ENV_COLUMN}) AS t(e)
             WHERE e.distance <= {cfg.max_monster_distance}
         ),
@@ -466,7 +472,8 @@ def clean_environment(con: duckdb.DuckDBPyConnection, actions: Path, cfg: Cleani
         ),
         ranked AS (
             SELECT rid,
-                   struct_pack(type := type, name := name, id := id, lvl := lvl, distance := distance) AS obj,
+                   struct_pack(type := type, name := name, id := id, lvl := lvl, distance := distance,
+                               object_id := object_id, hp_pct := hp_pct, attackers := attackers) AS obj,
                    row_number() OVER (PARTITION BY rid ORDER BY distance ASC, id ASC) AS rn
             FROM relevant
         )
@@ -517,6 +524,8 @@ def extract_target_npc_ids(light: pd.DataFrame, cfg: CleaningConfig) -> NDArray[
 
         [selected target]: Venomous Spider (NPC_ID:20038, Lvl:18) | HP:0.0/476.0 …  -> 20038
         [selected target]: Superior Herb of Life [CharStatus: HP:607.0/607 …]       -> -1
+        TARGET Venomous Spider#268451514(20038 L18) hp 476/476 | me …               -> 20038 (format 2)
+        TARGET Superior Herb of Life#268460001(item 8603) | me …                   -> -1
 
     The ``[Env: …]`` trailer of the same line also lists ``(NPC_ID:…)`` for every
     nearby monster, so a naive search would turn each item pickup into a monster
@@ -530,7 +539,9 @@ def extract_target_npc_ids(light: pd.DataFrame, cfg: CleaningConfig) -> NDArray[
 
     raw = pd.Series(light["action_raw"].to_numpy()[target_rows], dtype="string")
     header = raw.str.extract(TARGET_HEADER_REGEX, expand=False).fillna(raw)
-    found = pd.to_numeric(header.str.extract(TARGET_NPC_ID_REGEX, expand=False), errors="coerce").to_numpy()
+    found_v1 = pd.to_numeric(header.str.extract(TARGET_NPC_ID_REGEX, expand=False), errors="coerce")
+    found_v2 = pd.to_numeric(raw.str.extract(TARGET_V2_NPC_ID_REGEX, expand=False), errors="coerce")
+    found = found_v2.fillna(found_v1).to_numpy(dtype=float)
     npc_id[target_rows] = np.where(np.isnan(found), -1, found).astype(np.int64)
     return npc_id
 

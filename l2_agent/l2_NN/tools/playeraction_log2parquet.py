@@ -51,6 +51,11 @@ from pathlib import Path
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+try:  # run as a script from l2_NN/tools, or imported as part of the l2_NN package
+    import playeraction_v2 as v2
+except ImportError:  # pragma: no cover
+    from l2_NN.tools import playeraction_v2 as v2
+
 # Repository root, so the default datapack tables are found from any CWD.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_NPC_PARQUET = _REPO_ROOT / "l2jc6_npcs.parquet"
@@ -541,6 +546,7 @@ ROW_FIELDS = (
     "action_method",
     # links resolved against l2jc6_npcs.parquet / l2jc6_items.parquet
     "entity_name",
+    "entity_object_id",
     "entity_kind",
     "entity_ambiguous",
     "entity_npc_id",
@@ -935,8 +941,199 @@ def _prefix_action(message: str) -> str | None:
     return None
 
 
-def parse_log_line(line: str, resolver: EntityResolver, source_file: str, line_no: int) -> dict | None:
-    """Parse one log line into a flat row, or ``None`` when it is not an action line."""
+# Format-2 event -> action_type (the same labels as format 1, see ACTION_LABELS).
+V2_ACTIONS = {
+    "TARGET": "selected_target", "MOVE": "moved", "ATTACK": "attacked", "SKILL": "used_skill",
+    "DMG": "inflicted_damage", "HIT": "took_damage", "KILL": "killed", "PICKUP": "pickup",
+    "ACTION": "performed_action", "ITEM": "used_item", "EFFECT": "effect_applied", "EFFECTS": "active_effects",
+    "SHOT": "shot_used", "BUY": "buy", "SELL": "sell", "LEARN": "learned_skill", "TELEPORT": "teleported",
+    "DIED": "died", "REVIVED": "resurrected", "SKILLS": "skills_updated", "NOTE": "other",
+}
+V2_SLOTS = dict(zip(v2.SLOT_KEYS, SLOTS))
+V2_STATS = {"patk": "p_atk", "matk": "m_atk", "pdef": "p_def", "mdef": "m_def", "acc": "accur", "crit": "crit_rate",
+            "eva": "evasion", "aspd": "atk_speed", "cspd": "cast_speed", "str": "str", "int": "int", "dex": "dex",
+            "con": "con", "wit": "wit"}
+V2_DAMAGE = re.compile(r"^(?P<damage>miss|\d+) (?:->|<-) (?P<ref>.+) skill (?P<skill>.+)$")
+V2_KILL = re.compile(r"^(?P<ref>.+) drop (?P<item>.+)\[(?P<count>\d+)\] (?P<how>auto|ground)$")
+V2_TRADE = re.compile(r"^(?P<item>.+)\[(?P<item_id>\d+)\] x(?P<count>\d+) price (?P<price>\d+) npc (?P<npc>.+)\[(?P<npc_id>\d+)\]$")
+V2_LEARN = re.compile(r"^(?P<skill>.+)\[(?P<skill_id>\d+)\] L(?P<level>\d+) cost (?P<sp>\d+)sp")
+V2_POINT = re.compile(r"(-?\d+),(-?\d+),(-?\d+)")
+
+
+def _v2_link_ref(row: dict, resolver: EntityResolver, ref: dict | None, character: str) -> None:
+    """Link a format-2 reference: authoritative npc / item ids, the world object id and the target HP."""
+    if ref is None:
+        return
+    if ref["kind"] == "item":
+        _link_item(row, resolver, name=ref["name"], item_id=ref.get("item_id"))
+    else:
+        _link_entity(row, resolver, name=ref["name"], character=character, npc_id=ref.get("npc_id"))
+    row["entity_object_id"] = ref.get("object_id")
+    if "hp" in ref:
+        row["target_hp"], row["target_max_hp"] = float(ref["hp"]), float(ref["max_hp"])
+
+
+def _v2_apply_state(row: dict, state: v2.CharacterState) -> None:
+    """The character's last STATS / EQUIP / SKILLS on every row, as format 1 had them on every line."""
+    stats = state.stats
+    if stats:
+        row["lvl"] = stats.get("level")
+        row["exp"] = stats.get("exp")
+        row["sp"] = stats.get("sp")
+        values = {old: stats.get(new) for new, old in V2_STATS.items()}
+        if values["atk_speed"] is not None:
+            values["atk_speed"] = float(values["atk_speed"])
+        row["char_stats"] = values
+    if state.equip:
+        row["equipment"] = {V2_SLOTS[slot]: name for slot, (name, _) in state.equip.items()}
+        row["equipment_ids"] = {V2_SLOTS[slot]: item_id for slot, (_, item_id) in state.equip.items()}
+
+
+def parse_v2_line(line: str, resolver: EntityResolver, source_file: str, line_no: int,
+                  states: dict[str, v2.CharacterState]) -> dict | None:
+    """Parse a format-2 line (see ``playeraction_v2.py``); STATS / EQUIP lines only update the state."""
+    m = v2.LINE.match(line)
+    character, event, rest = m.group("character"), m.group("event"), m.group("rest") or ""
+    state = states.setdefault(character, v2.CharacterState())
+    if event == "STATS":
+        state.stats = v2.parse_stats(rest)
+        return None
+    if event == "EQUIP":
+        state.equip = {slot: (name, item_id if item_id is not None else (
+            (resolver.resolve_item(name=name) or {}).get("id") if name else None))
+            for slot, (name, item_id) in v2.parse_equip(rest).items()}
+        return None
+
+    row: dict = dict.fromkeys(ROW_FIELDS)
+    row["source_file"] = source_file
+    row["line_no"] = line_no
+    row["timestamp"] = f"{m.group('date')} {m.group('time').replace('.', ',')}"
+    row["character_id"] = resolver.character_id(character)
+    row["action_raw"] = f"{event} {rest}".strip()
+    action_type = V2_ACTIONS.get(event, "other")
+    payload, blocks = v2.split_tail(rest)
+    if event == "AUTOSHOT":
+        action_type = "autouse_enabled" if payload.startswith("on ") else "autouse_disabled"
+    row["action_type"] = action_type
+    _v2_apply_state(row, state)
+
+    if "me" in blocks:
+        me = v2.parse_me(blocks["me"])
+        for key in ("hp", "max_hp", "mp", "max_mp", "cp", "max_cp"):
+            row[key] = me.get(key)
+        row["lvl"] = me.get("level", row["lvl"])
+        row["pos_x"], row["pos_y"], row["pos_z"] = me.get("x"), me.get("y"), me.get("z")
+        row["head"] = me.get("heading")
+        row["weight_pct"] = me.get("weight_pct")
+        row["is_sitting"], row["is_casting"] = me["sit"], me["cast"]
+        row["is_attacking"], row["is_dead"], row["in_combat"] = me["atk"], me["dead"], me["combat"]
+    if "sel" in blocks:
+        sel = v2.parse_sel(blocks["sel"])
+        row["selected_distance"], row["selected_los"], row["selected_head"] = (
+            sel.get("distance"), sel.get("los"), sel.get("heading"))
+    if "env" in blocks:
+        env = v2.parse_env(blocks["env"])
+        row["ground_items"] = env["items"]
+        monsters = []
+        for mob in env["monsters"]:
+            info = resolver.resolve_npc(npc_id=mob["npc_id"])
+            monsters.append({"type": "monster", "name": info["name"] if info else None, "id": mob["npc_id"],
+                             "lvl": mob["level"], "distance": mob["distance"], "object_id": mob["object_id"],
+                             "hp_pct": mob["hp_pct"], "attackers": mob["attackers"] or None})
+        row["nearby_count"] = len(monsters)
+        row["nearby_objects"] = monsters or None
+    if "cd" in blocks:
+        row["cooldown_raw"] = blocks["cd"]
+        row["cooldowns"] = [{"skill_id": sid, "remaining": ms} for sid, ms in v2.parse_cd(blocks["cd"])] or None
+
+    if event in ("TARGET", "ATTACK"):
+        _v2_link_ref(row, resolver, v2.parse_ref(payload), character)
+    elif event == "MOVE":
+        point = V2_POINT.match(payload)
+        if point:
+            row["move_x"], row["move_y"], row["move_z"] = (int(v) for v in point.groups())
+    elif event == "SKILL":
+        skill, _, ref = payload.partition(" -> ")
+        row["skill_name"], row["skill_id"] = v2.named_id(skill)
+        _v2_link_ref(row, resolver, v2.parse_ref(ref), character)
+    elif event in ("DMG", "HIT"):
+        dmg = V2_DAMAGE.match(payload)
+        if dmg:
+            row["is_miss"] = dmg.group("damage") == "miss"
+            row["damage"] = 0 if row["is_miss"] else int(dmg.group("damage"))
+            if dmg.group("skill") != "-":
+                row["skill_name"], row["skill_id"] = v2.named_id(dmg.group("skill"))
+            _v2_link_ref(row, resolver, v2.parse_ref(dmg.group("ref")), character)
+    elif event == "KILL":
+        kill = V2_KILL.match(payload)
+        if kill:
+            _v2_link_ref(row, resolver, v2.parse_ref(kill.group("ref")), character)
+            _link_drop(row, resolver, name=kill.group("item"), count=int(kill.group("count")))
+    elif event in ("PICKUP", "AUTOSHOT"):
+        name, item_id = v2.named_id(payload.split(" ", 1)[1] if event == "AUTOSHOT" else payload)
+        if item_id is not None:
+            resolver.observe_item(name, item_id)
+        _link_item(row, resolver, name=name, item_id=item_id)
+    elif event == "ITEM":
+        item, _, left = payload.rpartition(" left ")
+        name, item_id = v2.named_id(item)
+        _link_item(row, resolver, name=name, item_id=item_id)
+        row["item_remaining"] = _to_int(left)
+    elif event == "EFFECT":
+        kind, _, rest_effect = payload.partition(" ")
+        skill, _, duration = rest_effect.rpartition(" ")
+        row["effect_kind"] = kind.capitalize()
+        row["effect_name"], row["effect_id"] = v2.named_id(skill)
+        row["effect_duration"] = _to_int(duration.rstrip("s"))
+    elif event in ("BUY", "SELL"):
+        trade = V2_TRADE.match(payload)
+        if trade:
+            item_id = int(trade.group("item_id"))
+            resolver.observe_item(trade.group("item"), item_id)
+            _link_item(row, resolver, name=trade.group("item"), item_id=item_id, count=int(trade.group("count")))
+            row["item_price"] = int(trade.group("price"))
+            row["vendor_npc_id"] = int(trade.group("npc_id"))
+            vendor = resolver.resolve_npc(npc_id=row["vendor_npc_id"])
+            row["vendor_npc_name"] = vendor["name"] if vendor else trade.group("npc")
+    elif event == "LEARN":
+        learn = V2_LEARN.match(payload)
+        if learn:
+            row["skill_name"], row["skill_id"] = learn.group("skill"), int(learn.group("skill_id"))
+            row["skill_level"], row["skill_cost"] = int(learn.group("level")), int(learn.group("sp"))
+    elif event == "TELEPORT":
+        points = V2_POINT.findall(payload)
+        if len(points) == 2:
+            row["teleport_from_x"], row["teleport_from_y"], row["teleport_from_z"] = (int(v) for v in points[0])
+            row["move_x"], row["move_y"], row["move_z"] = (int(v) for v in points[1])
+        row["action_method"] = payload.rpartition(" via ")[2] or None
+    elif event in ("DIED", "REVIVED"):
+        point = V2_POINT.search(payload)
+        if point:
+            row["move_x"], row["move_y"], row["move_z"] = (int(v) for v in point.groups())
+        if event == "DIED":
+            killer = payload.partition(" killer ")[2]
+            if killer:
+                _link_entity(row, resolver, name=v2.named_id(killer)[0], character=character)
+        else:
+            row["action_method"] = payload.rpartition(" via ")[2] or None
+    elif event == "SKILLS":
+        active, passive = v2.parse_skills(payload)
+        state.active, state.passive = active, passive
+        row["active_skills"] = [{"id": sid, "level": lvl} for sid, lvl in active] or None
+        row["passive_skills"] = [{"id": sid, "level": lvl} for sid, lvl in passive] or None
+
+    if action_type == "effect_applied":
+        resolver.observe_skill(row["effect_id"], row["effect_name"])
+    else:
+        resolver.observe_skill(row["skill_id"], row["skill_name"])
+    return row
+
+
+def parse_log_line(line: str, resolver: EntityResolver, source_file: str, line_no: int,
+                   states: dict | None = None) -> dict | None:
+    """Parse one log line (format 1 or 2) into a flat row, or ``None`` when it is not an action line."""
+    if v2.is_v2(line.rstrip("\n")):
+        return parse_v2_line(line.rstrip("\n"), resolver, source_file, line_no, states if states is not None else {})
     start = LINE_START.match(line)
     if start is None:
         return None
@@ -983,6 +1180,10 @@ def _build_schema() -> pa.Schema:
         ("id", pa.int64()),
         ("lvl", pa.int64()),
         ("distance", pa.float64()),
+        # format 2 only: the monster's world object id, HP % and the other players attacking it
+        ("object_id", pa.int64()),
+        ("hp_pct", pa.float64()),
+        ("attackers", pa.list_(pa.string())),
     ]))
     skill_list = pa.list_(pa.struct([("id", pa.int64()), ("level", pa.int64())]))
     cooldown_list = pa.list_(pa.struct([("skill_id", pa.int64()), ("remaining", pa.int64())]))
@@ -1012,6 +1213,7 @@ def _build_schema() -> pa.Schema:
         ("action_type", pa.string()),
         ("action_method", pa.string()),
         ("entity_name", pa.string()),
+        ("entity_object_id", pa.int64()),
         ("entity_kind", pa.string()),
         ("entity_ambiguous", pa.bool_()),
         ("entity_npc_id", pa.int64()),
@@ -1255,6 +1457,14 @@ def _learn_entities(path: Path, resolver: EntityResolver) -> None:
             if start is not None:
                 character, _ = _split_character(start.group("rest").strip())
                 resolver.observe_character(character)
+                continue
+            new = v2.LINE.match(line.rstrip("\n"))
+            if new is not None and new.group("event") in v2.EVENTS:
+                resolver.observe_character(new.group("character"))
+                if new.group("event") == "PICKUP":
+                    name, item_id = v2.named_id(v2.split_tail(new.group("rest") or "")[0])
+                    if item_id is not None:
+                        resolver.observe_item(name, item_id)
 
 
 def _fill_known_skills(rows: list[dict]) -> int:
@@ -1335,12 +1545,14 @@ def process_logs(
             print(f"Loaded {added} extra skill names from {skills_xml}")
 
     rows: list[dict] = []
+    # Format 2 writes STATS / EQUIP / SKILLS only on change: keep them per character across the files.
+    states: dict[str, v2.CharacterState] = {}
     skipped = 0
     for log_path in log_files:
         before = len(rows)
         with open(log_path, encoding="utf-8", errors="replace") as handle:
             for line_no, line in enumerate(handle, 1):
-                row = parse_log_line(line, resolver, log_path.name, line_no)
+                row = parse_log_line(line, resolver, log_path.name, line_no, states)
                 if row is None:
                     skipped += 1
                 else:
