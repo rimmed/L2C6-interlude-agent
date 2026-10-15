@@ -75,6 +75,7 @@ import org.l2jmobius.gameserver.config.custom.PrivateStoreRangeConfig;
 import org.l2jmobius.gameserver.config.custom.PvpAnnounceConfig;
 import org.l2jmobius.gameserver.config.custom.PvpRewardItemConfig;
 import org.l2jmobius.gameserver.config.custom.PvpTitleColorConfig;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
 import org.l2jmobius.gameserver.data.enums.CategoryType;
 import org.l2jmobius.gameserver.data.holders.AccessLevel;
 import org.l2jmobius.gameserver.data.holders.PetLevelData;
@@ -114,6 +115,7 @@ import org.l2jmobius.gameserver.managers.InstanceManager;
 import org.l2jmobius.gameserver.managers.ItemManager;
 import org.l2jmobius.gameserver.managers.ItemsOnGroundManager;
 import org.l2jmobius.gameserver.managers.PunishmentManager;
+import org.l2jmobius.gameserver.managers.RLAgentManager;
 import org.l2jmobius.gameserver.managers.RecipeManager;
 import org.l2jmobius.gameserver.managers.ScriptManager;
 import org.l2jmobius.gameserver.managers.SiegeManager;
@@ -12475,6 +12477,13 @@ public class Player extends Playable
 		{
 			final SystemMessage sm = new SystemMessage(SystemMessageId.YOU_HIT_FOR_S1_DAMAGE);
 			sm.addInt(damage);
+			if (RLAgentEnvironmentConfig.RL_AGENT_ENABLED && RLAgentManager.getInstance().isAgent(this))
+			{
+				// RL agents also learn whom they hit (polearms and area skills hit several monsters) and how much HP it has left.
+				sm.addInt(target.getObjectId());
+				sm.addInt((int) target.getCurrentHp());
+				sm.addInt(target.getMaxHp());
+			}
 			sendPacket(sm);
 		}
 	}

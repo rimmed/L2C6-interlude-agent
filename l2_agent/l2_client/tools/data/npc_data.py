@@ -32,6 +32,7 @@ DEFAULT_NPC_XML_PATH = "../L2J_Mobius/L2J_Mobius_CT_0_Interlude/dist/game/data/s
 
 _npc_names: dict[int, str] = {}
 _npc_levels: dict[int, int] = {}
+_npc_hp: dict[int, float] = {}
 _loaded = False
 
 
@@ -40,12 +41,13 @@ def load_npc_names(path: str = DEFAULT_NPC_XML_PATH) -> dict[int, str]:
     Parse all NPC XML files and return a {npc_id: name} lookup table.
 
     Also populates the internal ``_npc_levels`` dict with the level
-    attribute (e.g. ``<npc id="20120" level="4" …>``).
+    attribute (e.g. ``<npc id="20120" level="4" …>``) and ``_npc_hp`` with the
+    base maximum HP (``<vitals hp="…">``).
 
     :param path: directory containing ``20000-20099.xml`` etc.
     :returns: dict mapping npc template id -> name
     """
-    global _npc_names, _npc_levels, _loaded
+    global _npc_names, _npc_levels, _npc_hp, _loaded
     if _loaded:
         return _npc_names
 
@@ -55,6 +57,7 @@ def load_npc_names(path: str = DEFAULT_NPC_XML_PATH) -> dict[int, str]:
         return _npc_names
 
     pattern = re.compile(r'<npc\s+id="(\d+)"\s+level="(\d+)"[^>]*\sname="([^"]+)"')
+    vitals = re.compile(r'<vitals\s+hp="([\d.]+)"')
     count = 0
     for fname in sorted(os.listdir(path)):
         if not fname.endswith(".xml"):
@@ -65,12 +68,18 @@ def load_npc_names(path: str = DEFAULT_NPC_XML_PATH) -> dict[int, str]:
                 text = fh.read()
         except Exception:
             continue
-        for m in pattern.finditer(text):
+        matches = list(pattern.finditer(text))
+        for i, m in enumerate(matches):
             npc_id = int(m.group(1))
             level = int(m.group(2))
             name = m.group(3)
             _npc_names[npc_id] = name
             _npc_levels[npc_id] = level
+            # The first <vitals> before the next <npc> belongs to this one.
+            block_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+            hp = vitals.search(text, m.end(), block_end)
+            if hp:
+                _npc_hp[npc_id] = float(hp.group(1))
             count += 1
 
     _loaded = True
@@ -86,3 +95,8 @@ def get_npc_name(template_id: int) -> str:
 def get_npc_level(template_id: int) -> int:
     """Return the level for an NPC template ID, or 0 if unknown."""
     return _npc_levels.get(template_id, 0)
+
+
+def get_npc_max_hp(template_id: int) -> float:
+    """Return the base maximum HP for an NPC template ID from the datapack, or 0 if unknown."""
+    return _npc_hp.get(template_id, 0.0)

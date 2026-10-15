@@ -24,6 +24,7 @@ from l2_client import packets
 from l2_client.character import L2Character
 from l2_client.packets import GameServerPacket, SystemMessageId
 from l2_client.policy import CombatPolicy
+from l2_client.tools.data import npc_data
 
 log = logging.getLogger(__name__)
 
@@ -36,6 +37,8 @@ class StepEvents:
     """What happened in the game since the last decision step (the raw material of the reward)."""
 
     damage_dealt: int = 0
+    #: damage dealt as a share of the target's maximum HP (1.0 = a whole monster), the reward's damage term
+    damage_dealt_share: float = 0.0
     damage_taken: int = 0
     kills: int = 0
     deaths: int = 0
@@ -226,12 +229,31 @@ class WorldState:
         char.radar.remove(oid)
         return []
 
+    def _target_max_hp(self) -> float:
+        """Maximum HP of the current target (standard server): the StatusUpdate, else the datapack's base HP."""
+        mob = self.char.radar.entries.get(self.target_id)
+        if mob is None:
+            return 0.0
+        return float(mob.get("max_hp") or npc_data.get_npc_max_hp(mob.get("npc_id", 0)))
+
     def _on_system_message(self, msg: dict, now: float) -> None:
         if not msg:
             return
         params = msg["params"]
         if msg["msg_id"] == SystemMessageId.YOU_DID_DAMAGE and params and isinstance(params[0], int):
-            self.events.damage_dealt += params[0]
+            damage = params[0]
+            self.events.damage_dealt += damage
+            if len(params) >= 4 and all(isinstance(p, int) for p in params[1:4]):
+                # RL-environment server: the message also names the monster hit and its HP (a polearm or an
+                # area skill hits several monsters, one message each).
+                victim, cur_hp, max_hp = params[1:4]
+                mob = self.char.radar.entries.get(victim)
+                if mob is not None:
+                    mob["cur_hp"], mob["max_hp"] = cur_hp, max_hp
+            else:  # standard server: assume the current target
+                max_hp = self._target_max_hp()
+            if max_hp > 0:
+                self.events.damage_dealt_share += min(1.0, damage / max_hp)
             self.last_hit_at = now
         elif msg["msg_id"] in (SystemMessageId.DAMAGE_TAKEN, SystemMessageId.DAMAGE_TAKEN_2) and len(params) > 1 \
                 and isinstance(params[1], int):
