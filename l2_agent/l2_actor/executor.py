@@ -56,6 +56,12 @@ class ExecutorConfig:
     cooldown_sync_s: float = 1.0
 
 
+#: Shop buff potions (RLBuffPotions on the server) -> the skill of their effect; Greater ones first.
+BUFF_POTIONS: dict[int, int] = {1374: 2034, 734: 2011, 1375: 2035, 735: 2012, 6036: 2169, 6035: 2169}
+#: A drunk potion's effect may take a moment to show up in AbnormalStatusUpdate: do not drink again meanwhile.
+POTION_RETRY_S = 8.0
+
+
 def find_healing_potion(char) -> dict | None:
     """Best healing potion in the inventory, or ``None``."""
     for potion_id in HEALING_POTION_IDS:
@@ -83,6 +89,7 @@ class ActionExecutor:
         self._engaged = 0
         self._engaged_at = 0.0
         self._last_cooldown_sync = 0.0
+        self._potion_tried: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Gating
@@ -110,6 +117,27 @@ class ActionExecutor:
         world.ignore_target(world.target_id, self.cfg.ignore_target_s, now)
         self.encoder.reset_session()
         return True
+
+    def drink_buff_potions(self, now: float) -> str | None:
+        """
+        Drink a buff potion whose kind of effect (run / attack / casting speed) is not on the character.
+
+        Scripted like automatic soulshots, not a model decision: the model has no buff features yet.
+        At most one potion per call; returns its name or ``None``.
+        """
+        char = self.world.char
+        active = {skill_data.get_abnormal_type(b["skill_id"]) for b in char.buffs}
+        for item_id, effect_skill in BUFF_POTIONS.items():
+            kind = skill_data.get_abnormal_type(effect_skill)
+            if not kind or kind in active or now - self._potion_tried.get(kind, 0.0) < POTION_RETRY_S:
+                continue
+            potion = next((i for i in char.items if i["item_id"] == item_id and i["count"] > 0), None)
+            if potion is None:
+                continue
+            self._send(packets.build_use_item(potion["object_id"]))
+            self._potion_tried[kind] = now
+            return item_data.get_item_name(item_id) or str(item_id)
+        return None
 
     def sync_cooldowns(self, now: float) -> None:
         """Ask the server for the real cooldowns while a skill is cooling down."""

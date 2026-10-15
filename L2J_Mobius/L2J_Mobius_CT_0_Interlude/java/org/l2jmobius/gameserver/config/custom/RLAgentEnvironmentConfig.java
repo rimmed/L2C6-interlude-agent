@@ -22,6 +22,7 @@ package org.l2jmobius.gameserver.config.custom;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
@@ -53,6 +54,42 @@ public class RLAgentEnvironmentConfig
 	public record FarmZone(int minLevel, int maxLevel, List<Location> anchors, boolean useStartPoint)
 	{
 	}
+	
+	/**
+	 * One buff of a buff set.
+	 * @param skillId the buff skill
+	 * @param minLevel first agent level that gets it
+	 * @param maxLevel last agent level that gets it
+	 * @param mageOnly only for mages
+	 * @param fighterOnly only for fighters
+	 */
+	public record BuffEntry(int skillId, int minLevel, int maxLevel, boolean mageOnly, boolean fighterOnly)
+	{
+	}
+	
+	/**
+	 * Buff potions given to agents of a level range.
+	 * @param itemId the potion
+	 * @param count how many an agent keeps
+	 * @param minLevel first agent level that gets it
+	 * @param maxLevel last agent level that gets it
+	 * @param mageOnly only for mages
+	 * @param fighterOnly only for fighters
+	 */
+	public record PotionEntry(int itemId, int count, int minLevel, int maxLevel, boolean mageOnly, boolean fighterOnly)
+	{
+	}
+	
+	/** Support classes whose buffs form the {@code support} buff set ({@code RLBuffSupport.<name>}). */
+	public static final String[] BUFF_SUPPORT_CLASSES =
+	{
+		"Prophet",
+		"ElvenElder",
+		"ShillienElder",
+		"Bishop",
+		"Warcryer",
+		"Overlord"
+	};
 	
 	// Constants
 	public static boolean RL_AGENT_ENABLED;
@@ -89,6 +126,14 @@ public class RLAgentEnvironmentConfig
 	public static int RL_FARM_MIN_MONSTERS;
 	public static int RL_FARM_MOBS_PER_AGENT;
 	public static List<String> RL_FARM_EXCLUDED_SPAWN_FOLDERS;
+	/** Buff set name -> weight, in the configured order. */
+	public static Map<String, Integer> RL_BUFF_SET_WEIGHTS;
+	public static List<BuffEntry> RL_BUFF_NEWBIE;
+	public static Map<String, List<BuffEntry>> RL_BUFF_SUPPORT;
+	public static List<BuffEntry> RL_BUFF_DANCES_SONGS;
+	public static List<BuffEntry> RL_BUFF_FULL;
+	public static int RL_BUFF_REFRESH_INTERVAL;
+	public static List<PotionEntry> RL_BUFF_POTIONS;
 	public static boolean RL_RESPAWN_ON_DEATH;
 	public static int RL_RESPAWN_DELAY;
 	
@@ -145,6 +190,25 @@ public class RLAgentEnvironmentConfig
 				RL_FARM_EXCLUDED_SPAWN_FOLDERS.add(folder.trim());
 			}
 		}
+		RL_BUFF_SET_WEIGHTS = parseWeights(config.getString("RLBuffSetWeights", "none:15;newbie:20;support:30;dances_songs:15;full:20"));
+		RL_BUFF_NEWBIE = parseBuffs(config.getString("RLBuffNewbie", ""));
+		RL_BUFF_SUPPORT = new LinkedHashMap<>();
+		for (String supportClass : BUFF_SUPPORT_CLASSES)
+		{
+			final List<BuffEntry> buffs = parseBuffs(config.getString("RLBuffSupport." + supportClass, ""));
+			if (!buffs.isEmpty())
+			{
+				RL_BUFF_SUPPORT.put(supportClass, buffs);
+			}
+		}
+		RL_BUFF_DANCES_SONGS = parseBuffs(config.getString("RLBuffDancesSongs", ""));
+		RL_BUFF_FULL = parseBuffs(config.getString("RLBuffFull", ""));
+		RL_BUFF_REFRESH_INTERVAL = Math.max(0, config.getInt("RLBuffRefreshInterval", 30000));
+		RL_BUFF_POTIONS = new ArrayList<>();
+		for (BuffEntry entry : parseBuffs(config.getString("RLBuffPotions", "734:1-39,1374:40-80,735:1-39:fighter,1375:40-80:fighter,6035:1-39:mage,6036:40-80:mage")))
+		{
+			RL_BUFF_POTIONS.add(new PotionEntry(entry.skillId(), config.getInt("RLBuffPotionCount", 20), entry.minLevel(), entry.maxLevel(), entry.mageOnly(), entry.fighterOnly()));
+		}
 		RL_RESPAWN_ON_DEATH = config.getBoolean("RLRespawnOnDeath", true);
 		RL_RESPAWN_DELAY = Math.max(0, config.getInt("RLRespawnDelay", 4000));
 	}
@@ -188,6 +252,82 @@ public class RLAgentEnvironmentConfig
 			catch (NumberFormatException e)
 			{
 				LOGGER.warning(RLAgentEnvironmentConfig.class.getSimpleName() + ": Invalid RLConsumables entry: " + entry);
+			}
+		}
+		return Collections.unmodifiableList(result);
+	}
+	
+	/**
+	 * Parses {@code name:weight;name:weight} (names lower case, in the configured order).
+	 * @param value the config value
+	 * @return name -> weight
+	 */
+	private static Map<String, Integer> parseWeights(String value)
+	{
+		final Map<String, Integer> result = new LinkedHashMap<>();
+		for (String entry : value.split(";"))
+		{
+			final String[] pair = entry.trim().split(":");
+			if (pair.length != 2)
+			{
+				continue;
+			}
+			try
+			{
+				result.put(pair[0].trim().toLowerCase(), Math.max(0, Integer.parseInt(pair[1].trim())));
+			}
+			catch (NumberFormatException e)
+			{
+				LOGGER.warning(RLAgentEnvironmentConfig.class.getSimpleName() + ": Invalid weight entry: " + entry);
+			}
+		}
+		return result;
+	}
+	
+	/**
+	 * Parses a buff list: {@code skillId[:minLevel-maxLevel][:mage|fighter]}, separated by commas or semicolons.
+	 * @param value the config value
+	 * @return the buffs in the configured order
+	 */
+	private static List<BuffEntry> parseBuffs(String value)
+	{
+		final List<BuffEntry> result = new ArrayList<>();
+		for (String entry : value.split("[,;]"))
+		{
+			if (entry.isBlank())
+			{
+				continue;
+			}
+			try
+			{
+				final String[] parts = entry.trim().split(":");
+				int minLevel = 1;
+				int maxLevel = Integer.MAX_VALUE;
+				boolean mageOnly = false;
+				boolean fighterOnly = false;
+				for (int i = 1; i < parts.length; i++)
+				{
+					final String part = parts[i].trim();
+					if (part.equalsIgnoreCase("mage"))
+					{
+						mageOnly = true;
+					}
+					else if (part.equalsIgnoreCase("fighter"))
+					{
+						fighterOnly = true;
+					}
+					else
+					{
+						final String[] range = part.split("-");
+						minLevel = Integer.parseInt(range[0].trim());
+						maxLevel = Integer.parseInt(range[range.length - 1].trim());
+					}
+				}
+				result.add(new BuffEntry(Integer.parseInt(parts[0].trim()), minLevel, maxLevel, mageOnly, fighterOnly));
+			}
+			catch (RuntimeException e)
+			{
+				LOGGER.warning(RLAgentEnvironmentConfig.class.getSimpleName() + ": Invalid buff entry: " + entry);
 			}
 		}
 		return Collections.unmodifiableList(result);

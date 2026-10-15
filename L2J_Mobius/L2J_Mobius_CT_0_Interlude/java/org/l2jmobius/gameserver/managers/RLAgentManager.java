@@ -39,6 +39,7 @@ import org.l2jmobius.commons.util.Rnd;
 import org.l2jmobius.gameserver.config.custom.AllowedPlayerRacesConfig;
 import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
 import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig.FarmZone;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig.PotionEntry;
 import org.l2jmobius.gameserver.data.sql.CharInfoTable;
 import org.l2jmobius.gameserver.data.xml.ExperienceData;
 import org.l2jmobius.gameserver.data.xml.ItemData;
@@ -161,6 +162,7 @@ public class RLAgentManager
 	private final Set<Integer> _inSetup = ConcurrentHashMap.newKeySet();
 	private final Map<Integer, ScheduledFuture<?>> _respawnTasks = new ConcurrentHashMap<>();
 	private final RLFarmAreas _farmAreas = new RLFarmAreas();
+	private final RLBuffs _buffs = new RLBuffs();
 	
 	// Listeners
 	private final ListenersContainer _listenerContainer = Containers.Players();
@@ -187,6 +189,7 @@ public class RLAgentManager
 	private final Consumer<OnPlayerLogout> _playerLogoutEvent = event ->
 	{
 		_farmAreas.release(event.getPlayer());
+		_buffs.release(event.getPlayer());
 		final ScheduledFuture<?> task = _respawnTasks.remove(event.getPlayer().getObjectId());
 		if (task != null)
 		{
@@ -202,6 +205,7 @@ public class RLAgentManager
 			ThreadPool.schedule(() -> runSafely(player, "level-up progression", () ->
 			{
 				progress(player, false);
+				_buffs.relevel(player);
 				// A level-up can lift the agent out of its area's level window.
 				if (RLAgentEnvironmentConfig.RL_TELEPORT_TO_FARM_ZONE && RLAgentEnvironmentConfig.RL_FARM_AUTO && !player.isDead() && _farmAreas.outgrown(player))
 				{
@@ -373,6 +377,9 @@ public class RLAgentManager
 			{
 				teleportToFarmZone(player);
 			}
+			// The server restores the buffs of the last session on login: a life starts with exactly one buff set.
+			player.stopAllEffectsExceptThoseThatLastThroughDeath();
+			_buffs.assign(player);
 			
 			if (firstSetup)
 			{
@@ -463,6 +470,7 @@ public class RLAgentManager
 		restoreVitals(player);
 		teleportToFarmZone(player);
 		supply(player);
+		_buffs.assign(player); // a new life, a new buff set
 	}
 	
 	private static void restoreVitals(Player player)
@@ -809,6 +817,15 @@ public class RLAgentManager
 		for (ItemHolder consumable : RLAgentEnvironmentConfig.RL_CONSUMABLES)
 		{
 			topUp(player, consumable.getId(), consumable.getCount());
+		}
+		// Buff potions; the actor drinks one when no buff of the same kind is on the character.
+		for (PotionEntry potion : RLAgentEnvironmentConfig.RL_BUFF_POTIONS)
+		{
+			final int level = player.getLevel();
+			if ((level >= potion.minLevel()) && (level <= potion.maxLevel()) && (!potion.mageOnly() || player.isMageClass()) && (!potion.fighterOnly() || !player.isMageClass()))
+			{
+				topUp(player, potion.itemId(), potion.count());
+			}
 		}
 		
 		if (RLAgentEnvironmentConfig.RL_AUTO_ENABLE_SHOTS && (shotCount > 0) && (weapon != null) && (player.getActiveWeaponItem() != player.getFistsWeaponItem()))

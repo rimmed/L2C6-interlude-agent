@@ -118,6 +118,7 @@ class GameClientPacket(IntEnum):
     SAY2 = 0x38
     REQUEST_RESTART_POINT = 0x6D
     REQUEST_SKILL_COOL_TIME = 0x9D
+    REQUEST_ITEM_LIST = 0x0F
     NET_PING = 0xA8
     DLG_ANSWER = 0xC5
     GAME_GUARD_REPLY = 0xCA
@@ -227,6 +228,11 @@ def build_enter_world() -> bytes:
     p = bytearray([GameClientPacket.ENTER_WORLD]) + b'\x00' * 32 + struct.pack("<IIII", 0, 0, 0, 0)
     p += b'\x00' * 32 + struct.pack("<I", 0) + b'\x00' * 20
     return pack(p)
+
+
+def build_request_item_list() -> bytes:
+    """RequestItemList (0x0F): ask the server for a fresh ItemList (0x1B)."""
+    return pack(bytearray([GameClientPacket.REQUEST_ITEM_LIST]))
 
 
 def build_request_skill_cool_time() -> bytes:

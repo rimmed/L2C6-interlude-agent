@@ -169,6 +169,7 @@ def _read_raw(skill_elem: ET.Element, name: str, levels: int) -> dict:
         "levels": levels,
         "operate_type": (skill_elem.findtext("operateType") or "").strip(),
         "target_type": (skill_elem.findtext("targetType") or "").strip(),
+        "abnormal_type": (skill_elem.findtext("abnormalType") or "").strip(),
         "effects": frozenset(e.get("name") for e in skill_elem.iter("effect") if e.get("name")),
         "tables": tables,
         "values": values,
@@ -216,6 +217,12 @@ def _level_value(raw: dict, tag: str, level: int, default: float = 0.0) -> float
         return float(text)
     except ValueError:
         return default
+
+
+def get_abnormal_type(skill_id: int) -> str:
+    """Effect slot of a buff (e.g. ``SPEED_UP``): two effects of one type do not stack; ``""`` if none."""
+    raw = _SKILL_RAW.get(skill_id)
+    return raw["abnormal_type"] if raw else ""
 
 
 def get_skill_info(skill_id: int, level: int = 1) -> SkillInfo | None:

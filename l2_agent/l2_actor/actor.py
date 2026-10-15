@@ -97,6 +97,8 @@ class ActorConfig:
     settle_time: float = 6.0
     respawn_timeout: float = 60.0
     seed: int | None = None
+    #: drink shop buff potions (run / attack / casting speed) when no such buff is on the character
+    buff_potions: bool = True
 
 
 class Actor:
@@ -131,6 +133,8 @@ class Actor:
         self._pending: Transition | None = None
         self._last_decision = 0.0
         self._restart_requested = False
+        #: when to ask for a fresh ItemList: the server tops up shots, arrows and potions after login / revive
+        self._item_list_at = 0.0
         self.started = time.time()
         self.episode_id = 0
         self.episode_step = 0
@@ -188,6 +192,7 @@ class Actor:
         log.info("Playing '%s' (account %s): level %d, class %d, at %s", self.conn.character_name, self.account,
                  char.level, char.class_id, self.world.pos)
         self._update_header()
+        self._item_list_at = time.time() + 2.0
 
     def _download_model(self) -> Path:
         """Wait for the trainer's policy in Redis and store it under ``output_dir/models/``."""
@@ -263,7 +268,12 @@ class Actor:
         if world.dead:
             self._respawn_fallback(now)
             return
+        if self._item_list_at and now >= self._item_list_at:
+            self.conn.send(packets.build_request_item_list())
+            self._item_list_at = 0.0
         self.executor.sync_cooldowns(now)
+        if self.cfg.buff_potions:
+            self.executor.drink_buff_potions(now)
         self.executor.drop_stuck_target(now)
         if now - self._last_decision >= self.cfg.decision_interval and not self.executor.busy(now):
             self._poll_model(now)
@@ -299,6 +309,7 @@ class Actor:
             self.encoder.reset_session()
         elif event == "revive":
             self._restart_requested = False
+            self._item_list_at = now + 2.0
             log.info("Revived by the server")
 
     def _respawn_fallback(self, now: float) -> None:
