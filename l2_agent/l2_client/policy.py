@@ -521,7 +521,7 @@ class CombatPolicy:
 
     def _snapshot(self, char, current_target_id: int, pos: tuple[int, int], now: float) -> _Frame:
         """Encode the current state and append it to the session history."""
-        mobs, mob_ids = self._encode_mobs(char, current_target_id, pos)
+        mobs, mob_ids = self._encode_mobs(char, current_target_id, pos, now)
         # dt is fixed when the row is appended, so it stays the real gap to the previous event
         # even after that event has scrolled out of the window (as in the training windows).
         log_dt = math.log1p(max(0.0, now - self._frames[-1].t)) if self._frames else 0.0
@@ -557,7 +557,8 @@ class CombatPolicy:
         }
         return np.array([values[name] for name in self._player_names], dtype=np.float32)
 
-    def _encode_mobs(self, char, current_target_id: int, pos: tuple[int, int]) -> tuple[np.ndarray, tuple[int, ...]]:
+    def _encode_mobs(self, char, current_target_id: int, pos: tuple[int, int],
+                     now: float | None = None) -> tuple[np.ndarray, tuple[int, ...]]:
         c = self.constants
         matrix = np.zeros((self.max_mobs, len(self._mob_names)), dtype=np.float32)
         matrix[:, self._mob_at["is_padded"]] = 1.0
@@ -591,6 +592,8 @@ class CombatPolicy:
                 "lvl_diff": (mob["level"] - char.level) / c["max_level"],
                 "is_current_target": 1.0 if oid == current_target_id or (
                     target_npc_id and mob.get("npc_id") == target_npc_id) else 0.0,
+                # another player hit it recently (the actor's WorldState marks the radar entry)
+                "by_other": 1.0 if mob.get("by_other_until", 0.0) > (time.time() if now is None else now) else 0.0,
                 "is_padded": 0.0,
             }
             matrix[slot] = [row[name] for name in self._mob_names]

@@ -67,6 +67,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from l2_actor import replay  # noqa: E402 - PROJECT_ROOT is added just above
 from l2_client.policy import POINTER_ACTIONS  # noqa: E402
+from l2_NN.dataloader import dataloder as dl  # noqa: E402
 from l2_NN.dataloader.augment import AugmentConfig  # noqa: E402
 from l2_NN.dataloader.dataloder import USED_SKILL_ACTION_ID, Lineage2EventDataset  # noqa: E402
 from l2_NN.export_onnx import export_policy, load_policy_weights  # noqa: E402
@@ -451,6 +452,11 @@ class Trainer:
         self.ingest = Ingest(args.redis, self.incoming, self.stop)
         self._episode_returns: dict[tuple[str, int], float] = {}
         self.demos = demo_batches(args, self.init_args, self.action_to_id)
+        # Demonstrations come in today's mob layout; an older model may know fewer mob features.
+        model_mob = (checkpoint.get("features") or {}).get("mob") or dl.mob_feature_names(self.model_config["mob_features"])
+        self.features = {"player": list(dl.PLAYER_FEATURE_NAMES), "mob": list(model_mob),
+                         "skill": list(dl.SKILL_FEATURE_NAMES)}
+        self.demo_mob_columns = torch.tensor([dl.MOB_FEATURE_NAMES.index(name) for name in model_mob])
 
     # -- data ----------------------------------------------------------------------------
 
@@ -491,8 +497,9 @@ class Trainer:
         if not warmup:
             loss = loss + policy_loss
             if self.demos is not None:
-                demo, masks = prepare_batch(next(self.demos), self.device, not self.init_args.get(
-                    "keep_last_target_flag", False))
+                raw = next(self.demos)
+                raw["mobs_matrix"] = raw["mobs_matrix"].index_select(-1, self.demo_mob_columns)
+                demo, masks = prepare_batch(raw, self.device, not self.init_args.get("keep_last_target_flag", False))
                 with torch.autocast(self.device.type, dtype=self.amp_dtype or torch.float32,
                                     enabled=self.amp_dtype is not None):
                     logits = self.model({key: demo[key] for key in INPUT_KEYS})
@@ -525,6 +532,7 @@ class Trainer:
             "optimizer_state_dict": self.optimizer.state_dict(),
             "model_config": self.model_config,
             "action_to_id": self.action_to_id,
+            "features": self.features,
             "args": self.init_args,
             "val_metrics": None,
             "split": None,

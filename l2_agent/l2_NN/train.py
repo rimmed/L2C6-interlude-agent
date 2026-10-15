@@ -71,7 +71,9 @@ from l2_NN.dataloader.dataloder import (  # noqa: E402 - PROJECT_ROOT is added j
     MOB_FEATURE_DIM,
     MOB_FEATURE_NAMES,
     PLAYER_FEATURE_DIM,
+    PLAYER_FEATURE_NAMES,
     SKILL_FEATURE_DIM,
+    SKILL_FEATURE_NAMES,
     USED_SKILL_ACTION_ID,
     Lineage2EventDataset,
 )
@@ -567,6 +569,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "train_metrics": train_metrics,
             "val_metrics": val_metrics,
             "action_to_id": dataset.action_to_id,
+            # Feature layouts by name: export_onnx / train_rl must not assume today's layout for old checkpoints.
+            "features": {"player": list(PLAYER_FEATURE_NAMES), "mob": list(MOB_FEATURE_NAMES),
+                         "skill": list(SKILL_FEATURE_NAMES)},
             "split": {"by": args.split_by, **split_info},
             "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         }

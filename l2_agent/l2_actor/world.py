@@ -30,6 +30,8 @@ log = logging.getLogger(__name__)
 
 #: Extra wait after the server-announced cast time before the next decision.
 CAST_MARGIN_S = 0.15
+#: A monster another player hit counts as "attacked by another player" this long (game seconds).
+OTHER_ATTACKER_MEMORY_S = 10.0
 
 
 @dataclass
@@ -195,8 +197,15 @@ class WorldState:
         elif pid == GameServerPacket.SKILL_COOL_TIME:
             self.encoder.apply_skill_cool_time(packets.parse_skill_cool_time(body), now)
 
+        elif pid == GameServerPacket.ATTACK:
+            attack = packets.parse_attack(body)
+            if attack:
+                self._note_other_attack(attack["attacker_id"], [hit[0] for hit in attack["hits"]], now)
+
         elif pid == GameServerPacket.MAGIC_SKILL_USE:
             cast = packets.parse_magic_skill_use(body)
+            if cast and cast["caster_id"] != char.object_id:
+                self._note_other_attack(cast["caster_id"], [cast["target_id"]], now)
             if cast and cast["caster_id"] == char.object_id:
                 self.cast_until = now + cast["hit_time"] / 1000.0 / self.server_speed + CAST_MARGIN_S
 
@@ -228,6 +237,19 @@ class WorldState:
             return ["kill"]
         char.radar.remove(oid)
         return []
+
+    def _note_other_attack(self, attacker_id: int, target_ids: list[int], now: float) -> None:
+        """
+        Remember that another player attacks these monsters (the ``by_other`` mob feature): the
+        attacker is not this character and not a monster on the radar (a monster hitting a player).
+        """
+        if attacker_id == self.char.object_id or attacker_id in self.char.radar.entries:
+            return
+        until = now + OTHER_ATTACKER_MEMORY_S / self.server_speed
+        for target_id in target_ids:
+            mob = self.char.radar.entries.get(target_id)
+            if mob is not None:
+                mob["by_other_until"] = until
 
     def _target_max_hp(self) -> float:
         """Maximum HP of the current target (standard server): the StatusUpdate, else the datapack's base HP."""

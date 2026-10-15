@@ -39,6 +39,8 @@ logged column                 consumed as
 ``char_stats.cast_speed``     player cast speed (there is **no** flat ``cast_speed`` column)
 ``char_stats.atk_speed``      player attack speed (likewise no flat column)
 ``nearby_objects[].id``       monster npc id (the key is ``id``, **not** ``npc_id``)
+``.attackers`` (same list)    other players on the monster's aggro list -> ``by_other``
+                              (format-2 logs only, see ``tools/playeraction_v2.py``)
 ``entity_npc_id``             npc id of the target of the current event
 ``active_skills[].id`` and    skill panel; there is **no** ``available_skills`` column
 ``cooldowns[].skill_id`` /    and no per-skill MP cost anywhere in the logs
@@ -239,8 +241,20 @@ PLAYER_FEATURE_NAMES: Final[tuple[str, ...]] = (
 )
 PLAYER_FEATURE_DIM: Final[int] = len(PLAYER_FEATURE_NAMES)
 
-MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_current_target", "is_padded")
+#: ``by_other``: another player is on the monster's aggro list (format-2 logs, ``nearby_objects[].attackers``;
+#: always 0 in format-1 logs).
+MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_current_target", "by_other", "is_padded")
 MOB_FEATURE_DIM: Final[int] = len(MOB_FEATURE_NAMES)
+#: The mob features of models trained before ``by_other`` existed.
+LEGACY_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_current_target", "is_padded")
+
+
+def mob_feature_names(dim: int) -> tuple[str, ...]:
+    """The mob feature layout of a model with ``dim`` mob features (old checkpoints carry no names)."""
+    for names in (MOB_FEATURE_NAMES, LEGACY_MOB_FEATURE_NAMES):
+        if len(names) == dim:
+            return names
+    raise ValueError(f"no known mob feature layout has {dim} features")
 MOB_PADDED_INDEX: Final[int] = MOB_FEATURE_NAMES.index("is_padded")
 
 SKILL_FEATURE_NAMES: Final[tuple[str, ...]] = SKILL_SLOT_FEATURES
@@ -747,7 +761,9 @@ class Lineage2EventDataset(Dataset):
                     pointer_idx = slot_idx
                     matched = True
 
-            matrix[slot_idx] = (dist_norm, lvl_diff, is_target, 0.0)
+            attackers = mob.get("attackers")
+            by_other = 1.0 if attackers is not None and len(attackers) > 0 else 0.0
+            matrix[slot_idx] = (dist_norm, lvl_diff, is_target, by_other, 0.0)
 
         return matrix, pointer_idx, matched
 

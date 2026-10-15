@@ -115,10 +115,11 @@ def probe_inputs(config: dict, seq_len: int, batch_size: int = 4, seed: int = 0)
     """A random left-padded batch shaped like the dataloader output (rows with 1..L real events)."""
     generator = torch.Generator().manual_seed(seed)
     max_mobs, max_skills = config["max_mobs"], config["max_skills"]
+    padded_at = dl.mob_feature_names(config["mob_features"]).index("is_padded")
     player_state = torch.rand(batch_size, seq_len, config["player_dim"], generator=generator)
     delta_t = torch.rand(batch_size, seq_len, generator=generator)
     mobs = torch.rand(batch_size, seq_len, max_mobs, config["mob_features"], generator=generator)
-    mobs[..., dl.MOB_PADDED_INDEX] = (torch.rand(batch_size, seq_len, max_mobs, generator=generator) > 0.7).float()
+    mobs[..., padded_at] = (torch.rand(batch_size, seq_len, max_mobs, generator=generator) > 0.7).float()
     skills = (torch.rand(batch_size, seq_len, max_skills, config["skill_features"], generator=generator) > 0.5).float()
 
     seq_mask = torch.zeros(batch_size, seq_len, dtype=torch.bool)
@@ -129,7 +130,7 @@ def probe_inputs(config: dict, seq_len: int, batch_size: int = 4, seed: int = 0)
     player_state[padded] = 0.0
     delta_t[padded] = 0.0
     mobs[padded] = 0.0
-    mobs[..., dl.MOB_PADDED_INDEX][padded] = 1.0
+    mobs[..., padded_at][padded] = 1.0
     skills[padded] = 0.0
     return player_state, delta_t, mobs, skills, seq_mask
 
@@ -149,9 +150,10 @@ def build_metadata(checkpoint: dict, onnx_path: Path) -> dict:
         # inference has to feed the network the same way.
         "hide_last_target": not bool(args.get("keep_last_target_flag", False)),
         "action_to_id": checkpoint["action_to_id"],
-        "features": {
+        # The layout the model was trained with (checkpoints before ``by_other`` carry no names).
+        "features": checkpoint.get("features") or {
             "player": list(dl.PLAYER_FEATURE_NAMES),
-            "mob": list(dl.MOB_FEATURE_NAMES),
+            "mob": list(dl.mob_feature_names(config["mob_features"])),
             "skill": list(dl.SKILL_FEATURE_NAMES),
         },
         "constants": {

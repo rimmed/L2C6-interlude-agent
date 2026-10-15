@@ -704,6 +704,29 @@ def parse_teleport_to_location(body: bytes) -> dict:
     return {"object_id": object_id, "x": x, "y": y, "z": z}
 
 
+def parse_attack(body: bytes) -> dict:
+    """
+    Parse Attack (0x05): ``{"attacker_id": int, "hits": [(target_id, damage, flags), ...]}``.
+
+    Layout: attacker, first hit (target, damage, flags byte), attacker x/y/z, the number of further
+    hits (short), the further hits, target x/y/z. A polearm or an area attack hits several targets.
+    """
+    if len(body) < 1 + 4 + 9 + 12 + 2:
+        return {}
+    attacker = struct.unpack_from("<i", body, 1)[0]
+    pos = 5
+    hits = [struct.unpack_from("<iiB", body, pos)]
+    pos += 9 + 12
+    count = struct.unpack_from("<H", body, pos)[0]
+    pos += 2
+    for _ in range(count):
+        if pos + 9 > len(body):
+            break
+        hits.append(struct.unpack_from("<iiB", body, pos))
+        pos += 9
+    return {"attacker_id": attacker, "hits": hits}
+
+
 def parse_magic_skill_use(body: bytes) -> dict:
     """
     Parse MagicSkillUse (0x48): a creature starts casting.
