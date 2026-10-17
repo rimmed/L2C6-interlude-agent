@@ -302,7 +302,7 @@ class Actor:
 
         self._pending = Transition(
             actor_id=self.actor_id, episode_id=self.life_id, step=self.life_step, t=now,
-            state=obs.feeds, action=self._action_record(decision, executed), action_mask=self._mask_record(obs),
+            state=obs.feeds, action=self._action_record(decision, executed), action_mask=self._mask_record(obs, decision),
             info=self._info_record(),
         )
         self.episode_step += 1
@@ -427,11 +427,12 @@ class Actor:
             "model_version": self.model_version, "executed": executed,
         }
 
-    def _mask_record(self, obs: Observation) -> dict[str, Any]:
+    def _mask_record(self, obs: Observation, decision: Decision) -> dict[str, Any]:
         return {
             "types": [action_id for name, action_id in self.encoder.executable_actions if obs.valid[name]],
             "n_mobs": len(obs.mob_ids),
-            "skill_slots": list(obs.usable_slots),
+            # the slots the skill head chose from: the summon's skills for pet_skill, the character's otherwise
+            "skill_slots": list(obs.skill_slots(decision.action)),
         }
 
     def _info_record(self) -> dict[str, Any]:

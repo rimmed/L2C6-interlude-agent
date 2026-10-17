@@ -94,6 +94,9 @@ class GameServerPacket(IntEnum):
     ABNORMAL_STATUS_UPDATE = 0x7F
     QUEST_LIST = 0x80
     ASK_JOIN_ALLIANCE = 0xA8
+    PET_INFO = 0xB1
+    PET_STATUS_UPDATE = 0xB5
+    PET_DELETE = 0xB6
     SKILL_COOL_TIME = 0xC1
     NET_PING = 0xD3  # only ever the answer to the client's RequestNetPing
     CONFIRM_DLG = 0xED
@@ -114,6 +117,7 @@ class GameClientPacket(IntEnum):
     CHARACTER_SELECT = 0x0D
     USE_ITEM = 0x14
     REQUEST_MAGIC_SKILL_USE = 0x2F
+    REQUEST_ACTION_USE = 0x45
     APPEARING = 0x30
     SAY2 = 0x38
     REQUEST_RESTART_POINT = 0x6D
@@ -137,6 +141,7 @@ class SystemMessageId(IntEnum):
     YOU_DID_DAMAGE = 35  # "You hit for $s1 damage."
     DAMAGE_TAKEN = 36  # "$s1 hit you for $s2 damage."
     DAMAGE_TAKEN_2 = 37  # same message for another attacker kind
+    PET_DID_DAMAGE = 1015  # "Your pet hit for $s1 damage."
 
 
 #: Game server opcode -> packet name, for logging.
@@ -289,6 +294,18 @@ def build_attack_request(target_obj_id: int, x: int, y: int, z: int, shift_click
     p = bytearray([GameClientPacket.ATTACK_REQUEST])
     p += struct.pack("<iiii", target_obj_id, x, y, z)
     p += struct.pack("<B", 1 if shift_click else 0)
+    return pack(p)
+
+
+def build_request_action_use(action_id: int, ctrl_pressed: bool = False, shift_pressed: bool = False) -> bytes:
+    """
+    Packet 0x45: RequestActionUse -- an action of the action panel, e.g. a summon command (22 = attack,
+    21 = follow, 23 = stop for a servitor; 16 / 15 / 17 for a pet) or a summon skill (43 = Hydro Screw ...).
+
+    Format: c d d c
+    """
+    p = bytearray([GameClientPacket.REQUEST_ACTION_USE])
+    p += struct.pack("<iiB", action_id, 1 if ctrl_pressed else 0, 1 if shift_pressed else 0)
     return pack(p)
 
 
@@ -702,6 +719,52 @@ def parse_teleport_to_location(body: bytes) -> dict:
         return {}
     object_id, x, y, z = struct.unpack_from("<iiii", body, 1)
     return {"object_id": object_id, "x": x, "y": y, "z": z}
+
+
+def parse_pet_info(body: bytes) -> dict:
+    """
+    Parse PetInfo (0xB1): the character's summon appeared or changed.
+
+    ``{summon_type (1 = servitor, 2 = pet), object_id, npc_id, x, y, z, in_combat, dead, cur_hp,
+    max_hp, cur_mp, max_mp, level}``
+    """
+    try:
+        pos = 1
+        summon_type, object_id, display_id, _ = struct.unpack_from("<iiii", body, pos); pos += 16
+        x, y, z, _heading, _ = struct.unpack_from("<iiiii", body, pos); pos += 20
+        pos += 10 * 4 + 4 * 8 + 3 * 4  # speeds, multipliers and collision, weapon / armor
+        _owner, _running, in_combat, dead, _value = struct.unpack_from("<BBBBB", body, pos); pos += 5
+        _, pos = _read_utf16le_string(body, pos)  # name
+        _, pos = _read_utf16le_string(body, pos)  # owner name
+        pos += 4 * 5  # 1, pvp flag, karma, current / max fed
+        cur_hp, max_hp, cur_mp, max_mp, _sp, level = struct.unpack_from("<iiiiii", body, pos)
+    except struct.error:
+        return {}
+    return {"summon_type": summon_type, "object_id": object_id, "npc_id": display_id - 1000000, "x": x, "y": y,
+            "z": z, "in_combat": bool(in_combat), "dead": bool(dead), "cur_hp": cur_hp, "max_hp": max_hp,
+            "cur_mp": cur_mp, "max_mp": max_mp, "level": level}
+
+
+def parse_pet_status_update(body: bytes) -> dict:
+    """Parse PetStatusUpdate (0xB5): ``{summon_type, object_id, x, y, z, cur_hp, max_hp, cur_mp, max_mp, level}``."""
+    try:
+        pos = 1
+        summon_type, object_id, x, y, z = struct.unpack_from("<iiiii", body, pos); pos += 20
+        _, pos = _read_utf16le_string(body, pos)  # owner name
+        pos += 8  # current / max fed
+        cur_hp, max_hp, cur_mp, max_mp, level = struct.unpack_from("<iiiii", body, pos)
+    except struct.error:
+        return {}
+    return {"summon_type": summon_type, "object_id": object_id, "x": x, "y": y, "z": z, "cur_hp": cur_hp,
+            "max_hp": max_hp, "cur_mp": cur_mp, "max_mp": max_mp, "level": level}
+
+
+def parse_pet_delete(body: bytes) -> dict:
+    """Parse PetDelete (0xB6): ``{summon_type, object_id}``."""
+    if len(body) < 9:
+        return {}
+    summon_type, object_id = struct.unpack_from("<ii", body, 1)
+    return {"summon_type": summon_type, "object_id": object_id}
 
 
 def parse_attack(body: bytes) -> dict:

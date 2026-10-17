@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 from l2_client import packets
 from l2_client.policy import CombatPolicy, Decision
-from l2_client.tools.data import item_data, skill_data
+from l2_client.tools.data import item_data, skill_data, summon_data
 
 from .world import WorldState
 
@@ -210,6 +210,26 @@ class ActionExecutor:
                 self._send(packets.build_use_item(potion["object_id"]))
                 return f"UseItem {item_data.get_item_name(potion['item_id'])}"
             return "no potion"
+
+        if action == "pet_attack":
+            pet = char.pet
+            target = mob_id if mob_id is not None else (world.target_id if world.target_alive() else None)
+            if pet is None or target is None:
+                return "no summon / target"
+            selected = self._select(target) + ", " if target != world.target_id else ""
+            # The summon attacks the owner's target: the selection above reaches the server first.
+            servitor, pet_type = summon_data.ATTACK_ACTIONS
+            self._send(packets.build_request_action_use(servitor if pet.get("summon_type") == 1 else pet_type))
+            self.encoder.note_combat(now)
+            return f"{selected}summon attacks {target}"
+
+        if action == "pet_skill" and decision.pet_action_id is not None:
+            selected = ""
+            if not decision.pet_on_owner and not world.target_alive() and mob_id is not None:
+                selected = self._select(mob_id) + ", "  # a summon skill hits the owner's target
+            self._send(packets.build_request_action_use(decision.pet_action_id, ctrl_pressed=True))
+            self.encoder.note_combat(now)
+            return f"{selected}summon skill {skill_data.get_skill_name(decision.skill_id) or decision.skill_id}"
 
         if action == "moved":
             goal_id = world.target_id if world.target_alive() else mob_id

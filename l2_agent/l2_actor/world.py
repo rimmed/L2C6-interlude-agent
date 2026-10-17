@@ -32,6 +32,8 @@ log = logging.getLogger(__name__)
 CAST_MARGIN_S = 0.15
 #: A monster another player hit counts as "attacked by another player" this long (game seconds).
 OTHER_ATTACKER_MEMORY_S = 10.0
+#: An attack of the summon counts as "attacking" this long (game seconds): the logs' ``atk`` flag.
+PET_ATTACK_MEMORY_S = 2.0
 
 
 @dataclass
@@ -45,6 +47,8 @@ class StepEvents:
     kills: int = 0
     deaths: int = 0
     items_picked: int = 0
+    #: the character's summon died
+    pet_deaths: int = 0
 
     def take(self) -> StepEvents:
         """Return a copy of the counters and reset them."""
@@ -69,6 +73,9 @@ class WorldState:
         self.server_speed = max(server_speed, 1e-6)
 
         self.char = L2Character()
+        #: the character's summon (``None`` without one): PetInfo / PetStatusUpdate state plus its
+        #: ``target_id`` and ``attacking_until`` / ``casting_until`` (real time), see :meth:`_on_pet_info`
+        self.char.pet = None
         self.pos: tuple[int, int, int] = (0, 0, 0)
         self.target_id: int = 0
         self.pending_loot: list[dict] = []
@@ -200,11 +207,22 @@ class WorldState:
         elif pid == GameServerPacket.ATTACK:
             attack = packets.parse_attack(body)
             if attack:
-                self._note_other_attack(attack["attacker_id"], [hit[0] for hit in attack["hits"]], now)
+                pet = char.pet
+                if pet and attack["attacker_id"] == pet["object_id"]:
+                    pet["target_id"] = attack["hits"][0][0]
+                    pet["attacking_until"] = now + PET_ATTACK_MEMORY_S / self.server_speed
+                else:
+                    self._note_other_attack(attack["attacker_id"], [hit[0] for hit in attack["hits"]], now)
 
         elif pid == GameServerPacket.MAGIC_SKILL_USE:
             cast = packets.parse_magic_skill_use(body)
-            if cast and cast["caster_id"] != char.object_id:
+            pet = char.pet
+            if cast and pet and cast["caster_id"] == pet["object_id"]:
+                pet["casting_until"] = now + cast["hit_time"] / 1000.0 / self.server_speed + CAST_MARGIN_S
+                if cast["target_id"] != char.object_id and cast["target_id"] != pet["object_id"]:
+                    pet["target_id"] = cast["target_id"]
+                self.encoder.note_pet_skill_used(cast["skill_id"], now)
+            elif cast and cast["caster_id"] != char.object_id:
                 self._note_other_attack(cast["caster_id"], [cast["target_id"]], now)
             if cast and cast["caster_id"] == char.object_id:
                 self.cast_until = now + cast["hit_time"] / 1000.0 / self.server_speed + CAST_MARGIN_S
@@ -215,12 +233,49 @@ class WorldState:
         elif pid == GameServerPacket.ABNORMAL_STATUS_UPDATE:
             char.apply_abnormal_status_update(packets.parse_abnormal_status_update(body))
 
+        elif pid == GameServerPacket.PET_INFO:
+            return self._on_pet_info(packets.parse_pet_info(body))
+
+        elif pid == GameServerPacket.PET_STATUS_UPDATE:
+            status = packets.parse_pet_status_update(body)
+            if status and char.pet and status["object_id"] == char.pet["object_id"]:
+                char.pet.update({key: status[key] for key in ("x", "y", "z", "cur_hp", "max_hp", "cur_mp", "max_mp")})
+
+        elif pid == GameServerPacket.PET_DELETE:
+            gone = packets.parse_pet_delete(body)
+            if gone and char.pet and gone["object_id"] == char.pet["object_id"]:
+                char.pet = None
+                return ["unsummoned"]
+
         return []
+
+    def _on_pet_info(self, info: dict) -> list[str]:
+        """A summon appeared (or its state changed): keep what the packets do not repeat."""
+        if not info:
+            return []
+        pet = self.char.pet
+        if pet and pet["object_id"] == info["object_id"]:
+            pet.update(info)
+            return []
+        self.char.pet = {**info, "target_id": 0, "attacking_until": 0.0, "casting_until": 0.0}
+        return ["summoned"]
 
     def _on_die(self, die: dict, now: float) -> list[str]:
         if not die:
             return []
         oid, char = die["object_id"], self.char
+        pet = char.pet
+        if pet and oid == pet["object_id"]:
+            pet["dead"] = True
+            self.events.pet_deaths += 1
+            return ["pet_died"]
+        if pet and oid == pet.get("target_id") and oid != self.target_id:
+            # The summon finished a monster it was ordered at (not the character's target): a kill too.
+            self.encoder.record_event(char, self.target_id, self.xy, now)
+            self.events.kills += 1
+            char.radar.remove(oid)
+            pet["target_id"] = 0
+            return ["kill"]
         if oid == char.object_id:
             self.dead = True
             self.dead_since = now
@@ -253,7 +308,10 @@ class WorldState:
 
     def _target_max_hp(self) -> float:
         """Maximum HP of the current target (standard server): the StatusUpdate, else the datapack's base HP."""
-        mob = self.char.radar.entries.get(self.target_id)
+        return self._mob_max_hp(self.target_id)
+
+    def _mob_max_hp(self, object_id: int | None) -> float:
+        mob = self.char.radar.entries.get(object_id) if object_id else None
         if mob is None:
             return 0.0
         return float(mob.get("max_hp") or npc_data.get_npc_max_hp(mob.get("npc_id", 0)))
@@ -262,7 +320,8 @@ class WorldState:
         if not msg:
             return
         params = msg["params"]
-        if msg["msg_id"] == SystemMessageId.YOU_DID_DAMAGE and params and isinstance(params[0], int):
+        if msg["msg_id"] in (SystemMessageId.YOU_DID_DAMAGE, SystemMessageId.PET_DID_DAMAGE) and params \
+                and isinstance(params[0], int):
             damage = params[0]
             self.events.damage_dealt += damage
             if len(params) >= 4 and all(isinstance(p, int) for p in params[1:4]):
@@ -272,8 +331,10 @@ class WorldState:
                 mob = self.char.radar.entries.get(victim)
                 if mob is not None:
                     mob["cur_hp"], mob["max_hp"] = cur_hp, max_hp
-            else:  # standard server: assume the current target
-                max_hp = self._target_max_hp()
+            else:  # standard server: assume the current target (the summon's, for its damage)
+                pet = self.char.pet
+                max_hp = (self._mob_max_hp(pet.get("target_id")) if msg["msg_id"] == SystemMessageId.PET_DID_DAMAGE and pet
+                          else self._target_max_hp())
             if max_hp > 0:
                 self.events.damage_dealt_share += min(1.0, damage / max_hp)
             self.last_hit_at = now
