@@ -155,6 +155,15 @@ COMBAT_ACTIONS: Final[frozenset[str]] = frozenset({"attacked", "used_skill", "pi
 # Damage resolution frames: the RL reward is attributed to them.
 DAMAGE_ACTIONS: Final[frozenset[str]] = frozenset({"inflicted_damage", "took_damage"})
 
+# Summoning before a fight: a summon cast (``used_skill`` of a ``Summon ...`` skill) or the
+# ``summoned`` event right before a target selection opens the session, so the model sees the
+# summoner prepare. Between it and the target selection only these rows may lie.
+SUMMON_SKILL_REGEX: Final = r"^(?:SKILL Summon |\[used skill\]: Summon )"
+PREPARATION_GAP_ACTIONS: Final[frozenset[str]] = frozenset(
+    {"used_skill", "summoned", "moved", "effect_applied", "skills_updated", "pet_command", "pet_used_skill",
+     "unsummoned", "used_item", "autouse_enabled", "autouse_disabled"}
+)
+
 # Breaks an open engagement before a kill (case C). The interrupting row itself is
 # never kept: the session is truncated at the last combat frame *before* it, so a
 # death / teleport is not part of the episode.
@@ -366,6 +375,8 @@ class CleaningReport:
     targets_non_hostile_ignored: int = 0
     targets_refresh: int = 0
     interrupts_total: int = 0
+    sessions_with_summoning: int = 0
+    dropped_pet_command_spam: int = 0
     sessions_extracted: int = 0
     sessions_with_kill: int = 0
     sessions_with_pickup: int = 0
@@ -660,6 +671,44 @@ def _combat_group_spans(
     )
 
 
+def _include_summoning(
+    start_index: NDArray[np.int64],
+    end_index: NDArray[np.int64],
+    character: NDArray,
+    action: NDArray,
+    timestamp: NDArray,
+    raw_text: NDArray,
+    cfg: CleaningConfig,
+) -> NDArray[np.int64]:
+    """
+    Move a session's start back to a summon cast (or ``summoned`` event) that prepared it.
+
+    Walks back from the target selection over :data:`PREPARATION_GAP_ACTIONS` rows of the same
+    character, never into the previous session and never across a gap above ``gap_seconds``;
+    the earliest summoning row found becomes the start.
+    """
+    summoning = (action == "summoned") | ((action == "used_skill")
+                                          & pd.Series(raw_text).str.contains(SUMMON_SKILL_REGEX, regex=True).to_numpy())
+    order = np.argsort(start_index, kind="stable")
+    result = start_index.copy()
+    gap = np.timedelta64(int(cfg.gap_seconds * 1000), "ms")
+    previous_end = -1
+    for index in order:
+        start = int(start_index[index])
+        floor = previous_end if previous_end >= 0 and character[previous_end] == character[start] else -1
+        position, earliest = start - 1, None
+        while (position > floor and character[position] == character[start]
+               and action[position] in PREPARATION_GAP_ACTIONS
+               and timestamp[position + 1] - timestamp[position] <= gap):
+            if summoning[position]:
+                earliest = position
+            position -= 1
+        if earliest is not None:
+            result[index] = earliest
+        previous_end = int(end_index[index])
+    return result
+
+
 def assign_combat_sessions(
     light: pd.DataFrame,
     eligible: NDArray[np.bool_],
@@ -743,6 +792,9 @@ def assign_combat_sessions(
     end_index = np.concatenate(ends)
     has_kill = np.concatenate(kills)
     has_pickup = np.concatenate(pickups)
+    raw_text = light["action_raw"].fillna("").to_numpy()[rows]
+    start_index = _include_summoning(start_index, end_index, character, action, timestamp, raw_text, cfg)
+    report.sessions_with_summoning = int((start_index != np.concatenate(starts)).sum())
 
     # Chronological ids across characters.
     rank = np.empty(start_index.size, dtype=np.int64)
@@ -943,6 +995,46 @@ def debounce_micro_events(
     return result
 
 
+#: ``PETCMD <command> -> Name#<objectId>(...)``: the command and the object id of its target.
+PET_COMMAND_REGEX: Final = r"^PETCMD (\S+) -> (?:.+?#(\d+|\?)\()?"
+#: A repeated summon command on the same target within this many seconds is click spam.
+PET_COMMAND_REPEAT_S: Final[float] = 3.0
+
+
+def dedup_pet_commands(
+    light: pd.DataFrame,
+    keep: NDArray[np.bool_],
+    sessions: NDArray[np.int64],
+    window_s: float = PET_COMMAND_REPEAT_S,
+) -> NDArray[np.bool_]:
+    """
+    Drop repeated summon commands: the same command on the same target within ``window_s`` of
+    the previous kept one of the session (players click "attack" several times per fight).
+    """
+    rows = np.flatnonzero(keep & (light["action_type"].to_numpy() == "pet_command")).astype(np.int64)
+    if rows.size == 0:
+        return keep
+    parsed = light["action_raw"].iloc[rows].fillna("").str.extract(PET_COMMAND_REGEX)
+    command = parsed[0].fillna("").to_numpy()
+    target = parsed[1].fillna("").to_numpy()
+    character = light["character_id"].to_numpy()[rows]
+    timestamp = light["ts"].to_numpy()[rows]
+    session = sessions[rows]
+    order = np.lexsort((rows, timestamp, character))
+
+    result = keep.copy()
+    window = np.timedelta64(int(window_s * 1000), "ms")
+    last: dict[tuple, np.datetime64] = {}
+    for i in order:
+        key = (character[i], session[i], command[i], target[i])
+        previous = last.get(key)
+        if previous is not None and timestamp[i] - previous <= window:
+            result[rows[i]] = False
+        else:
+            last[key] = timestamp[i]
+    return result
+
+
 def combat_by_session(
     light: pd.DataFrame,
     sessions: NDArray[np.int64],
@@ -1052,6 +1144,10 @@ def decide_rows(light: pd.DataFrame, cfg: CleaningConfig, report: CleaningReport
     surviving = int(keep.sum())
     keep = debounce_micro_events(light, keep, raw_session, cfg)
     report.dropped_debounced = surviving - int(keep.sum())
+
+    surviving = int(keep.sum())
+    keep = dedup_pet_commands(light, keep, raw_session)
+    report.dropped_pet_command_spam = surviving - int(keep.sum())
 
     # Stage 4b: a session survives only if it holds combat interaction. Every
     # engagement starts on a target selection, so a session whose only surviving
@@ -1283,6 +1379,11 @@ def print_summary(
         f"  stage 4a sub-ms duplicate spam       : {report.dropped_debounced} "
         f"(< {cfg.debounce_ms:g} ms, identical type + raw)"
     )
+    print(
+        f"  stage 4a summon command spam         : {report.dropped_pet_command_spam} "
+        f"(same command + target within {PET_COMMAND_REPEAT_S:g}s)"
+    )
+    print(f"  stage 1  sessions opened by summoning : {report.sessions_with_summoning}")
     print(
         f"  stage 4b sessions without combat    : {report.sessions_dropped} of {report.sessions_total} "
         f"-> {report.dropped_empty_sessions} rows removed"

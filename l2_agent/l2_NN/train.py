@@ -74,7 +74,7 @@ from l2_NN.dataloader.dataloder import (  # noqa: E402 - PROJECT_ROOT is added j
     PLAYER_FEATURE_NAMES,
     SKILL_FEATURE_DIM,
     SKILL_FEATURE_NAMES,
-    USED_SKILL_ACTION_ID,
+    SKILL_ACTION_IDS,
     Lineage2EventDataset,
 )
 from l2_NN.model.CombatEventTransformer import CombatEventTransformer  # noqa: E402
@@ -83,6 +83,8 @@ from l2_NN.model.CombatEventTransformer import CombatEventTransformer  # noqa: E
 DEFAULT_DATA_PATH: Final[Path] = PROJECT_ROOT.parent / "l2jc6_playeractions_cleaned.parquet"
 
 MOB_IS_TARGET_AT: Final[int] = MOB_FEATURE_NAMES.index("is_current_target")
+#: Actions whose skill slot the skill head learns (the character's skills and its summon's).
+SKILL_ACTION_TENSOR: Final[torch.Tensor] = torch.tensor(SKILL_ACTION_IDS)
 
 INPUT_KEYS: Final[tuple[str, ...]] = ("player_state", "delta_t", "mobs_matrix", "skills_matrix", "seq_mask")
 TARGET_KEYS: Final[tuple[str, ...]] = ("target_action_type", "target_pointer_idx", "target_skill_slot")
@@ -293,7 +295,8 @@ def prepare_batch(
     last_target_flags = batch["mobs_matrix"][:, -1, :, MOB_IS_TARGET_AT]
     masks = {
         "pointer": last_target_flags.gt(0.5).any(dim=-1),
-        "skill": batch["target_action_type"].eq(USED_SKILL_ACTION_ID) & batch["target_skill_valid"],
+        "skill": torch.isin(batch["target_action_type"], SKILL_ACTION_TENSOR.to(batch["target_action_type"].device))
+        & batch["target_skill_valid"],
     }
     if hide_last_target:
         mobs = batch["mobs_matrix"].clone()

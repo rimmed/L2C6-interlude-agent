@@ -51,14 +51,18 @@ from typing import Any
 import numpy as np
 
 from . import skill_features
-from .tools.data import skill_data
+from .tools.data import skill_data, summon_data
 
 #: Action classes the bot can execute.  The rest of the label space (inflicted_damage, killed, ...)
 #: is the game answering the player and is never a valid command.
-EXECUTABLE_ACTIONS = ("moved", "selected_target", "attacked", "used_skill", "picked_up", "used_item")
+EXECUTABLE_ACTIONS = ("moved", "selected_target", "attacked", "used_skill", "picked_up", "used_item",
+                      "pet_attack", "pet_skill")
 
 #: Actions whose execution uses the pointed monster; the pointer head is part of their probability.
-POINTER_ACTIONS = ("selected_target", "attacked", "used_skill", "moved")
+POINTER_ACTIONS = ("selected_target", "attacked", "used_skill", "moved", "pet_attack")
+
+#: Actions whose execution uses the chosen skill slot; the skill head is part of their probability.
+SKILL_ACTIONS = ("used_skill", "pet_skill")
 
 #: The logged InCombat flag is the server's attack stance: it switches on with the first hit (not
 #: with target selection) and lapses this long after the last combat action.
@@ -98,8 +102,12 @@ class Decision:
     pointer_slot: int | None = None
     skill_slot: int | None = None
     #: log-probability of the whole decision under the policy that made it: action type, plus the
-    #: pointer for :data:`POINTER_ACTIONS`, plus the skill slot for ``used_skill`` (RL importance weights)
+    #: pointer for :data:`POINTER_ACTIONS`, plus the skill slot for :data:`SKILL_ACTIONS` (RL importance weights)
     logp: float = 0.0
+    #: RequestActionUse id of the summon skill (``pet_skill``), ``None`` otherwise
+    pet_action_id: int | None = None
+    #: the summon skill is cast on the owner (heal, buff) instead of the target
+    pet_on_owner: bool = False
 
     def describe(self) -> str:
         parts = [f"{self.action} ({self.confidence:.0%})"]
@@ -123,10 +131,18 @@ class Observation:
     valid: dict[str, bool]
     #: ``skills_matrix`` slots whose skill can be cast right now
     usable_slots: tuple[int, ...]
-    #: the skill panel (slot -> skill id) the slots refer to
+    #: the skill panel (slot -> skill id) the slots refer to, the summon's skills after the character's
     panel: tuple[int, ...]
     #: ``time.time()`` of the observation
     t: float
+    #: slots of the summon's skills it can cast right now
+    pet_slots: tuple[int, ...] = ()
+    #: slot -> the summon skill behind it
+    pet_skills: dict[int, summon_data.PetSkill] | None = None
+
+    def skill_slots(self, action: str) -> tuple[int, ...]:
+        """The skill slots the skill head chooses from for ``action``."""
+        return self.pet_slots if action == "pet_skill" else self.usable_slots
 
 
 @dataclass(frozen=True)
@@ -241,8 +257,9 @@ class CombatPolicy:
             "cooldown_scale_s": skill_features.COOLDOWN_SCALE_S,
         }
         mismatch = {k: (expected.get(k), v) for k, v in actual.items() if not math.isclose(expected.get(k, -1.0), v)}
-        if mismatch or list(self.meta["features"]["skill"]) != list(skill_features.SKILL_SLOT_FEATURES):
-            raise ValueError(f"{meta_path}: skill encoding differs from l2_client/skill_features.py: {mismatch}")
+        unknown = [name for name in self.meta["features"]["skill"] if name not in skill_features.SKILL_SLOT_FEATURES]
+        if mismatch or unknown:
+            raise ValueError(f"{meta_path}: skill encoding differs from l2_client/skill_features.py: {mismatch} {unknown}")
 
     def _init_layout(self, server_speed: float, max_target_dz: float | None) -> None:
         self.seq_len: int = self.meta["seq_len"]
@@ -258,6 +275,8 @@ class CombatPolicy:
         self._skill_names: list[str] = features["skill"]
         self._mob_at = {name: i for i, name in enumerate(self._mob_names)}
         self._skill_at = {name: i for i, name in enumerate(self._skill_names)}
+        #: the model's skill features in the encoder's full slot layout (older models know fewer)
+        self._skill_cols = [skill_features.SKILL_SLOT_FEATURES.index(name) for name in self._skill_names]
 
         self._executable = [
             (name, self.action_to_id[name]) for name in EXECUTABLE_ACTIONS if name in self.action_to_id
@@ -265,6 +284,10 @@ class CombatPolicy:
         self.panel: list[int] = []
         self._panel_info: list[skill_data.SkillInfo] = []
         self._known_skills: set[int] = set()
+        #: the summon's skills (after the panel) for the summon template in ``_pet_npc``
+        self._pet_npc: int | None = None
+        self._pet_skills: list[tuple[summon_data.PetSkill, skill_data.SkillInfo]] = []
+        self._pet_cooldown_until: dict[int, float] = {}
 
         self._frames: deque[_Frame] = deque(maxlen=self.seq_len)
         self._session_engaged = False
@@ -334,6 +357,26 @@ class CombatPolicy:
         reuse_s = skill_data.get_skill_reuse_delay(skill_id) / 1000.0 / self.server_speed
         self._cooldown_until[skill_id] = now + reuse_s
         self._cast_at[skill_id] = now
+
+    def note_pet_skill_used(self, skill_id: int, now: float | None = None) -> None:
+        """The summon cast ``skill_id`` (its MagicSkillUse): its reuse starts (real-time expiry)."""
+        now = time.time() if now is None else now
+        info = next((info for pet, info in self._pet_skills if pet.skill_id == skill_id), None)
+        if info is not None:
+            self._pet_cooldown_until[skill_id] = now + info.reuse_ms / 1000.0 / self.server_speed
+
+    def _bind_pet(self, pet: dict | None) -> None:
+        """Rebuild the summon's skill slots when the summon (template) changed."""
+        npc = None if not pet or pet.get("dead") else pet.get("npc_id")
+        if npc == self._pet_npc:
+            return
+        self._pet_npc = npc
+        self._pet_skills = []
+        if npc is not None:
+            for pet_skill in summon_data.pet_skills(npc):
+                info = skill_data.get_skill_info(pet_skill.skill_id, pet_skill.level)
+                if info is not None and len(self._panel_info) + len(self._pet_skills) < self.max_skills:
+                    self._pet_skills.append((pet_skill, info))
 
     def apply_skill_cool_time(self, parsed: dict, now: float | None = None) -> None:
         """
@@ -410,12 +453,24 @@ class CombatPolicy:
             self.reset_session()
         self._session_engaged = self._session_engaged or engaged
 
+        pet = self._live_pet(char)
+        self._bind_pet(pet)
         frame = self._snapshot(char, current_target_id, pos, now)
         has_mobs = bool(frame.mob_ids)
         target_alive = bool(current_target_id) and current_target_id in char.radar.entries
         usable_slots = tuple(
             i for i, info in enumerate(self._panel_info)
             if self._skill_usable(info.skill_id, now) and char.cur_mp >= info.mp_cost
+            # summon skills need a summon; a second servitor cannot be summoned while one is out
+            and (pet is not None or not skill_data.needs_summon(info.skill_id))
+            and (pet is None or not skill_data.summons_servitor(info.skill_id))
+        )
+        first_pet_slot = len(self._panel_info)
+        pet_skills = {first_pet_slot + j: pet_skill for j, (pet_skill, _) in enumerate(self._pet_skills)}
+        pet_slots = tuple(
+            first_pet_slot + j for j, (pet_skill, info) in enumerate(self._pet_skills)
+            if pet is not None and self._pet_cooldown_until.get(pet_skill.skill_id, 0.0) <= now
+            and pet.get("cur_mp", 0) >= info.mp_cost and (pet_skill.on_owner or target_alive or has_mobs)
         )
         valid = {
             "moved": True,
@@ -424,9 +479,18 @@ class CombatPolicy:
             "used_skill": bool(usable_slots) and (target_alive or has_mobs),
             "picked_up": has_loot,
             "used_item": has_potion,
+            "pet_attack": pet is not None and (target_alive or has_mobs),
+            "pet_skill": bool(pet_slots),
         }
+        panel = tuple(self.panel) + tuple(pet_skill.skill_id for pet_skill, _ in self._pet_skills)
         return Observation(feeds=self._window(), mob_ids=frame.mob_ids, valid=valid, usable_slots=usable_slots,
-                           panel=tuple(self.panel), t=now)
+                           panel=panel, t=now, pet_slots=pet_slots, pet_skills=pet_skills)
+
+    @staticmethod
+    def _live_pet(char) -> dict | None:
+        """The character's summon if it has a living one (``char.pet`` is kept by the actor's WorldState)."""
+        pet = getattr(char, "pet", None)
+        return pet if pet and not pet.get("dead") else None
 
     def act(self, obs: Observation, *, sample: bool = False, rng: np.random.Generator | None = None) -> Decision:
         """
@@ -459,17 +523,23 @@ class CombatPolicy:
                 logp += float(logp_pointer[pointer_slot])
 
         skill_id = skill_slot = None
-        if obs.usable_slots:
-            logp_skill = _log_softmax(np.array([logits_skill[i] for i in obs.usable_slots]))
+        pet_skill = None
+        slots = obs.skill_slots(action)
+        if slots:
+            logp_skill = _log_softmax(np.array([logits_skill[i] for i in slots]))
             j = choose(logp_skill)
-            skill_slot = obs.usable_slots[j]
+            skill_slot = slots[j]
             skill_id = obs.panel[skill_slot]
-            if action == "used_skill":
+            if action in SKILL_ACTIONS:
                 logp += float(logp_skill[j])
+            if action == "pet_skill" and obs.pet_skills:
+                pet_skill = obs.pet_skills.get(skill_slot)
 
         return Decision(action=action, mob_object_id=mob_id, skill_id=skill_id,
                         confidence=float(np.exp(logp_action[k])), action_id=action_id,
-                        pointer_slot=pointer_slot, skill_slot=skill_slot, logp=logp)
+                        pointer_slot=pointer_slot, skill_slot=skill_slot, logp=logp,
+                        pet_action_id=pet_skill.action_id if pet_skill else None,
+                        pet_on_owner=bool(pet_skill and pet_skill.on_owner))
 
     def reload(self, onnx_bytes: bytes, meta: dict[str, Any]) -> None:
         """
@@ -537,7 +607,7 @@ class CombatPolicy:
         frame = _Frame(
             t=now,
             log_dt=log_dt,
-            player=self._encode_player(char, current_target_id, now),
+            player=self._encode_player(char, current_target_id, now, pos),
             mobs=mobs,
             skills=self._encode_skills(char, now),
             mob_ids=mob_ids,
@@ -545,7 +615,7 @@ class CombatPolicy:
         self._frames.append(frame)
         return frame
 
-    def _encode_player(self, char, current_target_id: int, now: float) -> np.ndarray:
+    def _encode_player(self, char, current_target_id: int, now: float, pos: tuple[int, int] = (0, 0)) -> np.ndarray:
         c = self.constants
 
         def ratio(numerator: float, denominator: float) -> float:
@@ -563,8 +633,30 @@ class CombatPolicy:
             "atk_speed": ratio(char.p_atk_spd or c["default_atk_speed"], c["max_atk_speed"]),
             # Training never saw a real move speed - feed the same constant it was trained on.
             "move_speed": ratio(c["default_move_speed"], c["max_move_speed"]),
+            **self._pet_features(char, now, pos),
         }
         return np.array([values[name] for name in self._player_names], dtype=np.float32)
+
+    def _pet_features(self, char, now: float, pos: tuple[int, int]) -> dict[str, float]:
+        """``has_pet .. pet_casting`` as the logs' ``pet`` block gives them (all 0 without a summon)."""
+        pet = self._live_pet(char)
+        if pet is None:
+            return {"has_pet": 0.0, "pet_hp_ratio": 0.0, "pet_mp_ratio": 0.0, "pet_dist_norm": 0.0,
+                    "pet_attacking": 0.0, "pet_casting": 0.0}
+
+        def ratio(numerator: float, denominator: float) -> float:
+            return 0.0 if denominator <= 0 else min(max(numerator / denominator, 0.0), 1.0)
+
+        x, y = pos
+        distance = math.hypot(pet.get("x", x) - x, pet.get("y", y) - y)
+        return {
+            "has_pet": 1.0,
+            "pet_hp_ratio": ratio(pet.get("cur_hp", 0), pet.get("max_hp", 0)),
+            "pet_mp_ratio": ratio(pet.get("cur_mp", 0), pet.get("max_mp", 0)),
+            "pet_dist_norm": min(distance / self.constants["max_distance"], 1.0),
+            "pet_attacking": 1.0 if pet.get("attacking_until", 0.0) > now else 0.0,
+            "pet_casting": 1.0 if pet.get("casting_until", 0.0) > now else 0.0,
+        }
 
     def _encode_mobs(self, char, current_target_id: int, pos: tuple[int, int],
                      now: float | None = None) -> tuple[np.ndarray, tuple[int, ...]]:
@@ -579,6 +671,8 @@ class CombatPolicy:
 
         x, y = pos
         char_z = getattr(char, "z", None)
+        pet = self._live_pet(char)
+        pet_target = pet.get("target_id") if pet else None
 
         def reachable(oid: int, mob: dict) -> bool:
             # The current target always stays visible: radar positions are spawn positions, so a monster
@@ -603,20 +697,28 @@ class CombatPolicy:
                     target_npc_id and mob.get("npc_id") == target_npc_id) else 0.0,
                 # another player hit it recently (the actor's WorldState marks the radar entry)
                 "by_other": 1.0 if mob.get("by_other_until", 0.0) > (time.time() if now is None else now) else 0.0,
+                "is_pet_target": 1.0 if pet_target and oid == pet_target else 0.0,
                 "is_padded": 0.0,
             }
             matrix[slot] = [row[name] for name in self._mob_names]
         return matrix, tuple(oid for _, oid, _ in ranked)
 
     def _encode_skills(self, char, now: float) -> np.ndarray:
-        matrix = np.zeros((self.max_skills, len(self._skill_names)), dtype=np.float32)
+        matrix = np.zeros((self.max_skills, skill_features.SKILL_SLOT_DIM), dtype=np.float32)
         for slot, info in enumerate(self._panel_info):
             # Expiries are real time, the feature is game time like the logged cooldowns.
             left = max(0.0, self._cooldown_until.get(info.skill_id, 0.0) - now) * self.server_speed
             matrix[slot] = skill_features.encode_skill_slot(
                 info, max_mp=char.max_mp, cur_mp=char.cur_mp, cooldown_left_s=left
             )
-        return matrix
+        pet = self._live_pet(char)
+        if pet is not None:
+            for j, (pet_skill, info) in enumerate(self._pet_skills):
+                left = max(0.0, self._pet_cooldown_until.get(pet_skill.skill_id, 0.0) - now) * self.server_speed
+                matrix[len(self._panel_info) + j] = skill_features.encode_skill_slot(
+                    info, max_mp=pet.get("max_mp", 0), cur_mp=pet.get("cur_mp", 0), cooldown_left_s=left, pet=True
+                )
+        return matrix[:, self._skill_cols]
 
     def _window(self) -> dict[str, np.ndarray]:
         """The last ``seq_len`` rows as unbatched, left-padded model inputs."""

@@ -152,9 +152,9 @@ def build_metadata(checkpoint: dict, onnx_path: Path) -> dict:
         "action_to_id": checkpoint["action_to_id"],
         # The layout the model was trained with (checkpoints before ``by_other`` carry no names).
         "features": checkpoint.get("features") or {
-            "player": list(dl.PLAYER_FEATURE_NAMES),
+            "player": list(dl.player_feature_names(config["player_dim"])),
             "mob": list(dl.mob_feature_names(config["mob_features"])),
-            "skill": list(dl.SKILL_FEATURE_NAMES),
+            "skill": list(dl.skill_feature_names(config["skill_features"])),
         },
         "constants": {
             "max_level": dl.MAX_LEVEL,

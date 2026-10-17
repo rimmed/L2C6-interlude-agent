@@ -56,6 +56,13 @@ _LEARN_LEVEL: dict[int, dict[int, int]] = {}
 
 #: Skill categories, in panel priority order (the first ones survive when a panel is full).
 CATEGORIES = ("attack", "debuff", "heal", "buff")
+#: Summoning a servitor, pet or cubic: on the panel too, after the combat categories (it has its own
+#: ``cat_summon`` feature, so the original one-hot layout of :data:`CATEGORIES` stays unchanged).
+SUMMON_CATEGORY = "summon"
+#: Every category that gets a panel slot, in panel priority order.
+PANEL_CATEGORIES = (*CATEGORIES, SUMMON_CATEGORY)
+#: Effects that bring a servitor or cubic (``SummonPet`` - pet items - and ``SummonNpc`` are not panel skills).
+_SUMMON_EFFECTS = frozenset(("Summon", "SummonCubic"))
 #: Coarse target classes.
 TARGETS = ("self", "single", "area")
 
@@ -87,7 +94,7 @@ class SkillInfo:
     skill_id: int
     level: int
     name: str
-    #: one of :data:`CATEGORIES`, or ``"other"`` (crafting, summons, escape, ...)
+    #: one of :data:`PANEL_CATEGORIES`, or ``"other"`` (crafting, escape, ...)
     category: str
     #: one of :data:`TARGETS`
     target: str
@@ -104,8 +111,8 @@ class SkillInfo:
 
     @property
     def combat(self) -> bool:
-        """Belongs on the combat skill panel: a learnable active/toggle skill of a combat category."""
-        return self.learnable and self.category in CATEGORIES
+        """Belongs on the combat skill panel: a learnable active/toggle skill of a combat category or a summon."""
+        return self.learnable and self.category in PANEL_CATEGORIES
 
 _loaded = False
 
@@ -225,6 +232,18 @@ def get_abnormal_type(skill_id: int) -> str:
     return raw["abnormal_type"] if raw else ""
 
 
+def needs_summon(skill_id: int) -> bool:
+    """The skill targets the character's summon (Servitor Heal, Bright Servitor ...): useless without one."""
+    raw = _SKILL_RAW.get(skill_id)
+    return bool(raw) and raw["target_type"] in ("SERVITOR", "PET", "SUMMON")
+
+
+def summons_servitor(skill_id: int) -> bool:
+    """The skill brings a servitor or pet (not a cubic): the server refuses it while one is out."""
+    raw = _SKILL_RAW.get(skill_id)
+    return bool(raw) and "Summon" in raw["effects"]
+
+
 def get_skill_info(skill_id: int, level: int = 1) -> SkillInfo | None:
     """Static description of a skill at ``level``, or ``None`` for an unknown skill."""
     raw = _SKILL_RAW.get(skill_id)
@@ -236,6 +255,8 @@ def get_skill_info(skill_id: int, level: int = 1) -> SkillInfo | None:
     # Corpse-targeted skills need a dead monster as target, which the bots never select.
     if not is_active or effects & _NON_COMBAT_EFFECTS or "CORPSE" in raw["target_type"]:
         category = "other"
+    elif effects & _SUMMON_EFFECTS:
+        category = SUMMON_CATEGORY
     elif effects & _ATTACK_EFFECTS:
         category = "attack"
     elif effects & _DEBUFF_EFFECTS:
@@ -299,7 +320,7 @@ def combat_panel(skills: Iterable[tuple[int, int]], max_slots: int = 64) -> list
 
     :param skills: ``(skill_id, level)`` pairs the character knows (passives are dropped here)
     :param max_slots: panel size; when there are more skills, categories earlier in
-        :data:`CATEGORIES` win (attacks first), then lower skill ids
+        :data:`PANEL_CATEGORIES` win (attacks first, summons last), then lower skill ids
     :return: the panel in a stable order (category priority, then skill id)
     """
     best: dict[int, SkillInfo] = {}
@@ -307,7 +328,7 @@ def combat_panel(skills: Iterable[tuple[int, int]], max_slots: int = 64) -> list
         info = get_skill_info(int(skill_id), int(level))
         if info is not None and info.combat and (skill_id not in best or level > best[skill_id].level):
             best[int(skill_id)] = info
-    ranked = sorted(best.values(), key=lambda s: (CATEGORIES.index(s.category), s.skill_id))
+    ranked = sorted(best.values(), key=lambda s: (PANEL_CATEGORIES.index(s.category), s.skill_id))
     return ranked[:max_slots]
 
 

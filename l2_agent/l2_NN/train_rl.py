@@ -70,7 +70,7 @@ from l2_actor import replay  # noqa: E402 - PROJECT_ROOT is added just above
 from l2_client.policy import POINTER_ACTIONS  # noqa: E402
 from l2_NN.dataloader import dataloder as dl  # noqa: E402
 from l2_NN.dataloader.augment import AugmentConfig  # noqa: E402
-from l2_NN.dataloader.dataloder import USED_SKILL_ACTION_ID, Lineage2EventDataset  # noqa: E402
+from l2_NN.dataloader.dataloder import SKILL_ACTION_IDS, Lineage2EventDataset  # noqa: E402
 from l2_NN.export_onnx import export_policy, load_policy_weights  # noqa: E402
 from l2_NN.model.CombatEventTransformer import CombatEventTransformer  # noqa: E402
 from l2_NN.train import DEFAULT_DATA_PATH, INPUT_KEYS, AugmentedWindows, compute_losses, prepare_batch  # noqa: E402
@@ -300,6 +300,10 @@ def entropy(logp: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return -(logp.exp() * logp).masked_fill(~mask, 0.0).sum(dim=-1)
 
 
+#: Actions whose stored decision includes a skill slot (the character's skill or its summon's).
+SKILL_ACTIONS = torch.tensor(SKILL_ACTION_IDS)
+
+
 def policy_terms(out: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], pointer_action: torch.Tensor
                  ) -> tuple[torch.Tensor, torch.Tensor]:
     """``(logp, entropy)`` of the stored decisions under the learner, both ``[B, T]``."""
@@ -316,7 +320,7 @@ def policy_terms(out: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], p
     logp_skill = masked_log_softmax(logits_skill, batch["skill_mask"])
 
     use_ptr = pointer_action[action] & (pointer >= 0)
-    use_skill = (action == USED_SKILL_ACTION_ID) & (skill >= 0)
+    use_skill = torch.isin(action, SKILL_ACTIONS.to(action.device)) & (skill >= 0)
     logp = logp_type.gather(-1, action.unsqueeze(-1)).squeeze(-1)
     logp = logp + torch.where(use_ptr, logp_ptr.gather(-1, pointer.clamp(min=0).unsqueeze(-1)).squeeze(-1), 0.0)
     logp = logp + torch.where(use_skill, logp_skill.gather(-1, skill.clamp(min=0).unsqueeze(-1)).squeeze(-1), 0.0)
@@ -442,7 +446,8 @@ class Trainer:
         else:
             print(f"Initialised from {source} (BC epoch {checkpoint.get('epoch')})")
 
-        pointer_ids = [self.action_to_id[name] for name in POINTER_ACTIONS]
+        # A model trained before summons were supported has no pet_attack class.
+        pointer_ids = [self.action_to_id[name] for name in POINTER_ACTIONS if name in self.action_to_id]
         self.pointer_action = torch.zeros(len(self.action_to_id), dtype=torch.bool, device=self.device)
         self.pointer_action[pointer_ids] = True
 
@@ -459,11 +464,19 @@ class Trainer:
         self._reward_window: deque[tuple[float, int]] = deque(maxlen=2000)
         self._publisher: subprocess.Popen | None = None
         self.demos = demo_batches(args, self.init_args, self.action_to_id)
-        # Demonstrations come in today's mob layout; an older model may know fewer mob features.
-        model_mob = (checkpoint.get("features") or {}).get("mob") or dl.mob_feature_names(self.model_config["mob_features"])
-        self.features = {"player": list(dl.PLAYER_FEATURE_NAMES), "mob": list(model_mob),
-                         "skill": list(dl.SKILL_FEATURE_NAMES)}
-        self.demo_mob_columns = torch.tensor([dl.MOB_FEATURE_NAMES.index(name) for name in model_mob])
+        # Demonstrations come in today's feature layouts; an older model may know fewer features.
+        saved = checkpoint.get("features") or {}
+        self.features = {
+            "player": list(saved.get("player") or dl.player_feature_names(self.model_config["player_dim"])),
+            "mob": list(saved.get("mob") or dl.mob_feature_names(self.model_config["mob_features"])),
+            "skill": list(saved.get("skill") or dl.skill_feature_names(self.model_config["skill_features"])),
+        }
+        self.demo_columns = {
+            key: torch.tensor(dl.feature_columns(self.features[name], current))
+            for key, name, current in (("player_state", "player", dl.PLAYER_FEATURE_NAMES),
+                                       ("mobs_matrix", "mob", dl.MOB_FEATURE_NAMES),
+                                       ("skills_matrix", "skill", dl.SKILL_FEATURE_NAMES))
+        }
 
     # -- data ----------------------------------------------------------------------------
 
@@ -514,7 +527,8 @@ class Trainer:
             loss = loss + policy_loss
             if self.demos is not None:
                 raw = next(self.demos)
-                raw["mobs_matrix"] = raw["mobs_matrix"].index_select(-1, self.demo_mob_columns)
+                for key, columns in self.demo_columns.items():
+                    raw[key] = raw[key].index_select(-1, columns)
                 demo, masks = prepare_batch(raw, self.device, not self.init_args.get("keep_last_target_flag", False))
                 with torch.autocast(self.device.type, dtype=self.amp_dtype or torch.float32,
                                     enabled=self.amp_dtype is not None):

@@ -73,20 +73,24 @@ canonical set pinned by the dataloader contract, and the table then continues wi
 other action type the log parser can emit, so no logged event has to fall through to
 ``unknown``:
 
-======  =================  ======  ===================
-id      action_type        id      action_type
-======  =================  ======  ===================
-0       moved              10      resurrected
-1       selected_target    11      effect_applied
-2       attacked           12      skills_updated
-3       used_skill         13      used_item
-4       picked_up          14      learned_skill
-5       unknown            15      autouse_enabled
-6       inflicted_damage   16      autouse_disabled
-7       took_damage        17      dropped
-8       killed             18      buy
+======  =================  ======  ===================  ======  ====================
+id      action_type        id      action_type          id      action_type
+======  =================  ======  ===================  ======  ====================
+0       moved              10      resurrected          20      pet_attack
+1       selected_target    11      effect_applied       21      pet_skill
+2       attacked           12      skills_updated       22      pet_order
+3       used_skill         13      used_item            23      summoned
+4       picked_up          14      learned_skill        24      unsummoned
+5       unknown            15      autouse_enabled      25      pet_died
+6       inflicted_damage   16      autouse_disabled     26      pet_inflicted_damage
+7       took_damage        17      dropped              27      pet_took_damage
+8       killed             18      buy                  28      pet_used_skill
 9       died               19      teleported
-======  =================  ======  ===================
+======  =================  ======  ===================  ======  ====================
+
+The parser's ``pet_command`` is split by its command: ``attack`` -> ``pet_attack`` (the pointer
+head picks the monster), ``skill<actionId>`` -> ``pet_skill`` (the skill head picks the summon's
+skill slot, after the character's own panel), anything else -> ``pet_order``.
 
 ``unknown`` stays reserved for values the tables do not know (and for the parser's
 "``performed_action``"/"``other``" buckets).  :meth:`Lineage2EventDataset.unmapped_action_types`
@@ -118,8 +122,9 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset
 
+from l2_client import skill_features
 from l2_client.skill_features import COOLDOWN_SCALE_S, SKILL_SLOT_DIM, SKILL_SLOT_FEATURES, encode_skill_slot
-from l2_client.tools.data import skill_data
+from l2_client.tools.data import skill_data, summon_data
 
 from .augment import AugmentConfig
 
@@ -160,6 +165,17 @@ ACTION_TYPE_IDS: Final[dict[str, int]] = {
     # --- non-combat / locomotion (dropped by the cleaning stage, kept for raw logs) ------
     "buy": 18,
     "teleported": 19,
+    # --- summons (servitors / pets): the owner's commands ----------------------------------
+    "pet_attack": 20,  # PETCMD attack: the pointer head picks the monster
+    "pet_skill": 21,  # PETCMD skill<actionId>: the skill head picks the summon's skill slot
+    "pet_order": 22,  # the other commands (follow, stop, move, unsummon) - not executed by the bot yet
+    # --- summons: the game answering ------------------------------------------------------
+    "summoned": 23,
+    "unsummoned": 24,
+    "pet_died": 25,
+    "pet_inflicted_damage": 26,
+    "pet_took_damage": 27,
+    "pet_used_skill": 28,
 }
 
 #: Raw spellings that occur in the logs / are produced by the parser, folded onto the
@@ -228,6 +244,9 @@ ACTION_TYPE_ALIASES: Final[dict[str, str]] = {
 
 UNKNOWN_ACTION_ID: Final[int] = ACTION_TYPE_IDS["unknown"]
 USED_SKILL_ACTION_ID: Final[int] = ACTION_TYPE_IDS["used_skill"]
+PET_SKILL_ACTION_ID: Final[int] = ACTION_TYPE_IDS["pet_skill"]
+#: Actions whose label includes a skill slot (the skill head is trained on them).
+SKILL_ACTION_IDS: Final[tuple[int, ...]] = (USED_SKILL_ACTION_ID, PET_SKILL_ACTION_ID)
 
 PLAYER_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "hp_ratio",
@@ -238,20 +257,43 @@ PLAYER_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "cast_speed",
     "atk_speed",
     "move_speed",
+    # the character's summon (format-2 ``pet`` block); all 0 without one
+    "has_pet",
+    "pet_hp_ratio",
+    "pet_mp_ratio",
+    "pet_dist_norm",
+    "pet_attacking",
+    "pet_casting",
 )
 PLAYER_FEATURE_DIM: Final[int] = len(PLAYER_FEATURE_NAMES)
+#: The player features of models trained before summons were supported (a prefix of the current layout).
+LEGACY_PLAYER_FEATURE_NAMES: Final[tuple[str, ...]] = PLAYER_FEATURE_NAMES[: PLAYER_FEATURE_NAMES.index("has_pet")]
+
+
+def player_feature_names(dim: int) -> tuple[str, ...]:
+    """The player feature layout of a model with ``dim`` player features (old checkpoints carry no names)."""
+    for names in (PLAYER_FEATURE_NAMES, LEGACY_PLAYER_FEATURE_NAMES):
+        if len(names) == dim:
+            return names
+    raise ValueError(f"no known player feature layout has {dim} features")
+
 
 #: ``by_other``: another player is on the monster's aggro list (format-2 logs, ``nearby_objects[].attackers``;
-#: always 0 in format-1 logs).
-MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_current_target", "by_other", "is_padded")
+#: always 0 in format-1 logs). ``is_pet_target``: the character's summon has it as its target.
+#: ``is_padded`` is always the last feature (the model masks the padding slots by it).
+MOB_FEATURE_NAMES: Final[tuple[str, ...]] = (
+    "dist_norm", "lvl_diff", "is_current_target", "by_other", "is_pet_target", "is_padded",
+)
 MOB_FEATURE_DIM: Final[int] = len(MOB_FEATURE_NAMES)
+#: The mob features of models trained before summons were supported.
+BY_OTHER_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_current_target", "by_other", "is_padded")
 #: The mob features of models trained before ``by_other`` existed.
 LEGACY_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_current_target", "is_padded")
 
 
 def mob_feature_names(dim: int) -> tuple[str, ...]:
     """The mob feature layout of a model with ``dim`` mob features (old checkpoints carry no names)."""
-    for names in (MOB_FEATURE_NAMES, LEGACY_MOB_FEATURE_NAMES):
+    for names in (MOB_FEATURE_NAMES, BY_OTHER_MOB_FEATURE_NAMES, LEGACY_MOB_FEATURE_NAMES):
         if len(names) == dim:
             return names
     raise ValueError(f"no known mob feature layout has {dim} features")
@@ -259,6 +301,12 @@ MOB_PADDED_INDEX: Final[int] = MOB_FEATURE_NAMES.index("is_padded")
 
 SKILL_FEATURE_NAMES: Final[tuple[str, ...]] = SKILL_SLOT_FEATURES
 SKILL_FEATURE_DIM: Final[int] = SKILL_SLOT_DIM
+skill_feature_names = skill_features.skill_feature_names
+
+
+def feature_columns(model_names: Sequence[str], names: Sequence[str]) -> list[int]:
+    """Positions of a model's features (``model_names``) in a newer layout ``names`` (to feed an older model)."""
+    return [list(names).index(name) for name in model_names]
 
 #: Datapack skill XML (the skill catalog is built from it).
 DATAPACK_SKILLS: Final[Path] = (
@@ -267,7 +315,9 @@ DATAPACK_SKILLS: Final[Path] = (
 )
 
 #: Environment events (the game answering the player) that ``event_dropout`` may remove.
-ENVIRONMENT_EVENT_NAMES: Final[tuple[str, ...]] = ("inflicted_damage", "took_damage", "effect_applied")
+ENVIRONMENT_EVENT_NAMES: Final[tuple[str, ...]] = (
+    "inflicted_damage", "took_damage", "effect_applied", "pet_inflicted_damage", "pet_took_damage", "pet_used_skill",
+)
 
 #: Timestamp layout used by the client log (and therefore by the Parquet file).
 TIMESTAMP_FORMAT: Final[str] = "%Y.%m.%d %H:%M:%S,%f"
@@ -546,7 +596,8 @@ class Lineage2EventDataset(Dataset):
         for raw, count in self.data["action_type"].value_counts().items():
             key = str(raw).strip().lower()
             canonical = ACTION_TYPE_ALIASES.get(key, key)
-            if canonical not in self.action_to_id:
+            # pet_command is split by its command into pet_attack / pet_skill / pet_order
+            if canonical not in self.action_to_id and canonical != "pet_command":
                 unresolved[str(raw)] = int(count)
         return unresolved
 
@@ -683,6 +734,9 @@ class Lineage2EventDataset(Dataset):
             return UNKNOWN_ACTION_ID
         key = str(raw).strip().lower()
         canonical = ACTION_TYPE_ALIASES.get(key, key)
+        if canonical == "pet_command":
+            command = str(_lookup(row, "pet_command", "") or "")
+            canonical = "pet_attack" if command == "attack" else "pet_skill" if command.startswith("skill") else "pet_order"
         return self.action_to_id.get(canonical, UNKNOWN_ACTION_ID)
 
     def _encode_player_state(self, row: Any) -> np.ndarray:
@@ -714,8 +768,29 @@ class Lineage2EventDataset(Dataset):
                 _ratio(cast_speed, MAX_CAST_SPEED),
                 _ratio(atk_speed, MAX_ATK_SPEED),
                 _ratio(move_speed, MAX_MOVE_SPEED),
+                *self._encode_pet(row),
             ),
             dtype=np.float32,
+        )
+
+    @staticmethod
+    def _pet(row: Any) -> Optional[Mapping[str, Any]]:
+        """The ``pet`` struct of the event (the character's summon), ``None`` without one."""
+        pet = _lookup(row, "pet", None)
+        return pet if isinstance(pet, Mapping) and pet.get("object_id") is not None else None
+
+    def _encode_pet(self, row: Any) -> tuple[float, ...]:
+        """``has_pet .. pet_casting`` (all 0 without a living summon)."""
+        pet = self._pet(row)
+        if pet is None or _as_bool(pet.get("dead")):
+            return (0.0,) * 6
+        return (
+            1.0,
+            _ratio(_as_float(pet.get("hp"), 0.0), _as_float(pet.get("max_hp"), 1.0)),
+            _ratio(_as_float(pet.get("mp"), 0.0), _as_float(pet.get("max_mp"), 1.0)),
+            min(max(_as_float(pet.get("distance"), MAX_DISTANCE), 0.0) / MAX_DISTANCE, 1.0),
+            1.0 if _as_bool(pet.get("atk")) else 0.0,
+            1.0 if _as_bool(pet.get("cast")) else 0.0,
         )
 
     def _sorted_mob_candidates(self, row: Any) -> list[Mapping[str, Any]]:
@@ -742,9 +817,14 @@ class Lineage2EventDataset(Dataset):
 
         player_level = _feature_number(row, ("lvl", "level"), 1.0)
         target_npc_id = _optional_number(row, ("entity_npc_id", "entity_npc.id"))
+        # Format 2 names the very monster (its world object id): it wins over the template match.
+        target_object_id = _optional_number(row, ("entity_object_id",))
+        pet = self._pet(row)
+        pet_target = None if pet is None else _optional_number(pet, ("target_id",))
 
         pointer_idx = 0
         matched = False
+        exact = False
         for slot_idx, mob in enumerate(self._sorted_mob_candidates(row)[: self.max_mobs]):
             distance = _as_float(mob.get("distance"), DEFAULT_DISTANCE)
             dist_norm = min(max(distance, 0.0) / MAX_DISTANCE, 1.0)
@@ -753,6 +833,7 @@ class Lineage2EventDataset(Dataset):
             lvl_diff = 0.0 if mob_level is None else (mob_level - player_level) / MAX_LEVEL
 
             mob_npc_id = _optional_number(mob, ("id", "npc_id"))
+            mob_object_id = _optional_number(mob, ("object_id",))
             is_target = 0.0
             if target_npc_id is not None and mob_npc_id is not None and int(mob_npc_id) == int(target_npc_id):
                 is_target = 1.0
@@ -760,10 +841,15 @@ class Lineage2EventDataset(Dataset):
                     # Keep the *closest* matching candidate as the label.
                     pointer_idx = slot_idx
                     matched = True
+            if (not exact and target_object_id is not None and mob_object_id is not None
+                    and int(mob_object_id) == int(target_object_id)):
+                pointer_idx, matched, exact = slot_idx, True, True
 
             attackers = mob.get("attackers")
             by_other = 1.0 if attackers is not None and len(attackers) > 0 else 0.0
-            matrix[slot_idx] = (dist_norm, lvl_diff, is_target, by_other, 0.0)
+            is_pet_target = 1.0 if (pet_target is not None and mob_object_id is not None
+                                    and int(mob_object_id) == int(pet_target)) else 0.0
+            matrix[slot_idx] = (dist_norm, lvl_diff, is_target, by_other, is_pet_target, 0.0)
 
         return matrix, pointer_idx, matched
 
@@ -780,9 +866,15 @@ class Lineage2EventDataset(Dataset):
             remaining[int(skill_id)] = milliseconds / MILLISECONDS_PER_SECOND
         return remaining
 
-    def _encode_skills_matrix(self, row: Any, action_id: int) -> tuple[np.ndarray, np.ndarray, int, bool]:
+    def _encode_skills_matrix(self, row: Any, action_id: int, pet_cooldown_until: Mapping[int, float] | None = None,
+                              now: float = 0.0) -> tuple[np.ndarray, np.ndarray, int, bool]:
         """
         Encode the combat skill panel (``(N, SKILL_FEATURE_DIM)``) and the ``target_skill_slot`` label.
+
+        The summon's skills follow the character's panel (``is_pet_skill = 1``, MP and cooldown are
+        the summon's); ``pet_skill`` events are labelled with the slot of the ordered skill.
+
+        :param pet_cooldown_until: summon skill id -> end of its reuse (seconds, the clock of ``now``)
 
         :return: ``(matrix, skill_ids, slot_label, resolved)`` - ``skill_ids`` holds the skill of every
             slot (``-1`` = empty); ``resolved`` tells whether the used skill is on the panel
@@ -812,6 +904,28 @@ class Lineage2EventDataset(Dataset):
             skill_ids[slot_idx] = info.skill_id
             if used_skill_key is not None and info.skill_id == used_skill_key:
                 slot_label, resolved = slot_idx, True
+
+        pet = self._pet(row)
+        if pet is not None and not _as_bool(pet.get("dead")) and pet.get("npc_id") is not None:
+            ordered = None
+            command = str(_lookup(row, "pet_command", "") or "")
+            if action_id == PET_SKILL_ACTION_ID and command.startswith("skill") and command[5:].isdigit():
+                ordered = int(command[5:])
+            pet_mp = _as_float(pet.get("mp"), 0.0)
+            pet_max_mp = _as_float(pet.get("max_mp"), 1.0)
+            cooldowns = pet_cooldown_until or {}
+            for offset, pet_skill in enumerate(summon_data.pet_skills(int(pet["npc_id"]))):
+                slot_idx = len(panel) + offset
+                info = skill_data.get_skill_info(pet_skill.skill_id, pet_skill.level)
+                if slot_idx >= self.max_skills or info is None:
+                    break
+                matrix[slot_idx] = encode_skill_slot(
+                    info, max_mp=pet_max_mp, cur_mp=pet_mp,
+                    cooldown_left_s=max(0.0, cooldowns.get(pet_skill.skill_id, 0.0) - now), pet=True,
+                )
+                skill_ids[slot_idx] = pet_skill.skill_id
+                if ordered is not None and pet_skill.action_id == ordered:
+                    slot_label, resolved = slot_idx, True
         return matrix, skill_ids, slot_label, resolved
 
     # ----------------------------------------------------------------------------------
@@ -836,13 +950,25 @@ class Lineage2EventDataset(Dataset):
         max_mp = np.ones(count, dtype=np.float32)
         level = np.ones(count, dtype=np.float32)
 
+        # The logs carry the character's cooldowns only: a summon skill's reuse starts at its PETSKILL event.
+        times = frame["timestamp"].astype("int64").to_numpy() / 1e9
+        sessions_column = frame["session_id"].to_numpy()
+        pet_used = self.action_to_id["pet_used_skill"]
+        pet_cooldown_until: dict[int, float] = {}
         for position, (_, row) in enumerate(frame.iterrows()):
+            if position == 0 or sessions_column[position] != sessions_column[position - 1]:
+                pet_cooldown_until = {}
             action_id = self._encode_action_type(row)
             action_type[position] = action_id
             player_state[position] = self._encode_player_state(row)
             mobs_matrix[position], pointer_idx[position], pointer_resolved[position] = self._encode_mobs_matrix(row)
             (skills_matrix[position], skill_ids[position], skill_slot[position],
-             skill_resolved[position]) = self._encode_skills_matrix(row, action_id)
+             skill_resolved[position]) = self._encode_skills_matrix(row, action_id, pet_cooldown_until, times[position])
+            if action_id == pet_used:
+                used = _optional_number(row, ("skill_id",))
+                if used is not None:
+                    reuse_ms = skill_data.get_skill_info(int(used)).reuse_ms if skill_data.get_skill_info(int(used)) else 0.0
+                    pet_cooldown_until[int(used)] = times[position] + reuse_ms / MILLISECONDS_PER_SECOND
             mp[position] = _feature_number(row, ("mp", "char_stats.mp"), 0.0)
             max_mp[position] = _feature_number(row, ("max_mp", "char_stats.max_mp"), 1.0)
             level[position] = _feature_number(row, ("lvl", "level"), 1.0)
