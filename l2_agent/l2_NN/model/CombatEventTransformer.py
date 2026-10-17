@@ -140,8 +140,9 @@ class CombatEventTransformer(nn.Module):
         player_combined = torch.cat([player_state, delta_t], dim=-1) # [B, L, 9]
         emb_player = self.player_mlp(player_combined)                 # [B, L, 64]
 
-        # Для мобів: 4-й прапорець is_padded (1 = padded, 0 = real) -> маска valid = is_padded == 0
-        mob_valid_mask = (mobs_matrix[..., 3] == 0)                   # [B, L, K]
+        # Для мобів: останній прапорець is_padded (1 = padded, 0 = real) -> маска valid = is_padded == 0.
+        # is_padded is the last mob feature in every layout (dataloder.MOB_FEATURE_NAMES and the legacy one).
+        mob_valid_mask = (mobs_matrix[..., -1] == 0)                  # [B, L, K]
         emb_mobs, mob_entities = self.mob_encoder(mobs_matrix, mask=mob_valid_mask)  # [B, L, 64], [B, L, K, 64]
 
         # Для скілів: порожній слот - повністю нульовий рядок (is_valid = 0)
