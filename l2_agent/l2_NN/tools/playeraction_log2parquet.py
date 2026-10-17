@@ -627,6 +627,9 @@ ROW_FIELDS = (
     "active_skills",
     "passive_skills",
     "known_skills",
+    # summon (format 2): its state while the character has one, the owner's command
+    "pet",
+    "pet_command",
 )
 
 
@@ -948,12 +951,14 @@ V2_ACTIONS = {
     "ACTION": "performed_action", "ITEM": "used_item", "EFFECT": "effect_applied", "EFFECTS": "active_effects",
     "SHOT": "shot_used", "BUY": "buy", "SELL": "sell", "LEARN": "learned_skill", "TELEPORT": "teleported",
     "DIED": "died", "REVIVED": "resurrected", "SKILLS": "skills_updated", "NOTE": "other",
+    "SUMMON": "summoned", "UNSUMMON": "unsummoned", "PETDIED": "pet_died", "PETCMD": "pet_command",
+    "PETSKILL": "pet_used_skill", "PETHIT": "pet_took_damage",
 }
 V2_SLOTS = dict(zip(v2.SLOT_KEYS, SLOTS))
 V2_STATS = {"patk": "p_atk", "matk": "m_atk", "pdef": "p_def", "mdef": "m_def", "acc": "accur", "crit": "crit_rate",
             "eva": "evasion", "aspd": "atk_speed", "cspd": "cast_speed", "str": "str", "int": "int", "dex": "dex",
             "con": "con", "wit": "wit"}
-V2_DAMAGE = re.compile(r"^(?P<damage>miss|\d+) (?:->|<-) (?P<ref>.+) skill (?P<skill>.+)$")
+V2_DAMAGE = re.compile(r"^(?P<damage>miss|\d+) (?:->|<-) (?P<ref>.+) skill (?P<skill>.+?)(?P<by_pet> by pet)?$")
 V2_KILL = re.compile(r"^(?P<ref>.+) drop (?P<item>.+)\[(?P<count>\d+)\] (?P<how>auto|ground)$")
 V2_TRADE = re.compile(r"^(?P<item>.+)\[(?P<item_id>\d+)\] x(?P<count>\d+) price (?P<price>\d+) npc (?P<npc>.+)\[(?P<npc_id>\d+)\]$")
 V2_LEARN = re.compile(r"^(?P<skill>.+)\[(?P<skill_id>\d+)\] L(?P<level>\d+) cost (?P<sp>\d+)sp")
@@ -1042,6 +1047,8 @@ def parse_v2_line(line: str, resolver: EntityResolver, source_file: str, line_no
                              "hp_pct": mob["hp_pct"], "attackers": mob["attackers"] or None})
         row["nearby_count"] = len(monsters)
         row["nearby_objects"] = monsters or None
+    if "pet" in blocks:
+        row["pet"] = v2.parse_pet(blocks["pet"])
     if "cd" in blocks:
         row["cooldown_raw"] = blocks["cd"]
         row["cooldowns"] = [{"skill_id": sid, "remaining": ms} for sid, ms in v2.parse_cd(blocks["cd"])] or None
@@ -1052,18 +1059,29 @@ def parse_v2_line(line: str, resolver: EntityResolver, source_file: str, line_no
         point = V2_POINT.match(payload)
         if point:
             row["move_x"], row["move_y"], row["move_z"] = (int(v) for v in point.groups())
-    elif event == "SKILL":
+    elif event in ("SKILL", "PETSKILL"):
         skill, _, ref = payload.partition(" -> ")
         row["skill_name"], row["skill_id"] = v2.named_id(skill)
         _v2_link_ref(row, resolver, v2.parse_ref(ref), character)
-    elif event in ("DMG", "HIT"):
+    elif event in ("DMG", "HIT", "PETHIT"):
         dmg = V2_DAMAGE.match(payload)
         if dmg:
+            if dmg.group("by_pet"):
+                row["action_type"] = action_type = "pet_inflicted_damage"
             row["is_miss"] = dmg.group("damage") == "miss"
             row["damage"] = 0 if row["is_miss"] else int(dmg.group("damage"))
             if dmg.group("skill") != "-":
                 row["skill_name"], row["skill_id"] = v2.named_id(dmg.group("skill"))
             _v2_link_ref(row, resolver, v2.parse_ref(dmg.group("ref")), character)
+    elif event in ("SUMMON", "UNSUMMON"):
+        _v2_link_ref(row, resolver, v2.parse_ref(payload), character)
+    elif event == "PETDIED":
+        _, _, killer = payload.partition(" <- ")
+        _v2_link_ref(row, resolver, v2.parse_ref(killer), character)
+    elif event == "PETCMD":
+        command, _, ref = payload.partition(" -> ")
+        row["pet_command"] = command
+        _v2_link_ref(row, resolver, v2.parse_ref(ref), character)
     elif event == "KILL":
         kill = V2_KILL.match(payload)
         if kill:
@@ -1287,6 +1305,14 @@ def _build_schema() -> pa.Schema:
         ("active_skills", skill_list),
         ("passive_skills", skill_list),
         ("known_skills", skill_list),
+        ("pet", pa.struct([
+            ("object_id", pa.int64()), ("npc_id", pa.int64()), ("name", pa.string()), ("level", pa.int64()),
+            ("hp", pa.float64()), ("max_hp", pa.float64()), ("mp", pa.float64()), ("max_mp", pa.float64()),
+            ("x", pa.int64()), ("y", pa.int64()), ("z", pa.int64()), ("distance", pa.float64()),
+            ("target_id", pa.int64()), ("atk", pa.bool_()), ("cast", pa.bool_()), ("dead", pa.bool_()),
+            ("follow", pa.bool_()),
+        ])),
+        ("pet_command", pa.string()),
     ]
 
     if [name for name, _ in fields] != list(ROW_FIELDS):

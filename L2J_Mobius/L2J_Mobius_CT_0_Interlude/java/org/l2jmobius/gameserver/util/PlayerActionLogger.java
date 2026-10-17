@@ -37,6 +37,7 @@ import org.l2jmobius.gameserver.model.actor.Attackable;
 import org.l2jmobius.gameserver.model.actor.Creature;
 import org.l2jmobius.gameserver.model.actor.Npc;
 import org.l2jmobius.gameserver.model.actor.Player;
+import org.l2jmobius.gameserver.model.actor.Summon;
 import org.l2jmobius.gameserver.model.actor.holders.creature.TimeStamp;
 import org.l2jmobius.gameserver.model.actor.holders.npc.AggroInfo;
 import org.l2jmobius.gameserver.model.item.instance.Item;
@@ -52,10 +53,12 @@ import org.l2jmobius.gameserver.model.skill.Skill;
  * <li>references: {@code Name#objectId(npcId Llvl) hp cur/max} for monsters and NPCs, {@code Name#objectId(pc Llvl) hp cur/max} for players, {@code Name#objectId(item itemId)} for items, {@code -} for none;</li>
  * <li>{@code me L18 hp 711/711 mp 231/231 cp 368/368 @x,y,z h<heading> wt<load %>} plus the flags {@code sit cast atk dead combat} when set;</li>
  * <li>{@code sel d<distance> los|nolos h<target heading>}: the selected target, relative to the character;</li>
+ * <li>{@code pet Name#objectId(summon npcId Llvl) hp cur/max mp cur/max @x,y,z d<distance> tgt <objectId>|-} plus the flags {@code atk cast dead follow}: the character's summon (servitor or pet), when it has one;</li>
  * <li>{@code env items <ground items within 1000>; <npcId>#<objectId> L<lvl> d<distance> hp<hp %> [by:<players>]; ...}: the 10 nearest monsters within 3000, {@code by:} lists the other players on a monster's aggro list;</li>
  * <li>{@code cd <skillId>:<ms>,...}: skill reuse still running.</li>
  * </ul>
  * RL agents are not logged.
+ * A summon's actions are written on its owner's lines: {@code SUMMON} / {@code UNSUMMON} / {@code PETDIED}, the owner's commands ({@code PETCMD}), its casts ({@code PETSKILL}), its damage ({@code DMG ... by pet}), its kills ({@code KILL ... by pet}) and the damage it takes ({@code PETHIT}).
  * Character state that rarely changes is written on its own lines, only when it changed: {@code STATS} (level, exp, sp and combat stats), {@code EQUIP} (paperdoll) and {@code SKILLS} (known skills). A parser keeps the last state per character.
  */
 public class PlayerActionLogger
@@ -67,6 +70,7 @@ public class PlayerActionLogger
 	private static final Map<Integer, Long> _skillsLogTimes = new ConcurrentHashMap<>();
 	private static final long DAMAGE_LOG_COOLDOWN = 100; // 100 ms dedup window
 	private static final Map<Long, Long> _damageLogTimes = new ConcurrentHashMap<>();
+	private static final Map<Long, Long> _petHitLogTimes = new ConcurrentHashMap<>();
 	private static final long TARGET_SELECT_LOG_COOLDOWN = 1000; // 1s dedup window for target select
 	private static final Map<Long, Long> _targetSelectLogTimes = new ConcurrentHashMap<>();
 	
@@ -75,6 +79,9 @@ public class PlayerActionLogger
 	private static final int ENV_MAX_MONSTERS = 10;
 	private static final int GROUND_ITEM_RANGE = 1000;
 	
+	/** RequestActionUse actions that command a summon; the other summon actions are its skills (logged as {@code PETCMD skill<actionId>}, the cast itself as {@code PETSKILL}). */
+	private static final Map<Integer, String> SUMMON_COMMANDS = Map.of(15, "follow", 21, "follow", 16, "attack", 22, "attack", 17, "stop", 23, "stop", 19, "unsummon", 52, "unsummon", 53, "move", 54, "move");
+
 	/** Last {@code STATS} / {@code EQUIP} / {@code SKILLS} text written per character, so a line is only written on change. */
 	private static final Map<Integer, String> _lastStats = new ConcurrentHashMap<>();
 	private static final Map<Integer, String> _lastEquip = new ConcurrentHashMap<>();
@@ -134,7 +141,7 @@ public class PlayerActionLogger
 	// Line parts
 	// ========================================================================
 	
-	/** {@code Name#objectId(npcId Llvl) hp cur/max}, {@code Name#objectId(pc Llvl) hp cur/max}, {@code Name#objectId(item itemId)} or {@code -}. */
+	/** {@code Name#objectId(npcId Llvl) hp cur/max}, {@code Name#objectId(pc Llvl) hp cur/max}, {@code Name#objectId(summon npcId Llvl) hp cur/max}, {@code Name#objectId(item itemId)} or {@code -}. */
 	private static String ref(WorldObject object)
 	{
 		if (object == null)
@@ -153,6 +160,11 @@ public class PlayerActionLogger
 		{
 			final Player player = object.asPlayer();
 			sb.append("(pc L").append(player.getLevel()).append(") hp ").append((int) player.getCurrentHp()).append('/').append(player.getMaxHp());
+		}
+		else if (object.isSummon())
+		{
+			final Summon summon = object.asSummon();
+			sb.append("(summon ").append(summon.getId()).append(" L").append(summon.getLevel()).append(") hp ").append((int) summon.getCurrentHp()).append('/').append(summon.getMaxHp());
 		}
 		else if (object.isItem())
 		{
@@ -217,6 +229,41 @@ public class PlayerActionLogger
 		return sb.toString();
 	}
 	
+	/** The character's summon, or {@code null} without one. */
+	private static String pet(Player player)
+	{
+		final Summon summon = player.getSummon();
+		if (summon == null)
+		{
+			return null;
+		}
+
+		final StringBuilder sb = new StringBuilder(128);
+		sb.append("pet ").append(ref(summon));
+		sb.append(" mp ").append((int) summon.getCurrentMp()).append('/').append(summon.getMaxMp());
+		sb.append(" @").append(summon.getX()).append(',').append(summon.getY()).append(',').append(summon.getZ());
+		sb.append(" d").append((int) player.calculateDistance3D(summon));
+		final WorldObject target = summon.getTarget();
+		sb.append(" tgt ").append((target != null) ? String.valueOf(target.getObjectId()) : "-");
+		if (summon.isAttackingNow())
+		{
+			sb.append(" atk");
+		}
+		if (summon.isCastingNow())
+		{
+			sb.append(" cast");
+		}
+		if (summon.isDead())
+		{
+			sb.append(" dead");
+		}
+		if (summon.getFollowStatus())
+		{
+			sb.append(" follow");
+		}
+		return sb.toString();
+	}
+
 	private static String env(Player player)
 	{
 		final StringBuilder sb = new StringBuilder(256);
@@ -297,6 +344,11 @@ public class PlayerActionLogger
 		if (sel != null)
 		{
 			sb.append(" | ").append(sel);
+		}
+		final String pet = pet(player);
+		if (pet != null)
+		{
+			sb.append(" | ").append(pet);
 		}
 		sb.append(" | ").append(env(player));
 		final String cd = cd(player);
@@ -552,6 +604,88 @@ public class PlayerActionLogger
 		logSkillsUpdated(player);
 	}
 	
+	// -------------------------------------------------------------------------
+	// Summons (servitors and pets), written on the owner's lines
+	// -------------------------------------------------------------------------
+
+	/** The owner whose log gets a summon's line, or {@code null} when nothing is logged. */
+	private static Player loggedOwner(Summon summon)
+	{
+		final Player owner = (summon == null) ? null : summon.getOwner();
+		return ((owner == null) || isAgent(owner)) ? null : owner;
+	}
+
+	/** The owner gave the summon a command (RequestActionUse); actions that are not summon actions are ignored. */
+	public static void logSummonCommand(Player player, int actionId, WorldObject target)
+	{
+		if ((player == null) || (player.getSummon() == null) || isAgent(player)) return;
+		String command = SUMMON_COMMANDS.get(actionId);
+		if ((command == null) && (((actionId >= 32) && (actionId <= 54) && (actionId != 37) && (actionId != 38) && (actionId != 51)) || (actionId >= 1000)))
+		{
+			command = "skill" + actionId;
+		}
+		if (command != null)
+		{
+			action(player, "PETCMD " + command + " -> " + ref(target), target, player.isCastingNow());
+		}
+	}
+
+	public static void logSummonSpawn(Summon summon)
+	{
+		final Player owner = loggedOwner(summon);
+		if (owner == null) return;
+		action(owner, "SUMMON " + ref(summon), owner.getTarget(), owner.isCastingNow());
+	}
+
+	public static void logSummonUnsummon(Summon summon)
+	{
+		final Player owner = loggedOwner(summon);
+		if (owner == null) return;
+		action(owner, "UNSUMMON " + ref(summon), owner.getTarget(), owner.isCastingNow());
+	}
+
+	public static void logSummonDeath(Summon summon, Creature killer)
+	{
+		final Player owner = loggedOwner(summon);
+		if (owner == null) return;
+		action(owner, "PETDIED " + ref(summon) + " <- " + ref(killer), owner.getTarget(), owner.isCastingNow());
+	}
+
+	public static void logSummonSkill(Summon summon, Skill skill, WorldObject target)
+	{
+		final Player owner = loggedOwner(summon);
+		if ((owner == null) || (skill == null)) return;
+		action(owner, "PETSKILL " + skillRef(skill) + " -> " + ref(target), owner.getTarget(), owner.isCastingNow());
+	}
+
+	public static void logSummonDamageInflicted(Summon summon, double damage, Creature target, Skill skill)
+	{
+		final Player owner = loggedOwner(summon);
+		if (owner == null) return;
+
+		final long key = ((long) summon.getObjectId() << 32) | (target != null ? target.getObjectId() : 0);
+		final Long lastTime = _damageLogTimes.get(key);
+		final long now = System.currentTimeMillis();
+		if ((lastTime != null) && ((now - lastTime) < DAMAGE_LOG_COOLDOWN)) return;
+		_damageLogTimes.put(key, now);
+
+		action(owner, "DMG " + (damage == 0 ? "miss" : String.valueOf((int) damage)) + " -> " + ref(target) + " skill " + skillRef(skill) + " by pet", owner.getTarget(), owner.isCastingNow());
+	}
+
+	public static void logSummonDamageTaken(Summon summon, double damage, Creature attacker, Skill skill)
+	{
+		final Player owner = loggedOwner(summon);
+		if (owner == null) return;
+
+		final long key = ((long) summon.getObjectId() << 32) | (attacker != null ? attacker.getObjectId() : 0);
+		final Long lastTime = _petHitLogTimes.get(key);
+		final long now = System.currentTimeMillis();
+		if ((lastTime != null) && ((now - lastTime) < DAMAGE_LOG_COOLDOWN)) return;
+		_petHitLogTimes.put(key, now);
+
+		action(owner, "PETHIT " + (int) damage + " <- " + ref(attacker) + " skill " + skillRef(skill), owner.getTarget(), owner.isCastingNow());
+	}
+
 	// -------------------------------------------------------------------------
 	// Economy, progression, travel, life state
 	// -------------------------------------------------------------------------

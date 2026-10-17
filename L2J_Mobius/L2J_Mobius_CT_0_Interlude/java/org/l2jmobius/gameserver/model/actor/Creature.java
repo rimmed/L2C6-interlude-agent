@@ -6485,6 +6485,10 @@ public abstract class Creature extends WorldObject
 			{
 				PlayerActionLogger.logDamageTaken(asPlayer(), amount, attacker, skill);
 			}
+			else if (isSummon() && (amount > 0) && (attacker != null))
+			{
+				PlayerActionLogger.logSummonDamageTaken(asSummon(), amount, attacker, skill);
+			}
 			
 			_status.reduceHp(amount, attacker, awake, isDOT, false);
 		}

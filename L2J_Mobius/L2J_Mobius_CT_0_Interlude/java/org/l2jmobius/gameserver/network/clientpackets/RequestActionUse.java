@@ -47,6 +47,7 @@ import org.l2jmobius.gameserver.network.serverpackets.ChairSit;
 import org.l2jmobius.gameserver.network.serverpackets.NpcSay;
 import org.l2jmobius.gameserver.network.serverpackets.RecipeShopManageList;
 import org.l2jmobius.gameserver.network.serverpackets.SocialAction;
+import org.l2jmobius.gameserver.util.PlayerActionLogger;
 
 /**
  * @version $Revision: 1.11.2.7.2.9 $ $Date: 2005/04/06 16:13:48 $
@@ -93,6 +94,7 @@ public class RequestActionUse extends ClientPacket
 		
 		final Summon summon = player.getSummon();
 		final WorldObject target = player.getTarget();
+		PlayerActionLogger.logSummonCommand(player, _actionId, target);
 		switch (_actionId)
 		{
 			case 0: // Sit/Stand

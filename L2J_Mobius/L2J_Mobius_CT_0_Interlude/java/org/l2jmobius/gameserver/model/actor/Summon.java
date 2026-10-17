@@ -150,6 +150,8 @@ public abstract class Summon extends Playable
 		{
 			EventDispatcher.getInstance().notifyEventAsync(new OnPlayerSummonSpawn(this), this);
 		}
+		
+		PlayerActionLogger.logSummonSpawn(this);
 	}
 	
 	@Override
@@ -343,6 +345,7 @@ public abstract class Summon extends Playable
 			});
 		}
 		
+		PlayerActionLogger.logSummonDeath(this, killer);
 		DecayTaskManager.getInstance().add(this);
 		return true;
 	}
@@ -354,6 +357,7 @@ public abstract class Summon extends Playable
 			return false;
 		}
 		
+		PlayerActionLogger.logSummonDeath(this, killer);
 		if (!decayed)
 		{
 			DecayTaskManager.getInstance().add(this);
@@ -411,6 +415,7 @@ public abstract class Summon extends Playable
 	{
 		if (isSpawned() && !isDead())
 		{
+			PlayerActionLogger.logSummonUnsummon(this);
 			stopHpMpRegeneration();
 			
 			getAI().stopFollow();
@@ -779,7 +784,7 @@ public abstract class Summon extends Playable
 	{
 		if (_owner != null)
 		{
-			PlayerActionLogger.logDamageInflicted(_owner, damage, target, skill);
+			PlayerActionLogger.logSummonDamageInflicted(this, miss ? 0 : damage, target, skill);
 		}
 		
 		if (miss || (_owner == null))
@@ -849,6 +854,7 @@ public abstract class Summon extends Playable
 			return;
 		}
 		
+		PlayerActionLogger.logSummonSkill(this, skill, getTarget());
 		super.doCast(skill);
 	}
 	

@@ -5,7 +5,7 @@ The game server (``PlayerActionLogger``) writes one compact line per action::
 
     2026.10.14 10:01:59.411 dwarf DMG 85 -> Ol Mahum Guard#268451514(20058 L22) hp 526/611 skill - | me L18 hp 711/711 mp 231/231 cp 368/368 @-49823,147087,-2792 h57909 wt28.5 atk combat | sel d14.2 los h25615 | env items 0; 20058#268451514 L22 d14 hp86 by:Bob; 20437#268451777 L21 d2226 hp100 | cd 3:4500
 
-``<date> <time> <character> <EVENT> <payload> [| me ...] [| sel ...] [| env ...] [| cd ...]``
+``<date> <time> <character> <EVENT> <payload> [| me ...] [| sel ...] [| pet ...] [| env ...] [| cd ...]``
 
 ==========  ==================================================================  =====================
 event       payload                                                             old ``action_type``
@@ -15,6 +15,7 @@ MOVE        ``x,y,z``                                                           
 ATTACK      ``<ref>``                                                           attacked
 SKILL       ``<skill>[id] -> <ref>``                                            used_skill
 DMG         ``<damage|miss> -> <ref> skill <skill>[id]|-``                      inflicted_damage
+            ``... by pet``: the character's summon dealt it                      pet_inflicted_damage
 HIT         ``<damage|miss> <- <ref> skill <skill>[id]|-``                      took_damage
 KILL        ``<ref|name> drop <item>[count] auto|ground``                       killed
 PICKUP      ``<item>[itemId]``                                                  pickup
@@ -34,16 +35,25 @@ STATS       ``L<lvl> exp <n> sp <n> patk .. matk .. pdef .. mdef .. acc ..``    
             ``crit .. eva .. aspd .. cspd .. str .. int .. dex .. con .. wit ..``
 EQUIP       ``weapon <item>[id]|- shield .. head .. chest .. gloves .. legs``    (state only)
             ``.. feet .. neck .. rear .. lear .. rfinger .. lfinger ..``
+SUMMON      ``<summon ref>``: a servitor / pet appeared                        summoned
+UNSUMMON    ``<summon ref>``: dismissed (or its time ran out)                    unsummoned
+PETDIED     ``<summon ref> <- <killer ref>``                                    pet_died
+PETCMD      ``<command> -> <ref of the owner's target>``; command ``follow``      pet_command
+            ``attack stop unsummon move`` or ``skill<actionId>``
+PETSKILL    ``<skill>[id] -> <ref>``: the summon casts                          pet_used_skill
+PETHIT      ``<damage> <- <ref> skill <skill>[id]|-``: the summon was hit        pet_took_damage
 NOTE        ``<free text>``: an old line the converter could not map             (kept as is)
 ==========  ==================================================================  =====================
 
 A reference ``<ref>`` is ``Name#objectId(npcId Llvl) hp cur/max`` (monster or NPC),
-``Name#objectId(pc Llvl) hp cur/max`` (player), ``Name#objectId(item itemId)`` (item on the
-ground) or ``-``. Old logs had no object ids: the converter writes ``#?``.
+``Name#objectId(pc Llvl) hp cur/max`` (player), ``Name#objectId(summon npcId Llvl) hp cur/max``
+(servitor or pet), ``Name#objectId(item itemId)`` (item on the ground) or ``-``. Old logs had no object ids: the converter writes ``#?``.
 
 Tail blocks: ``me`` - the character (level, HP / MP / CP, position, heading, load %, flags
 ``sit cast atk dead combat``); ``sel`` - the selected target relative to the character
-(distance, line of sight, its heading); ``env`` - ground items within 1000 and the 10 nearest
+(distance, line of sight, its heading); ``pet`` - the character's summon while it has one
+(``<summon ref> mp cur/max @x,y,z d<distance> tgt <objectId>|-`` and the flags
+``atk cast dead follow``); ``env`` - ground items within 1000 and the 10 nearest
 monsters within 3000 (``by:`` lists the other players on a monster's aggro list); ``cd`` -
 skill reuse still running in milliseconds.
 
@@ -62,6 +72,7 @@ LINE = re.compile(r"^(?P<date>\d{4}\.\d{2}\.\d{2}) (?P<time>\d{2}:\d{2}:\d{2}\.\
 EVENTS = frozenset({
     "TARGET", "MOVE", "ATTACK", "SKILL", "DMG", "HIT", "KILL", "PICKUP", "ACTION", "ITEM", "EFFECT", "EFFECTS",
     "AUTOSHOT", "SHOT", "BUY", "SELL", "LEARN", "TELEPORT", "DIED", "REVIVED", "SKILLS", "STATS", "EQUIP", "NOTE",
+    "SUMMON", "UNSUMMON", "PETDIED", "PETCMD", "PETSKILL", "PETHIT",
 })
 
 REF = re.compile(r"^(?P<name>.+?)#(?P<oid>\d+|\?)\((?P<inside>[^)]*)\)(?: hp (?P<hp>-?\d+)/(?P<max_hp>\d+))?$")
@@ -69,6 +80,9 @@ NAMED_ID = re.compile(r"^(?P<name>.+?)\[(?P<id>\d+)\]$")
 STAT_KEYS = ("patk", "matk", "pdef", "mdef", "acc", "crit", "eva", "aspd", "cspd", "str", "int", "dex", "con", "wit")
 SLOT_KEYS = ("weapon", "shield", "head", "chest", "gloves", "legs", "feet", "neck", "rear", "lear", "rfinger", "lfinger")
 FLAGS = ("sit", "cast", "atk", "dead", "combat")
+PET_FLAGS = ("atk", "cast", "dead", "follow")
+PET = re.compile(r"^(?P<ref>.+?\) hp -?\d+/\d+) mp (?P<mp>-?\d+)/(?P<max_mp>\d+) @(?P<x>-?\d+),(?P<y>-?\d+),(?P<z>-?\d+) "
+                 r"d(?P<distance>\d+) tgt (?P<target>\d+|-)(?P<flags>(?: \w+)*)$")
 
 
 def is_v2(line: str) -> bool:
@@ -95,6 +109,10 @@ def parse_ref(text: str) -> dict | None:
     if inside and inside[0] == "pc":
         ref["kind"] = "player"
         ref["level"] = int(inside[1][1:]) if len(inside) > 1 else None
+    elif inside and inside[0] == "summon":
+        ref["kind"] = "summon"
+        ref["npc_id"] = int(inside[1]) if len(inside) > 1 else None
+        ref["level"] = int(inside[2][1:]) if len(inside) > 2 else None
     elif inside and inside[0] == "item":
         ref["kind"] = "item"
         ref["item_id"] = int(inside[1]) if len(inside) > 1 else None
@@ -144,12 +162,12 @@ def named_id(text: str) -> tuple[str | None, int | None]:
 
 
 def split_tail(rest: str) -> tuple[str, dict[str, str]]:
-    """Split ``payload | me .. | sel .. | env .. | cd ..`` into the payload and the named blocks."""
+    """Split ``payload | me .. | sel .. | pet .. | env .. | cd ..`` into the payload and the named blocks."""
     parts = rest.split(" | ")
     payload, blocks = parts[0], {}
     for part in parts[1:]:
         key, _, value = part.partition(" ")
-        if key in ("me", "sel", "env", "cd"):
+        if key in ("me", "sel", "pet", "env", "cd"):
             blocks[key] = value
         else:  # a ' | ' inside the payload (e.g. an item name): glue it back
             if blocks:
@@ -202,6 +220,22 @@ def parse_sel(text: str) -> dict:
         elif tok.startswith("h") and tok[1:].isdigit():
             sel["heading"] = int(tok[1:])
     return sel
+
+
+def parse_pet(text: str) -> dict | None:
+    """``Kat the Cat#oid(summon 14111 L39) hp 900/1000 mp 50/60 @x,y,z d120 tgt 2684.. atk follow``."""
+    m = PET.match(text.strip())
+    if m is None:
+        return None
+    ref = parse_ref(m.group("ref")) or {}
+    flags = set(m.group("flags").split())
+    return {
+        "object_id": ref.get("object_id"), "npc_id": ref.get("npc_id"), "name": ref.get("name"), "level": ref.get("level"),
+        "hp": ref.get("hp"), "max_hp": ref.get("max_hp"), "mp": int(m.group("mp")), "max_mp": int(m.group("max_mp")),
+        "x": int(m.group("x")), "y": int(m.group("y")), "z": int(m.group("z")), "distance": int(m.group("distance")),
+        "target_id": None if m.group("target") == "-" else int(m.group("target")),
+        **{flag: flag in flags for flag in PET_FLAGS},
+    }
 
 
 def format_sel(distance: float, los: bool, heading: int | None) -> str:
