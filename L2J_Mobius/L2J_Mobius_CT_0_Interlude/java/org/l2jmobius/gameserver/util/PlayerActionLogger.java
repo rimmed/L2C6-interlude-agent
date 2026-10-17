@@ -59,6 +59,7 @@ import org.l2jmobius.gameserver.model.skill.Skill;
  * </ul>
  * RL agents are not logged.
  * A summon's actions are written on its owner's lines: {@code SUMMON} / {@code UNSUMMON} / {@code PETDIED}, the owner's commands ({@code PETCMD}), its casts ({@code PETSKILL}), its damage ({@code DMG ... by pet}), its kills ({@code KILL ... by pet}) and the damage it takes ({@code PETHIT}).
+ * A kill is one {@code KILL} line with every drop ({@code drop Name[count] auto|ground; ...}, {@code drop -} without drops).
  * Character state that rarely changes is written on its own lines, only when it changed: {@code STATS} (level, exp, sp and combat stats), {@code EQUIP} (paperdoll) and {@code SKILLS} (known skills). A parser keeps the last state per character.
  */
 public class PlayerActionLogger
@@ -512,14 +513,21 @@ public class PlayerActionLogger
 		action(player, (pickup ? "PICKUP " : "ACTION " + actionName + " ") + details, target, player.isCastingNow());
 	}
 	
-	public static void logMobKillDrop(Player player, String mobName, String itemName, long itemCount, boolean autoLooted)
+	/**
+	 * One line per kill, on the line of the character that finished the monster ({@code by pet} when its summon did), with every drop or {@code -}.
+	 * @param killer the creature that dealt the killing blow
+	 * @param victim the monster
+	 * @param drops {@code Name[count] auto|ground} of each dropped item
+	 */
+	public static void logKill(Creature killer, Attackable victim, List<String> drops)
 	{
+		if ((killer == null) || (victim == null)) return;
+		final Player player = killer.asPlayer();
 		if ((player == null) || isAgent(player)) return;
-		
-		final WorldObject currentTarget = player.getTarget();
-		final String killed = ((currentTarget != null) && currentTarget.isNpc() && currentTarget.getName().equals(mobName)) ? ref(currentTarget) : mobName;
+
 		state(player);
-		LOGGER.info(player.getName() + " KILL " + killed + " drop " + itemName + "[" + itemCount + "] " + (autoLooted ? "auto" : "ground") + tail(player, currentTarget, false));
+		LOGGER.info(player.getName() + " KILL " + ref(victim) + (killer.isSummon() ? " by pet" : "") + " drop " + (drops.isEmpty() ? "-" : String.join("; ", drops)) + tail(player, player.getTarget(), false));
+		flush();
 	}
 	
 	public static void logShotUsage(Player player, String shotName, long remainingCount)

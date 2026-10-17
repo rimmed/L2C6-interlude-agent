@@ -87,6 +87,8 @@ public class Attackable extends Npc
 	// Raid
 	private boolean _isRaid = false;
 	private boolean _isRaidMinion = false;
+	/** Drops of the current death ("Name[count] auto|ground"), written on the kill's log line. */
+	private final List<String> _killDrops = new ArrayList<>();
 	
 	//
 	private boolean _champion = false;
@@ -314,8 +316,13 @@ public class Attackable extends Npc
 		// Kill the Npc (the corpse disappeared after 7 seconds)
 		if (!super.doDie(killer))
 		{
+			_killDrops.clear();
 			return false;
 		}
+		
+		// One log line per kill, with the drops of calculateRewards (called by super.doDie).
+		PlayerActionLogger.logKill(killer, this, _killDrops);
+		_killDrops.clear();
 		
 		// Delayed notification.
 		if (killer != null)
@@ -1145,8 +1152,8 @@ public class Attackable extends Npc
 					autoLooted = false;
 				}
 				
-				// Log the drop
-				PlayerActionLogger.logMobKillDrop(player, getName(), item.getName(), drop.getCount(), autoLooted);
+				// Collected for the kill's log line (written by doDie)
+				_killDrops.add(item.getName() + "[" + drop.getCount() + "] " + (autoLooted ? "auto" : "ground"));
 				
 				// Broadcast message if RaidBoss was defeated
 				if (_isRaid && !_isRaidMinion && (drop.getCount() > 0))

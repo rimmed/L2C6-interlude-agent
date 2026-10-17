@@ -630,6 +630,9 @@ ROW_FIELDS = (
     # summon (format 2): its state while the character has one, the owner's command
     "pet",
     "pet_command",
+    # format 2: the summon dealt the damage / the killing blow; every drop of a kill
+    "by_pet",
+    "drops",
 )
 
 
@@ -959,7 +962,8 @@ V2_STATS = {"patk": "p_atk", "matk": "m_atk", "pdef": "p_def", "mdef": "m_def", 
             "eva": "evasion", "aspd": "atk_speed", "cspd": "cast_speed", "str": "str", "int": "int", "dex": "dex",
             "con": "con", "wit": "wit"}
 V2_DAMAGE = re.compile(r"^(?P<damage>miss|\d+) (?:->|<-) (?P<ref>.+) skill (?P<skill>.+?)(?P<by_pet> by pet)?$")
-V2_KILL = re.compile(r"^(?P<ref>.+) drop (?P<item>.+)\[(?P<count>\d+)\] (?P<how>auto|ground)$")
+V2_KILL = re.compile(r"^(?P<ref>.+?)(?P<by_pet> by pet)? drop (?P<drops>.+)$")
+V2_DROP = re.compile(r"^(?P<item>.+)\[(?P<count>\d+)\] (?P<how>auto|ground)$")
 V2_TRADE = re.compile(r"^(?P<item>.+)\[(?P<item_id>\d+)\] x(?P<count>\d+) price (?P<price>\d+) npc (?P<npc>.+)\[(?P<npc_id>\d+)\]$")
 V2_LEARN = re.compile(r"^(?P<skill>.+)\[(?P<skill_id>\d+)\] L(?P<level>\d+) cost (?P<sp>\d+)sp")
 V2_POINT = re.compile(r"(-?\d+),(-?\d+),(-?\d+)")
@@ -1068,6 +1072,7 @@ def parse_v2_line(line: str, resolver: EntityResolver, source_file: str, line_no
         if dmg:
             if dmg.group("by_pet"):
                 row["action_type"] = action_type = "pet_inflicted_damage"
+                row["by_pet"] = True
             row["is_miss"] = dmg.group("damage") == "miss"
             row["damage"] = 0 if row["is_miss"] else int(dmg.group("damage"))
             if dmg.group("skill") != "-":
@@ -1086,7 +1091,14 @@ def parse_v2_line(line: str, resolver: EntityResolver, source_file: str, line_no
         kill = V2_KILL.match(payload)
         if kill:
             _v2_link_ref(row, resolver, v2.parse_ref(kill.group("ref")), character)
-            _link_drop(row, resolver, name=kill.group("item"), count=int(kill.group("count")))
+            row["by_pet"] = bool(kill.group("by_pet"))
+            # one line per kill with every drop ("A[1] ground; B[2] auto", "-" for none); older
+            # lines carry a single drop, one line per dropped item
+            drops = [d for d in (V2_DROP.match(part) for part in kill.group("drops").split("; ")) if d]
+            if drops:
+                _link_drop(row, resolver, name=drops[0].group("item"), count=int(drops[0].group("count")))
+                row["drops"] = [{"name": d.group("item"), "id": (resolver.resolve_item(name=d.group("item")) or {}).get("id"),
+                                 "count": int(d.group("count")), "auto": d.group("how") == "auto"} for d in drops]
     elif event in ("PICKUP", "AUTOSHOT"):
         name, item_id = v2.named_id(payload.split(" ", 1)[1] if event == "AUTOSHOT" else payload)
         if item_id is not None:
@@ -1313,6 +1325,9 @@ def _build_schema() -> pa.Schema:
             ("follow", pa.bool_()),
         ])),
         ("pet_command", pa.string()),
+        ("by_pet", pa.bool_()),
+        ("drops", pa.list_(pa.struct([("name", pa.string()), ("id", pa.int64()), ("count", pa.int64()),
+                                      ("auto", pa.bool_())]))),
     ]
 
     if [name for name, _ in fields] != list(ROW_FIELDS):

@@ -17,7 +17,9 @@ SKILL       ``<skill>[id] -> <ref>``                                            
 DMG         ``<damage|miss> -> <ref> skill <skill>[id]|-``                      inflicted_damage
             ``... by pet``: the character's summon dealt it                      pet_inflicted_damage
 HIT         ``<damage|miss> <- <ref> skill <skill>[id]|-``                      took_damage
-KILL        ``<ref|name> drop <item>[count] auto|ground``                       killed
+KILL        ``<ref> [by pet] drop <item>[count] auto|ground; ...|-``: one line  killed
+            per kill (``by pet``: the summon finished it); older logs wrote one
+            line per dropped item and no line for a kill without drops
 PICKUP      ``<item>[itemId]``                                                  pickup
 ACTION      ``<action> <details>``                                              performed_action
 ITEM        ``<item>[itemId] left <count>``                                     used_item
