@@ -45,6 +45,8 @@ import org.l2jmobius.gameserver.data.xml.ExperienceData;
 import org.l2jmobius.gameserver.data.xml.ItemData;
 import org.l2jmobius.gameserver.data.xml.PlayerTemplateData;
 import org.l2jmobius.gameserver.data.xml.SkillData;
+import org.l2jmobius.gameserver.model.effects.EffectType;
+import org.l2jmobius.gameserver.model.skill.Skill;
 import org.l2jmobius.gameserver.model.Location;
 import org.l2jmobius.gameserver.model.actor.Player;
 import org.l2jmobius.gameserver.model.actor.appearance.PlayerAppearance;
@@ -130,6 +132,10 @@ public class RLAgentManager
 	private static final int[] BLESSED_SPIRITSHOTS = { 3947, 3948, 3949, 3950, 3951, 3952 };
 	// Arrows of the same grades: Wooden, Bone, Fine Steel, Silver, Mithril, Shining. A bow fires only arrows of its grade.
 	private static final int[] ARROWS = { 17, 1341, 1342, 1343, 1344, 1345 };
+	// Beast Soulshot and Blessed Beast Spiritshot: the shots of a servitor (it uses its owner's).
+	private static final int[] BEAST_SHOTS = { 6645, 6647 };
+	// Beast Spiritshot too: an auto-used beast shot is never switched off for the agent's own shots.
+	private static final Set<Integer> ALL_BEAST_SHOTS = Set.of(6645, 6646, 6647);
 	
 	// Levels of the 1st, 2nd and 3rd class transfer.
 	private static final int[] CLASS_TRANSFER_LEVELS = { 20, 40, 76 };
@@ -967,6 +973,27 @@ public class RLAgentManager
 		{
 			topUp(player, consumable.getId(), consumable.getCount());
 		}
+		// What the agent's skills consume (summoning crystals, spirit ore) and its servitor's shots.
+		boolean summoner = false;
+		for (Skill skill : player.getAllSkills())
+		{
+			if (skill.isPassive())
+			{
+				continue;
+			}
+			if ((skill.getItemConsumeId() > 0) && (skill.getItemConsumeCount() > 0))
+			{
+				topUp(player, skill.getItemConsumeId(), Math.max(RLAgentEnvironmentConfig.RL_SKILL_ITEM_COUNT, skill.getItemConsumeCount() * 10));
+			}
+			summoner |= skill.hasEffectType(EffectType.SUMMON);
+		}
+		if (summoner)
+		{
+			for (int beastShot : BEAST_SHOTS)
+			{
+				topUp(player, beastShot, RLAgentEnvironmentConfig.RL_BEAST_SHOT_COUNT);
+			}
+		}
 		// Buff potions; the actor drinks one when no buff of the same kind is on the character.
 		for (PotionEntry potion : RLAgentEnvironmentConfig.RL_BUFF_POTIONS)
 		{
@@ -981,7 +1008,7 @@ public class RLAgentManager
 		{
 			for (int oldShot : new ArrayList<>(player.getAutoSoulShot()))
 			{
-				if (oldShot != shotId)
+				if ((oldShot != shotId) && !ALL_BEAST_SHOTS.contains(oldShot))
 				{
 					player.removeAutoSoulShot(oldShot);
 					player.sendPacket(new ExAutoSoulShot(oldShot, 0));
@@ -989,6 +1016,14 @@ public class RLAgentManager
 			}
 			player.addAutoSoulShot(shotId);
 			player.sendPacket(new ExAutoSoulShot(shotId, 1));
+			if (summoner)
+			{
+				for (int beastShot : BEAST_SHOTS)
+				{
+					player.addAutoSoulShot(beastShot);
+					player.sendPacket(new ExAutoSoulShot(beastShot, 1));
+				}
+			}
 			player.rechargeShots(true, true);
 		}
 	}

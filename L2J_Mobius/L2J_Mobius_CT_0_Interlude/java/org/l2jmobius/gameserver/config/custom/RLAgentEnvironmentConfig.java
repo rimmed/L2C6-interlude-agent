@@ -110,6 +110,8 @@ public class RLAgentEnvironmentConfig
 	public static int RL_SOULSHOT_COUNT;
 	public static int RL_SPIRITSHOT_COUNT;
 	public static int RL_ARROW_COUNT;
+	public static int RL_SKILL_ITEM_COUNT;
+	public static int RL_BEAST_SHOT_COUNT;
 	public static boolean RL_USE_BLESSED_SPIRITSHOTS;
 	public static boolean RL_AUTO_ENABLE_SHOTS;
 	public static List<ItemHolder> RL_CONSUMABLES;
@@ -174,6 +176,8 @@ public class RLAgentEnvironmentConfig
 		RL_SOULSHOT_COUNT = config.getInt("RLSoulshotCount", 2000);
 		RL_SPIRITSHOT_COUNT = config.getInt("RLSpiritshotCount", 1000);
 		RL_ARROW_COUNT = config.getInt("RLArrowCount", 3000);
+		RL_SKILL_ITEM_COUNT = config.getInt("RLSkillItemCount", 100);
+		RL_BEAST_SHOT_COUNT = config.getInt("RLBeastShotCount", 1000);
 		RL_USE_BLESSED_SPIRITSHOTS = config.getBoolean("RLUseBlessedSpiritshots", true);
 		RL_AUTO_ENABLE_SHOTS = config.getBoolean("RLAutoEnableShots", true);
 		RL_CONSUMABLES = parseItems(config.getString("RLConsumables", "1061:50;1539:50"));

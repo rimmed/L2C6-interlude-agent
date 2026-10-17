@@ -30,12 +30,14 @@ import org.l2jmobius.gameserver.ai.SummonAI;
 import org.l2jmobius.gameserver.config.GeoEngineConfig;
 import org.l2jmobius.gameserver.config.PlayerConfig;
 import org.l2jmobius.gameserver.config.custom.FakePlayersConfig;
+import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig;
 import org.l2jmobius.gameserver.data.xml.ExperienceData;
 import org.l2jmobius.gameserver.data.xml.ItemData;
 import org.l2jmobius.gameserver.geoengine.GeoEngine;
 import org.l2jmobius.gameserver.geoengine.pathfinding.PathFinding;
 import org.l2jmobius.gameserver.handler.IItemHandler;
 import org.l2jmobius.gameserver.handler.ItemHandler;
+import org.l2jmobius.gameserver.managers.RLAgentManager;
 import org.l2jmobius.gameserver.managers.ZoneManager;
 import org.l2jmobius.gameserver.model.Location;
 import org.l2jmobius.gameserver.model.World;
@@ -821,6 +823,13 @@ public abstract class Summon extends Playable
 			{
 				sm = new SystemMessage(SystemMessageId.YOUR_PET_HIT_FOR_S1_DAMAGE);
 				sm.addInt(damage);
+				if (RLAgentEnvironmentConfig.RL_AGENT_ENABLED && RLAgentManager.getInstance().isAgent(_owner))
+				{
+					// RL agents also learn whom the summon hit and how much HP it has left (as for their own hits).
+					sm.addInt(target.getObjectId());
+					sm.addInt((int) target.getCurrentHp());
+					sm.addInt(target.getMaxHp());
+				}
 			}
 			
 			sendPacket(sm);
