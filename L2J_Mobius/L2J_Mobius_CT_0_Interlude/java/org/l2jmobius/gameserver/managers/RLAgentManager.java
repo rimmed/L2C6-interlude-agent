@@ -45,7 +45,8 @@ import org.l2jmobius.gameserver.data.xml.ExperienceData;
 import org.l2jmobius.gameserver.data.xml.ItemData;
 import org.l2jmobius.gameserver.data.xml.PlayerTemplateData;
 import org.l2jmobius.gameserver.data.xml.SkillData;
-import org.l2jmobius.gameserver.model.effects.EffectType;
+import org.l2jmobius.gameserver.model.effects.AbstractEffect;
+import org.l2jmobius.gameserver.model.skill.EffectScope;
 import org.l2jmobius.gameserver.model.skill.Skill;
 import org.l2jmobius.gameserver.model.Location;
 import org.l2jmobius.gameserver.model.actor.Player;
@@ -151,7 +152,11 @@ public class RLAgentManager
 	/** Candidates of one slot tried before the slot is left empty. */
 	private static final int MAX_EQUIP_ATTEMPTS = 10;
 	
-	private static final int[] GEAR_SLOTS = { Inventory.PAPERDOLL_RHAND, Inventory.PAPERDOLL_LHAND, Inventory.PAPERDOLL_HEAD, Inventory.PAPERDOLL_GLOVES, Inventory.PAPERDOLL_CHEST, Inventory.PAPERDOLL_LEGS, Inventory.PAPERDOLL_FEET };
+	private static final int[] GEAR_SLOTS = { Inventory.PAPERDOLL_RHAND, Inventory.PAPERDOLL_LHAND, Inventory.PAPERDOLL_HEAD, Inventory.PAPERDOLL_GLOVES, Inventory.PAPERDOLL_CHEST, Inventory.PAPERDOLL_LEGS, Inventory.PAPERDOLL_FEET, Inventory.PAPERDOLL_NECK, Inventory.PAPERDOLL_REAR, Inventory.PAPERDOLL_LEAR, Inventory.PAPERDOLL_RFINGER, Inventory.PAPERDOLL_LFINGER };
+	/** Raid boss jewelry is far above the gear of its grade: never part of an agent's set. */
+	private static final String[] BOSS_JEWELRY = { "Queen Ant", "Core", "Orfen", "Antharas", "Valakas", "Baium", "Zaken", "Frintezza" };
+	/** Bumped when the equipment rules change, so existing agents get a new set once (2: jewelry). */
+	private static final String GEAR_VERSION = "/2";
 	
 	/** Equipment style of a class. */
 	private enum Archetype
@@ -187,7 +192,7 @@ public class RLAgentManager
 	}
 	
 	/** Equipment candidates of one grade and archetype, per slot. */
-	private record GearPool(List<ItemTemplate> weapons, List<ItemTemplate> shields, List<ItemTemplate> helmets, List<ItemTemplate> gloves, List<ItemTemplate> boots, List<ItemTemplate> bodies, List<ItemTemplate> legs)
+	private record GearPool(List<ItemTemplate> weapons, List<ItemTemplate> shields, List<ItemTemplate> helmets, List<ItemTemplate> gloves, List<ItemTemplate> boots, List<ItemTemplate> bodies, List<ItemTemplate> legs, List<ItemTemplate> necklaces, List<ItemTemplate> earrings, List<ItemTemplate> rings)
 	{
 	}
 	
@@ -484,7 +489,7 @@ public class RLAgentManager
 		if (RLAgentEnvironmentConfig.RL_AUTO_EQUIP)
 		{
 			final CrystalType grade = gradeForLevel(player.getLevel());
-			final String archetype = archetypeFor(player).name();
+			final String archetype = archetypeFor(player).name() + GEAR_VERSION;
 			if (forceEquip || !grade.name().equals(player.getVariables().getString(VAR_GEAR_GRADE, "")) || !archetype.equals(player.getVariables().getString(VAR_GEAR_ARCHETYPE, "")))
 			{
 				equip(player, grade);
@@ -777,9 +782,15 @@ public class RLAgentManager
 		{
 			equipFirstFitting(player, pool.legs());
 		}
+		// Jewelry: a necklace, two earrings and two rings (the second of a pair goes to the free slot).
+		equipFirstFitting(player, pool.necklaces());
+		equipFirstFitting(player, pool.earrings());
+		equipFirstFitting(player, pool.earrings());
+		equipFirstFitting(player, pool.rings());
+		equipFirstFitting(player, pool.rings());
 		
 		player.getVariables().set(VAR_GEAR_GRADE, grade.name());
-		player.getVariables().set(VAR_GEAR_ARCHETYPE, archetypeFor(player).name());
+		player.getVariables().set(VAR_GEAR_ARCHETYPE, archetypeFor(player).name() + GEAR_VERSION);
 		player.sendItemList(false);
 		player.broadcastUserInfo();
 	}
@@ -867,6 +878,9 @@ public class RLAgentManager
 		final List<ItemTemplate> boots = new ArrayList<>();
 		final List<ItemTemplate> bodies = new ArrayList<>();
 		final List<ItemTemplate> legs = new ArrayList<>();
+		final List<ItemTemplate> necklaces = new ArrayList<>();
+		final List<ItemTemplate> earrings = new ArrayList<>();
+		final List<ItemTemplate> rings = new ArrayList<>();
 		for (Armor armor : ItemData.getInstance().getAllArmors())
 		{
 			if (!usable.test(armor) || !fitsArmorVariant(armor, archetype))
@@ -900,10 +914,44 @@ public class RLAgentManager
 			{
 				legs.add(armor);
 			}
+			else if (((bodyPart == BodyPart.NECK) || (bodyPart == BodyPart.LR_EAR) || (bodyPart == BodyPart.LR_FINGER)) && !isBossJewelry(armor))
+			{
+				(bodyPart == BodyPart.NECK ? necklaces : bodyPart == BodyPart.LR_EAR ? earrings : rings).add(armor);
+			}
 		}
 		
-		LOGGER.info(RLAgentManager.class.getSimpleName() + ": " + grade + " " + archetype + " gear pool: " + weapons.size() + " weapons, " + shields.size() + " shields, " + helmets.size() + " helmets, " + gloves.size() + " gloves, " + boots.size() + " boots, " + bodies.size() + " bodies, " + legs.size() + " legs.");
-		return new GearPool(weapons, shields, helmets, gloves, boots, bodies, legs);
+		LOGGER.info(RLAgentManager.class.getSimpleName() + ": " + grade + " " + archetype + " gear pool: " + weapons.size() + " weapons, " + shields.size() + " shields, " + helmets.size() + " helmets, " + gloves.size() + " gloves, " + boots.size() + " boots, " + bodies.size() + " bodies, " + legs.size() + " legs, " + necklaces.size() + " necklaces, " + earrings.size() + " earrings, " + rings.size() + " rings.");
+		return new GearPool(weapons, shields, helmets, gloves, boots, bodies, legs, necklaces, earrings, rings);
+	}
+	
+	/** The skill brings a servitor (the Summon effect handler reports no effect type of its own, so it is found by class). */
+	private static boolean summonsServitor(Skill skill)
+	{
+		final List<AbstractEffect> effects = skill.getEffects(EffectScope.GENERAL);
+		if (effects == null)
+		{
+			return false;
+		}
+		for (AbstractEffect effect : effects)
+		{
+			if ((effect != null) && effect.getClass().getSimpleName().equals("Summon"))
+			{
+				return true;
+			}
+		}
+		return false;
+	}
+	
+	private static boolean isBossJewelry(ItemTemplate item)
+	{
+		for (String boss : BOSS_JEWELRY)
+		{
+			if (item.getName().contains(boss))
+			{
+				return true;
+			}
+		}
+		return false;
 	}
 	
 	private static boolean hasKnownSkills(ItemTemplate item)
@@ -964,7 +1012,21 @@ public class RLAgentManager
 		}
 		
 		topUp(player, shotId, shotCount);
-		if ((weapon != null) && (weapon.getItemType() == WeaponType.BOW))
+		// Arrows of the bow's grade only: those of earlier grades (or of a bow no longer carried) would
+		// pile up past the weight limit (an arrow weighs 4-6).
+		final boolean bow = (weapon != null) && (weapon.getItemType() == WeaponType.BOW);
+		for (int arrow : ARROWS)
+		{
+			if (!bow || (arrow != ARROWS[gradeIndex]))
+			{
+				final long count = player.getInventory().getInventoryItemCount(arrow, -1);
+				if (count > 0)
+				{
+					player.destroyItemByItemId(ItemProcessType.NONE, arrow, (int) count, null, false);
+				}
+			}
+		}
+		if (bow)
 		{
 			// The server equips matching arrows by itself when the bow attacks.
 			topUp(player, ARROWS[gradeIndex], RLAgentEnvironmentConfig.RL_ARROW_COUNT);
@@ -985,7 +1047,7 @@ public class RLAgentManager
 			{
 				topUp(player, skill.getItemConsumeId(), Math.max(RLAgentEnvironmentConfig.RL_SKILL_ITEM_COUNT, skill.getItemConsumeCount() * 10));
 			}
-			summoner |= skill.hasEffectType(EffectType.SUMMON);
+			summoner |= summonsServitor(skill);
 		}
 		if (summoner)
 		{
