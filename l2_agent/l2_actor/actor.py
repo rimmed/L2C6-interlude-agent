@@ -148,6 +148,9 @@ class Actor:
         self.life_step = 0
         self.episode_return = 0.0
         self.episode_terms: dict[str, float] = {}
+        #: decisions of the current fight per action type, and per skill (``"<id>"``, ``"pet:<id>"`` for the summon's)
+        self.episode_actions: dict[str, int] = {}
+        self.episode_skills: dict[str, int] = {}
         self.episode_started = 0.0
         self.total_steps = 0
         self.totals = {"episodes": 0, "kills": 0, "deaths": 0, "transitions": 0, "return": 0.0}
@@ -298,6 +301,10 @@ class Actor:
 
         decision = self.encoder.act(obs, sample=self.sample, rng=self.np_rng)
         executed = self.executor.execute(decision, now)
+        self.episode_actions[decision.action] = self.episode_actions.get(decision.action, 0) + 1
+        if decision.action in ("used_skill", "pet_skill") and decision.skill_id is not None:
+            key = f"pet:{decision.skill_id}" if decision.action == "pet_skill" else str(decision.skill_id)
+            self.episode_skills[key] = self.episode_skills.get(key, 0) + 1
         log.debug("[ep %d step %d] %s -> %s", self.episode_id, self.episode_step, decision.describe(), executed)
 
         self._pending = Transition(
@@ -377,8 +384,10 @@ class Actor:
                 "truncated": truncated,
                 "steps": self.episode_step, "return": round(self.episode_return, 4),
                 "reward_terms": {name: round(value, 4) for name, value in self.episode_terms.items()},
+                "actions": self.episode_actions, "skills": self.episode_skills,
                 "duration_s": round(time.time() - self.episode_started, 2),
                 "character": self.conn.character_name, "level": char.level, "class_id": char.class_id,
+                "t": round(time.time(), 1),
             }
             self.episodes_path.parent.mkdir(parents=True, exist_ok=True)
             with self.episodes_path.open("a", encoding="utf-8") as fh:
@@ -390,6 +399,8 @@ class Actor:
         self.episode_step = 0
         self.episode_return = 0.0
         self.episode_terms = {}
+        self.episode_actions = {}
+        self.episode_skills = {}
         self.episode_started = time.time()
         self.encoder.reset_session()
 
