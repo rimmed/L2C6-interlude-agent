@@ -1601,6 +1601,17 @@ def process_logs(
         print(f"  {log_path.name}: {len(rows) - before} action frames")
 
     print(f"Successfully parsed {len(rows)} action frames ({skipped} lines skipped).")
+    # A saved log may be a longer copy of an earlier one (the server log copied twice): a line that
+    # an earlier file already holds is the same event, not a second one.
+    first_file: dict[tuple, str] = {}
+    unique = []
+    for row in rows:
+        key = (row["character_id"], row["timestamp"], row["action_raw"])
+        if first_file.setdefault(key, row["source_file"]) == row["source_file"]:
+            unique.append(row)
+    if len(unique) < len(rows):
+        print(f"Dropped {len(rows) - len(unique)} action frames repeated from an earlier log file")
+        rows = unique
     known = _fill_known_skills(rows)
     print(f"known_skills filled for {known} of {len(rows)} frames")
 
