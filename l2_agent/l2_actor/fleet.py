@@ -80,7 +80,8 @@ class Worker:
                 log.warning("%s stopped on its own (%s); restarting", account, summary.get("steps"))
                 self.count("restarts")
             except Exception as exc:  # noqa: BLE001 - any failure of one actor must not stop the others
-                log.warning("%s failed: %s: %s; restarting in %.0fs", account, type(exc).__name__, exc, self.restart_delay)
+                log.warning("%s failed: %s: %s; restarting in %.0fs", account, type(exc).__name__, exc, self.restart_delay,
+                            exc_info=True)
                 self.count("restarts")
             finally:
                 self.collect(actor)

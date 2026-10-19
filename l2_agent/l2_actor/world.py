@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import math
+import struct
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, fields
@@ -94,6 +95,8 @@ class WorldState:
         self.home: tuple[int, int, int] | None = None
 
         self.has_user_info = False
+        #: opcodes of packets that failed to parse (logged once each)
+        self._bad_packets: set[int] = set()
         self.has_skills = False
         self.has_items = False
 
@@ -129,8 +132,19 @@ class WorldState:
     # ------------------------------------------------------------------
 
     def handle(self, body: bytes, now: float | None = None) -> list[str]:
-        """Apply one server packet and return the signals it produced."""
-        now = time.time() if now is None else now
+        """Apply one server packet and return the signals it produced (a packet that does not parse is skipped)."""
+        try:
+            return self._handle(body, time.time() if now is None else now)
+        except struct.error as exc:
+            # A packet layout the parser does not expect must not end the actor: log it once per opcode.
+            pid = body[0] if body else -1
+            if pid not in self._bad_packets:
+                self._bad_packets.add(pid)
+                log.warning("Skipped packet 0x%02X (%d bytes) that does not parse: %s; head %s", pid, len(body), exc,
+                            body[:48].hex())
+            return []
+
+    def _handle(self, body: bytes, now: float) -> list[str]:
         pid = body[0]
         char = self.char
 
