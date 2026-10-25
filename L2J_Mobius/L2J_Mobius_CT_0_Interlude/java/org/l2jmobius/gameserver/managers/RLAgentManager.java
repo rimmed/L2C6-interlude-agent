@@ -326,6 +326,15 @@ public class RLAgentManager
 	}
 	
 	/**
+	 * Tops up what an agent is supplied with (shots of its weapon grade, arrows, potions, what its skills consume, its servitor's shots), for any player: the {@code .supply} command.
+	 * @param player the player
+	 */
+	public void supplyPlayer(Player player)
+	{
+		supply(player);
+	}
+	
+	/**
 	 * @param player the player to check
 	 * @return {@code true} if the automated environment manages this character
 	 */

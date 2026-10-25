@@ -215,6 +215,7 @@ import handlers.chat.commands.voiced.Offline;
 import handlers.chat.commands.voiced.OfflinePlay;
 import handlers.chat.commands.voiced.Online;
 import handlers.chat.commands.voiced.Premium;
+import handlers.chat.commands.voiced.Supply;
 import handlers.chat.commands.voiced.Wedding;
 import handlers.items.BeastSoulShot;
 import handlers.items.BeastSpice;
@@ -521,6 +522,7 @@ public class MasterHandler
 			ExperienceGain.class,
 			FullBuff.class,
 			Heal.class,
+			Supply.class,
 			WeddingConfig.ALLOW_WEDDING ? Wedding.class : null,
 			AutoPlayConfig.ENABLE_AUTO_PLAY ? AutoPlay.class : null,
 			BankingConfig.BANKING_SYSTEM_ENABLED ? Banking.class : null,
