@@ -4,8 +4,9 @@ Lineage2 C6 Interlude -- neural combat policy for the headless client.
 Runs the ONNX export of ``CombatEventTransformer`` (see ``l2_NN/export_onnx.py``) on the live game
 state.  Only ``numpy`` and ``onnxruntime`` are needed: every normalisation constant, the window
 length and the action label space come from the ``.json`` file that the exporter writes next to
-the ``.onnx`` file.  The skill panel is the character's own combat skills (``SkillList`` filtered
-by the datapack catalog, ``skill_data.combat_panel``), each slot described by its datapack features
+the ``.onnx`` file.  The skill panel is the fixed panel of the character's class (``class_panels.json``,
+the one the training dataloader uses), a slot filled while the character knows the skill
+(``SkillList``) and its equipment allows it, each slot described by its datapack features
 (``l2_client/skill_features.py``, shared with the training dataloader) - so skills of classes the
 model never saw are usable.
 
@@ -51,7 +52,7 @@ from typing import Any
 import numpy as np
 
 from . import skill_features
-from .tools.data import skill_data, summon_data
+from .tools.data import class_panels, item_data, skill_data, summon_data
 
 #: Action classes the bot can execute.  The rest of the label space (inflicted_damage, killed, ...)
 #: is the game answering the player and is never a valid command.
@@ -260,6 +261,10 @@ class CombatPolicy:
         unknown = [name for name in self.meta["features"]["skill"] if name not in skill_features.SKILL_SLOT_FEATURES]
         if mismatch or unknown:
             raise ValueError(f"{meta_path}: skill encoding differs from l2_client/skill_features.py: {mismatch} {unknown}")
+        trained_on = self.meta["features"].get("skill_panels")
+        if trained_on != class_panels.panels_hash():
+            print(f"[MODEL] !! {meta_path.name} was trained on " + (f"class panels {trained_on}" if trained_on else
+                  "per-character skill panels") + f", the client uses class panels {class_panels.panels_hash()}")
 
     def _init_layout(self, server_speed: float, max_target_dz: float | None) -> None:
         self.seq_len: int = self.meta["seq_len"]
@@ -281,12 +286,16 @@ class CombatPolicy:
         self._executable = [
             (name, self.action_to_id[name]) for name in EXECUTABLE_ACTIONS if name in self.action_to_id
         ]
+        #: skill id of every slot of the class panel (``class_panels.json``); a slot never moves
         self.panel: list[int] = []
-        self._panel_info: list[skill_data.SkillInfo] = []
+        self._class_panel: class_panels.ClassPanel | None = None
+        #: usable slots of the character's own skills: slot -> the skill at the character's level of it
+        self._own_slots: dict[int, skill_data.SkillInfo] = {}
         self._known_skills: set[int] = set()
         #: the summon's skills (after the panel) for the summon template in ``_pet_npc``
         self._pet_npc: int | None = None
-        self._pet_skills: list[tuple[summon_data.PetSkill, skill_data.SkillInfo]] = []
+        #: slots of the summon's skills: slot -> (its skill, the skill at the summon's level of it)
+        self._pet_slots: dict[int, tuple[summon_data.PetSkill, skill_data.SkillInfo]] = {}
         self._pet_cooldown_until: dict[int, float] = {}
 
         self._frames: deque[_Frame] = deque(maxlen=self.seq_len)
@@ -304,18 +313,44 @@ class CombatPolicy:
 
     def bind_character(self, char) -> None:
         """
-        Build the skill panel from the character's own skills (``char.skills`` from SkillList).
+        Bind the fixed skill panel of the character's class and fill the slots it can use now.
 
-        Only learnable combat skills (attack, debuff, heal, buff) get a slot; item skills, crafting
-        and resting never do. Call again whenever a new SkillList arrives.
+        The panel is the class's (``class_panels.json``, the one the model was trained with); a slot is
+        usable while the character knows the skill (``char.skills`` from SkillList) and its equipment
+        allows it, at a level in the skill's range (``PanelSlot.active_at``: outgrown skills leave the panel).
+        Call again whenever a new SkillList, another weapon or a level-up arrives.
         """
         self._known_skills = {s["id"] for s in char.skills if not s.get("passive")}
-        known = [(s["id"], s.get("level", 1)) for s in char.skills if not s.get("passive")]
-        self._panel_info = skill_data.combat_panel(known, self.max_skills)
-        self.panel = [info.skill_id for info in self._panel_info]
-        print(f"[MODEL] Skill panel of {char.name}: " + ", ".join(
-            f"{info.name} ({info.category})" for info in self._panel_info) if self._panel_info
-            else f"[MODEL] {char.name} has no combat skill yet")
+        known = {s["id"]: s.get("level", 1) for s in char.skills if not s.get("passive")}
+        self._equipment = self._equipment_of(char)
+        class_id = getattr(char, "class_id", None)
+        if skill_data.LEGACY_PANELS:  # A/B: the per-character panel of 2026-10-22
+            self._bound_level = getattr(char, "level", 1)
+            self._own_slots = dict(enumerate(skill_data.combat_panel(known.items(), self.max_skills, equipment=self._equipment)))
+            self.panel = [info.skill_id for info in self._own_slots.values()]
+            self._pet_npc = None  # the summon's slots follow the panel
+            print(f"[MODEL] Legacy skill panel of {char.name}: " + ", ".join(info.name for info in self._own_slots.values()))
+            return
+        if self._class_panel is None or self._class_panel.class_id != class_id:
+            self._class_panel = class_panels.panel(class_id)
+            self._pet_npc = None  # the summon's slots are the new class's
+            self._pet_slots = {}
+            if self._class_panel is None:
+                print(f"[MODEL] !! no skill panel for class {class_id} of {char.name}: it fights without skills")
+        slots = self._class_panel.slots[: self.max_skills] if self._class_panel else ()
+        self.panel = [slot.skill_id for slot in slots]
+        self._own_slots = {}
+        self._bound_level = getattr(char, "level", 1)
+        for i, slot in enumerate(slots):
+            if slot.pet or slot.skill_id not in known or not slot.active_at(self._bound_level):
+                continue
+            if self._equipment is not None and not skill_data.usable_with(slot.skill_id, *self._equipment):
+                continue
+            info = skill_data.get_skill_info(slot.skill_id, known[slot.skill_id])
+            if info is not None:
+                self._own_slots[i] = info
+        print(f"[MODEL] Skill panel of {char.name} ({self._class_panel.name if self._class_panel else '?'}): "
+              + (", ".join(f"{i}:{info.name}" for i, info in self._own_slots.items()) or "no usable skill yet"))
 
     # ------------------------------------------------------------------
     # Live-state hooks
@@ -361,7 +396,7 @@ class CombatPolicy:
     def note_pet_skill_used(self, skill_id: int, now: float | None = None) -> None:
         """The summon cast ``skill_id`` (its MagicSkillUse): its reuse starts (real-time expiry)."""
         now = time.time() if now is None else now
-        info = next((info for pet, info in self._pet_skills if pet.skill_id == skill_id), None)
+        info = next((info for pet, info in self._pet_slots.values() if pet.skill_id == skill_id), None)
         if info is not None:
             self._pet_cooldown_until[skill_id] = now + info.reuse_ms / 1000.0 / self.server_speed
 
@@ -371,12 +406,21 @@ class CombatPolicy:
         if npc == self._pet_npc:
             return
         self._pet_npc = npc
-        self._pet_skills = []
-        if npc is not None:
-            for pet_skill in summon_data.pet_skills(npc):
+        self._pet_slots = {}
+        if skill_data.LEGACY_PANELS:
+            for pet_skill in summon_data.pet_skills(npc) if npc is not None else ():
                 info = skill_data.get_skill_info(pet_skill.skill_id, pet_skill.level)
-                if info is not None and len(self._panel_info) + len(self._pet_skills) < self.max_skills:
-                    self._pet_skills.append((pet_skill, info))
+                slot = len(self._own_slots) + len(self._pet_slots)
+                if info is not None and slot < self.max_skills:
+                    self._pet_slots[slot] = (pet_skill, info)
+            self.panel = self.panel[: len(self._own_slots)] + [p.skill_id for p, _ in self._pet_slots.values()]
+            return
+        if npc is not None and self._class_panel is not None:
+            for pet_skill in summon_data.pet_skills(npc):
+                slot = self._class_panel.slot_of(pet_skill.skill_id, pet=True)
+                info = skill_data.get_skill_info(pet_skill.skill_id, pet_skill.level)
+                if slot is not None and slot < self.max_skills and info is not None:
+                    self._pet_slots[slot] = (pet_skill, info)
 
     def apply_skill_cool_time(self, parsed: dict, now: float | None = None) -> None:
         """
@@ -453,22 +497,23 @@ class CombatPolicy:
             self.reset_session()
         self._session_engaged = self._session_engaged or engaged
 
+        if self._equipment_of(char) != getattr(self, "_equipment", None) or char.level != getattr(self, "_bound_level", None):
+            self.bind_character(char)  # another weapon or level: other skills become usable
         pet = self._live_pet(char)
         self._bind_pet(pet)
         frame = self._snapshot(char, current_target_id, pos, now)
         has_mobs = bool(frame.mob_ids)
         target_alive = bool(current_target_id) and current_target_id in char.radar.entries
         usable_slots = tuple(
-            i for i, info in enumerate(self._panel_info)
+            i for i, info in self._own_slots.items()
             if self._skill_usable(info.skill_id, now) and char.cur_mp >= info.mp_cost
             # summon skills need a summon; a second servitor cannot be summoned while one is out
             and (pet is not None or not skill_data.needs_summon(info.skill_id))
             and (pet is None or not skill_data.summons_servitor(info.skill_id))
         )
-        first_pet_slot = len(self._panel_info)
-        pet_skills = {first_pet_slot + j: pet_skill for j, (pet_skill, _) in enumerate(self._pet_skills)}
+        pet_skills = {slot: pet_skill for slot, (pet_skill, _) in self._pet_slots.items()}
         pet_slots = tuple(
-            first_pet_slot + j for j, (pet_skill, info) in enumerate(self._pet_skills)
+            slot for slot, (pet_skill, info) in self._pet_slots.items()
             if pet is not None and self._pet_cooldown_until.get(pet_skill.skill_id, 0.0) <= now
             and pet.get("cur_mp", 0) >= info.mp_cost and (pet_skill.on_owner or target_alive or has_mobs)
         )
@@ -482,9 +527,26 @@ class CombatPolicy:
             "pet_attack": pet is not None and (target_alive or has_mobs),
             "pet_skill": bool(pet_slots),
         }
-        panel = tuple(self.panel) + tuple(pet_skill.skill_id for pet_skill, _ in self._pet_skills)
+        panel = tuple(self.panel)
         return Observation(feeds=self._window(), mob_ids=frame.mob_ids, valid=valid, usable_slots=usable_slots,
-                           panel=panel, t=now, pet_slots=pet_slots, pet_skills=pet_skills)
+                           panel=panel, t=now, pet_slots=pet_slots, pet_skills=pet_skills,)
+
+    def panel_summary(self) -> dict:
+        """The usable slots of the class panel (``[slot, skill id, level]``, the character's and the summon's) and the equipment."""
+        return {"class_id": self._class_panel.class_id if self._class_panel else None,
+                "skills": [[slot, info.skill_id, info.level] for slot, info in sorted(self._own_slots.items())],
+                "pet": [[slot, pet_skill.skill_id, info.level] for slot, (pet_skill, info) in sorted(self._pet_slots.items())],
+                "equipment": list(self._equipment) if getattr(self, "_equipment", None) else None}
+
+    @staticmethod
+    def _equipment_of(char) -> tuple[str, str, bool] | None:
+        """``(weapon type, body armor type, has shield)`` from the UserInfo paperdoll, ``None`` before it arrives."""
+        doll = getattr(char, "paperdoll_display", None)
+        if not doll:
+            return None
+        weapon = doll.get("RHAND", 0) or doll.get("RHAND2", 0)
+        return (item_data.get_weapon_type(weapon) if weapon else "FIST", item_data.get_armor_type(doll.get("CHEST", 0)),
+                item_data.is_shield(doll.get("LHAND", 0)))
 
     @staticmethod
     def _live_pet(char) -> dict | None:
@@ -705,7 +767,7 @@ class CombatPolicy:
 
     def _encode_skills(self, char, now: float) -> np.ndarray:
         matrix = np.zeros((self.max_skills, skill_features.SKILL_SLOT_DIM), dtype=np.float32)
-        for slot, info in enumerate(self._panel_info):
+        for slot, info in self._own_slots.items():
             # Expiries are real time, the feature is game time like the logged cooldowns.
             left = max(0.0, self._cooldown_until.get(info.skill_id, 0.0) - now) * self.server_speed
             matrix[slot] = skill_features.encode_skill_slot(
@@ -713,9 +775,9 @@ class CombatPolicy:
             )
         pet = self._live_pet(char)
         if pet is not None:
-            for j, (pet_skill, info) in enumerate(self._pet_skills):
+            for slot, (pet_skill, info) in self._pet_slots.items():
                 left = max(0.0, self._pet_cooldown_until.get(pet_skill.skill_id, 0.0) - now) * self.server_speed
-                matrix[len(self._panel_info) + j] = skill_features.encode_skill_slot(
+                matrix[slot] = skill_features.encode_skill_slot(
                     info, max_mp=pet.get("max_mp", 0), cur_mp=pet.get("cur_mp", 0), cooldown_left_s=left, pet=True
                 )
         return matrix[:, self._skill_cols]

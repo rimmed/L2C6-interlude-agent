@@ -78,6 +78,7 @@ from l2_NN.dataloader.dataloder import (  # noqa: E402 - PROJECT_ROOT is added j
     Lineage2EventDataset,
 )
 from l2_NN.model.CombatEventTransformer import CombatEventTransformer  # noqa: E402
+from l2_client.tools.data import class_panels  # noqa: E402
 
 #: The cleaned dataset lives in the repository root, one level above the ``l2_agent`` project.
 DEFAULT_DATA_PATH: Final[Path] = PROJECT_ROOT.parent / "l2jc6_playeractions_cleaned.parquet"
@@ -574,7 +575,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             "action_to_id": dataset.action_to_id,
             # Feature layouts by name: export_onnx / train_rl must not assume today's layout for old checkpoints.
             "features": {"player": list(PLAYER_FEATURE_NAMES), "mob": list(MOB_FEATURE_NAMES),
-                         "skill": list(SKILL_FEATURE_NAMES)},
+                         "skill": list(SKILL_FEATURE_NAMES),
+                         # the class panels (l2_client/tools/data/class_panels.json) the skill slots come from
+                         "skill_panels": class_panels.panels_hash()},
             "split": {"by": args.split_by, **split_info},
             "args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(args).items()},
         }

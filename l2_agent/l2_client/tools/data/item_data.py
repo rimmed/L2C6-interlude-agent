@@ -46,6 +46,9 @@ _ITEM_GRADE: dict[int, int] = {}
 # Item name
 _ITEM_NAME: dict[int, str] = {}
 
+# Item -> (weapon_type or armor_type, bodypart), e.g. (BOW, lrhand), (LIGHT, chest), ("", lhand) for a shield
+_ITEM_KIND: dict[int, tuple[str, str]] = {}
+
 _loaded = False
 
 
@@ -83,6 +86,9 @@ def load_item_data(path: str = DEFAULT_ITEM_XML_PATH):
                 continue
 
             _ITEM_NAME[item_id] = name
+            sets = {e.get("name"): e.get("val", "") for e in item_elem.findall("set")}
+            if item_elem.get("type") in ("Weapon", "Armor"):
+                _ITEM_KIND[item_id] = (sets.get("weapon_type") or sets.get("armor_type") or "", sets.get("bodypart", ""))
 
             # crystal_type is a <set name="crystal_type" val="D"/> child element
             crystal_el = item_elem.find("set[@name='crystal_type']")
@@ -100,6 +106,23 @@ def load_item_data(path: str = DEFAULT_ITEM_XML_PATH):
 def get_item_name(item_id: int) -> str:
     """Return the human-readable name for an item ID, or ``""``."""
     return _ITEM_NAME.get(item_id, "")
+
+
+def get_weapon_type(item_id: int) -> str:
+    """Weapon type of a weapon (``SWORD``, ``BOW``, ``DUAL`` ...), ``""`` for anything else."""
+    kind, part = _ITEM_KIND.get(item_id, ("", ""))
+    return kind if part in ("rhand", "lrhand") else ""
+
+
+def get_armor_type(item_id: int) -> str:
+    """Armor type of a body armor (``HEAVY``, ``LIGHT``, ``MAGIC``), ``""`` for anything else."""
+    kind, part = _ITEM_KIND.get(item_id, ("", ""))
+    return kind if part in ("chest", "fullarmor", "onepiece") else ""
+
+
+def is_shield(item_id: int) -> bool:
+    """The item goes into the left hand (a shield or sigil)."""
+    return _ITEM_KIND.get(item_id, ("", ""))[1] == "lhand"
 
 
 def get_item_grade(item_id: int) -> int:

@@ -50,10 +50,13 @@ logged column                 consumed as
 
 Skill panel slots
 -----------------
-The panel of an event is the character's *combat* skill panel at that moment: the learnable
-active skills of ``known_skills`` (filled by the log converter) whose category is attack, debuff,
-heal or buff, ordered by category priority and skill id (``skill_data.combat_panel``, up to ``N``
-slots). Item skills (herbs, potions, keys), crafting and resting never get a slot.
+The panel of an event is the fixed panel of the character's class (``class_panels.json``, see
+``l2_client/tools/data/class_panels.py``; the very panel the live client uses): every combat skill
+of the class's profession chain and of its servitors in a fixed slot. A slot is filled when the
+skill is usable at that moment - the character knows it (``known_skills``), its equipment allows it,
+for a servitor's skill: that servitor is out - and the character's level is in the skill's range
+(learned and not outgrown, ``PanelSlot.outgrown_at``) - and an all-zero row (like padding) otherwise. The
+class comes from the ``class_id`` column (inferred from the known skills for logs without it).
 
 Every slot is described by *what the skill is* - category, target, power, MP cost, range, cast and
 reuse time from the datapack - and by its state - ready, remaining cooldown, affordable - see
@@ -124,7 +127,7 @@ from torch.utils.data import Dataset
 
 from l2_client import skill_features
 from l2_client.skill_features import COOLDOWN_SCALE_S, SKILL_SLOT_DIM, SKILL_SLOT_FEATURES, encode_skill_slot
-from l2_client.tools.data import skill_data, summon_data
+from l2_client.tools.data import class_panels, item_data, skill_data, summon_data
 
 from .augment import AugmentConfig
 
@@ -543,11 +546,16 @@ class Lineage2EventDataset(Dataset):
 
         self.data = self._preprocess_dataframe(df)
         skill_data.load_skill_data(str(DATAPACK_SKILLS))
+        item_data.load_item_data(str(DATAPACK_SKILLS.parent / "items"))
+        summon_data.load_summon_data(str(DATAPACK_SKILLS.parent / "npcs"))  # absolute: train.py runs from any CWD
         if "known_skills" not in self.data.columns:
             print("Warning: no known_skills column (re-run playeraction_log2parquet.py) - every skill panel is empty")
         #: every combat skill of the datapack: the pool distractor skills are drawn from
         self._skill_pool: list[int] = skill_data.combat_skill_ids()
         self._best_level_cache: dict[tuple[int, int], int] = {}
+        #: (character id, known skill ids) -> class guessed for rows without a class_id
+        self._class_cache: dict[tuple, Optional[int]] = {}
+        self._no_class_rows = 0
         self._env_action_ids = np.array([self.action_to_id[name] for name in ENVIRONMENT_EVENT_NAMES])
         #: per-event features, sliced by :meth:`window`.
         self.features = self._precompute_features(self.data)
@@ -632,7 +640,7 @@ class Lineage2EventDataset(Dataset):
         }
 
     def _panel_size_stats(self) -> dict[str, int]:
-        sizes = (self.features.skill_ids >= 0).sum(axis=1)
+        sizes = (self.features.skills_matrix.any(axis=2)).sum(axis=1)  # usable slots
         if sizes.size == 0:
             return {"min": 0, "median": 0, "max": 0}
         return {"min": int(sizes.min()), "median": int(np.median(sizes)), "max": int(sizes.max())}
@@ -653,7 +661,9 @@ class Lineage2EventDataset(Dataset):
             f"skill {stats['skill_resolved']} of {stats['skill_events']} used_skill events"
         )
         print(f"  nonzero pointer slots   : {stats['pointer_hits']}")
-        print(f"  combat panel size       : {stats['panel_size']}")
+        print(f"  usable panel slots      : {stats['panel_size']} (class panels {class_panels.panels_hash()})")
+        if self._no_class_rows:
+            print(f"  !! rows without a known class (empty panel): {self._no_class_rows}")
 
     # ----------------------------------------------------------------------------------
     # Preprocessing
@@ -853,6 +863,19 @@ class Lineage2EventDataset(Dataset):
 
         return matrix, pointer_idx, matched
 
+    @staticmethod
+    def _equipment(row: Any) -> Optional[tuple[str, str, bool]]:
+        """``(weapon type, body armor type, has shield)`` of the event's character, ``None`` when unknown."""
+        ids = _lookup(row, "equipment_ids", None)
+        if not isinstance(ids, Mapping):
+            return None
+        weapon = ids.get("Weapon")
+        chest = ids.get("Chest")
+        shield = ids.get("Shield")
+        return (item_data.get_weapon_type(int(weapon)) if weapon else "FIST",
+                item_data.get_armor_type(int(chest)) if chest else "",
+                bool(shield) and item_data.is_shield(int(shield)))
+
     def _cooldown_left_by_skill(self, row: Any) -> dict[int, float]:
         """Map ``skill_id -> remaining cooldown`` **in seconds** for the current event."""
         remaining: dict[int, float] = {}
@@ -866,28 +889,82 @@ class Lineage2EventDataset(Dataset):
             remaining[int(skill_id)] = milliseconds / MILLISECONDS_PER_SECOND
         return remaining
 
+    def _class_of(self, row: Any, known: Mapping[int, int]) -> Optional[int]:
+        """The character's class: the ``class_id`` column, else guessed from its known skills."""
+        class_id = _optional_number(row, ("class_id",))
+        if class_id is not None:
+            return int(class_id)
+        key = (_optional_number(row, ("character_id",)), frozenset(known))
+        if key not in self._class_cache:
+            self._class_cache[key] = class_panels.infer_class(known)
+        return self._class_cache[key]
+
+    def _encode_legacy_skills(self, row: Any, action_id: int, known: Mapping[int, int],
+                              pet_cooldown_until: Mapping[int, float] | None, now: float) -> tuple[np.ndarray, np.ndarray, int, bool]:
+        """A/B (``L2_LEGACY_PANELS=1``): the per-character panel of 2026-10-22, the summon's skills after it."""
+        matrix = np.zeros((self.max_skills, SKILL_FEATURE_DIM), dtype=np.float32)
+        skill_ids = np.full(self.max_skills, -1, dtype=np.int32)
+        panel = skill_data.combat_panel(known.items(), self.max_skills, equipment=self._equipment(row))
+        current_mp = _feature_number(row, ("mp", "char_stats.mp"), 0.0)
+        max_mp = _feature_number(row, ("max_mp", "char_stats.max_mp"), 1.0)
+        remaining = self._cooldown_left_by_skill(row)
+        used = _optional_number(row, ("skill_id",)) if action_id == USED_SKILL_ACTION_ID else None
+        slot_label, resolved = 0, False
+        for slot_idx, info in enumerate(panel):
+            matrix[slot_idx] = encode_skill_slot(info, max_mp=max_mp, cur_mp=current_mp,
+                                                 cooldown_left_s=remaining.get(info.skill_id, 0.0))
+            skill_ids[slot_idx] = info.skill_id
+            if used is not None and info.skill_id == int(used):
+                slot_label, resolved = slot_idx, True
+        pet = self._pet(row)
+        if pet is not None and not _as_bool(pet.get("dead")) and pet.get("npc_id") is not None:
+            command = str(_lookup(row, "pet_command", "") or "")
+            ordered = int(command[5:]) if action_id == PET_SKILL_ACTION_ID and command.startswith("skill") and command[5:].isdigit() else None
+            cooldowns = pet_cooldown_until or {}
+            for offset, pet_skill in enumerate(summon_data.pet_skills(int(pet["npc_id"]))):
+                slot_idx = len(panel) + offset
+                info = skill_data.get_skill_info(pet_skill.skill_id, pet_skill.level)
+                if slot_idx >= self.max_skills or info is None:
+                    break
+                matrix[slot_idx] = encode_skill_slot(info, max_mp=_as_float(pet.get("max_mp"), 1.0), cur_mp=_as_float(pet.get("mp"), 0.0),
+                                                     cooldown_left_s=max(0.0, cooldowns.get(pet_skill.skill_id, 0.0) - now), pet=True)
+                skill_ids[slot_idx] = pet_skill.skill_id
+                if ordered is not None and pet_skill.action_id == ordered:
+                    slot_label, resolved = slot_idx, True
+        return matrix, skill_ids, slot_label, resolved
+
     def _encode_skills_matrix(self, row: Any, action_id: int, pet_cooldown_until: Mapping[int, float] | None = None,
                               now: float = 0.0) -> tuple[np.ndarray, np.ndarray, int, bool]:
         """
-        Encode the combat skill panel (``(N, SKILL_FEATURE_DIM)``) and the ``target_skill_slot`` label.
+        Encode the class's skill panel (``(N, SKILL_FEATURE_DIM)``) and the ``target_skill_slot`` label.
 
-        The summon's skills follow the character's panel (``is_pet_skill = 1``, MP and cooldown are
-        the summon's); ``pet_skill`` events are labelled with the slot of the ordered skill.
+        Every slot of the class panel keeps its skill; a slot is encoded only while it is usable (the
+        skill is known and allowed by the equipment; a servitor's skill while that servitor is out -
+        its MP and cooldown are the summon's), otherwise it stays an all-zero row. ``pet_skill``
+        events are labelled with the slot of the ordered skill.
 
         :param pet_cooldown_until: summon skill id -> end of its reuse (seconds, the clock of ``now``)
 
         :return: ``(matrix, skill_ids, slot_label, resolved)`` - ``skill_ids`` holds the skill of every
-            slot (``-1`` = empty); ``resolved`` tells whether the used skill is on the panel
+            slot of the class panel (``-1`` after it); ``resolved`` tells whether the used skill is on
+            the panel and usable
         """
         matrix = np.zeros((self.max_skills, SKILL_FEATURE_DIM), dtype=np.float32)
         skill_ids = np.full(self.max_skills, -1, dtype=np.int32)
 
-        known = [
-            (int(entry["id"]), int(entry.get("level") or 1))
-            for entry in _dict_list(_lookup(row, "known_skills", None))
-            if entry.get("id") is not None
-        ]
-        panel = skill_data.combat_panel(known, self.max_skills)
+        known: dict[int, int] = {}
+        for entry in _dict_list(_lookup(row, "known_skills", None)):
+            if entry.get("id") is not None:
+                skill_id = int(entry["id"])
+                known[skill_id] = max(known.get(skill_id, 0), int(entry.get("level") or 1))
+        if skill_data.LEGACY_PANELS:
+            return self._encode_legacy_skills(row, action_id, known, pet_cooldown_until, now)
+        panel = class_panels.panel(self._class_of(row, known))
+        if panel is None:
+            self._no_class_rows += 1
+            return matrix, skill_ids, 0, False
+        equipment = self._equipment(row)
+        level = int(_optional_number(row, ("lvl",)) or 1)
 
         current_mp = _feature_number(row, ("mp", "char_stats.mp"), 0.0)
         max_mp = _feature_number(row, ("max_mp", "char_stats.max_mp"), 1.0)
@@ -897,11 +974,18 @@ class Lineage2EventDataset(Dataset):
         used_skill_key = None if used_skill_id is None else int(used_skill_id)
 
         slot_label, resolved = 0, False
-        for slot_idx, info in enumerate(panel):
+        for slot_idx, slot in enumerate(panel.slots[: self.max_skills]):
+            skill_ids[slot_idx] = slot.skill_id
+            skill_level = known.get(slot.skill_id)
+            if slot.pet or skill_level is None or not slot.active_at(level) \
+                    or (equipment is not None and not skill_data.usable_with(slot.skill_id, *equipment)):
+                continue
+            info = skill_data.get_skill_info(slot.skill_id, skill_level)
+            if info is None:
+                continue
             matrix[slot_idx] = encode_skill_slot(
                 info, max_mp=max_mp, cur_mp=current_mp, cooldown_left_s=remaining.get(info.skill_id, 0.0)
             )
-            skill_ids[slot_idx] = info.skill_id
             if used_skill_key is not None and info.skill_id == used_skill_key:
                 slot_label, resolved = slot_idx, True
 
@@ -914,16 +998,15 @@ class Lineage2EventDataset(Dataset):
             pet_mp = _as_float(pet.get("mp"), 0.0)
             pet_max_mp = _as_float(pet.get("max_mp"), 1.0)
             cooldowns = pet_cooldown_until or {}
-            for offset, pet_skill in enumerate(summon_data.pet_skills(int(pet["npc_id"]))):
-                slot_idx = len(panel) + offset
+            for pet_skill in summon_data.pet_skills(int(pet["npc_id"])):
+                slot_idx = panel.slot_of(pet_skill.skill_id, pet=True)
                 info = skill_data.get_skill_info(pet_skill.skill_id, pet_skill.level)
-                if slot_idx >= self.max_skills or info is None:
-                    break
+                if slot_idx is None or slot_idx >= self.max_skills or info is None:
+                    continue
                 matrix[slot_idx] = encode_skill_slot(
                     info, max_mp=pet_max_mp, cur_mp=pet_mp,
                     cooldown_left_s=max(0.0, cooldowns.get(pet_skill.skill_id, 0.0) - now), pet=True,
                 )
-                skill_ids[slot_idx] = pet_skill.skill_id
                 if ordered is not None and pet_skill.action_id == ordered:
                     slot_label, resolved = slot_idx, True
         return matrix, skill_ids, slot_label, resolved

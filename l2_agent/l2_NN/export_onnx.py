@@ -168,7 +168,7 @@ def build_metadata(checkpoint: dict, onnx_path: Path) -> dict:
             "default_move_speed": dl.DEFAULT_MOVE_SPEED,
             "skill_cooldown_norm_seconds": dl.SKILL_COOLDOWN_NORM_SECONDS,
         },
-        # The skill panel is the character's own combat skills (skill_data.combat_panel), encoded by
+        # The skill panel is the class's fixed panel (class_panels.json, its hash in features.skill_panels), encoded by
         # l2_client/skill_features.py; the client checks that its encoder still matches these scales.
         "skill_encoding": {
             "power_log_scale": sf.POWER_LOG_SCALE,

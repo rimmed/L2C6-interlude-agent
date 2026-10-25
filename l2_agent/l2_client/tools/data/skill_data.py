@@ -74,11 +74,31 @@ _MAGIC_ATTACK_EFFECTS = frozenset(("MagicalDamage", "MagicalDamageMp", "HpDrain"
 _DEBUFF_EFFECTS = frozenset((
     "Debuff", "DamOverTime", "ManaDamOverTime", "Stun", "Root", "Paralyze", "Mute", "PhysicalMute", "Fear",
     "Sleep", "Confuse", "Bluff", "Betray",
+    # aggro and hate (Aggression, Aura of Hate, Lure, Charm, Confusion, Curse Discord), buff removal
+    # (Mage / Warrior Bane) and Mass Fear
+    "GetAgro", "TargetMe", "AddHate", "RandomizeHate", "Distrust", "DispelBySlotProbability", "RunAway",
 ))
 _HEAL_EFFECTS = frozenset((
     "Heal", "HealOverTime", "HealPercent", "CpHeal", "ManaHeal", "ManaHealOverTime", "ManaHealByLevel",
     "ManaHealPercent", "HpByLevel",
+    # cures of the character's own ailments (Cure Poison / Bleeding, Bandage, Break Duress)
+    "DispelBySlot",
 ))
+#: Buffs without a ``Buff`` effect: charges (Sonic Focus, Focused Force), stances that root the caster
+#: (Snipe, Ultimate Defense, Vengeance), invincibility, max HP and the servitor's empowerment.
+_BUFF_EFFECTS = frozenset(("FocusEnergy", "ImmobileBuff", "ImmobilePetBuff", "Invincible", "MaxHp"))
+#: Skills whose effects do not tell their role: Provoke (aggro without an effect of its own) and
+#: Cancellation (its effect is shared with the friendly Cleanse).
+_CATEGORY_OVERRIDES = {286: "debuff", 1056: "debuff"}
+#: A/B switch (``L2_LEGACY_PANELS=1``): the panels of 2026-10-22 - per-character panels (policy, dataloader)
+#: and the categories before the aggro / cure / charge skills were added to them.
+LEGACY_PANELS = os.environ.get("L2_LEGACY_PANELS") == "1"
+if LEGACY_PANELS:
+    _DEBUFF_EFFECTS = _DEBUFF_EFFECTS - {"GetAgro", "TargetMe", "AddHate", "RandomizeHate", "Distrust",
+                                         "DispelBySlotProbability", "RunAway"}
+    _HEAL_EFFECTS = _HEAL_EFFECTS - {"DispelBySlot"}
+    _BUFF_EFFECTS = frozenset()
+    _CATEGORY_OVERRIDES = {}
 #: Non-combat skills: resting, faking death, sneaking (toggles) and corpse handling (sweeping).
 _NON_COMBAT_EFFECTS = frozenset(("Relax", "FakeDeath", "SilentMove", "ChameleonRest", "Sweeper", "ConsumeBody"))
 _SELF_TARGETS = frozenset(("SELF", "PARTY", "CLAN", "PARTY_CLAN", "CLAN_MEMBER", "OWNER_PET", "SERVITOR", "NONE"))
@@ -177,6 +197,9 @@ def _read_raw(skill_elem: ET.Element, name: str, levels: int) -> dict:
         "operate_type": (skill_elem.findtext("operateType") or "").strip(),
         "target_type": (skill_elem.findtext("targetType") or "").strip(),
         "abnormal_type": (skill_elem.findtext("abnormalType") or "").strip(),
+        # <conditions><using kind="BOW" /> ...: the weapon / armor the skill needs (all of them must hold)
+        "using": tuple(frozenset(k.strip() for k in u.get("kind", "").split(",") if k.strip())
+                       for c in skill_elem.findall("conditions") for u in c.iter("using") if u.get("kind")),
         "effects": frozenset(e.get("name") for e in skill_elem.iter("effect") if e.get("name")),
         "tables": tables,
         "values": values,
@@ -232,6 +255,29 @@ def get_abnormal_type(skill_id: int) -> str:
     return raw["abnormal_type"] if raw else ""
 
 
+#: ``<using kind>`` values that name a weapon type; ``LIGHT`` / ``HEAVY`` / ``MAGIC`` name the body armor.
+WEAPON_KINDS = frozenset(("SWORD", "BLUNT", "DAGGER", "BOW", "POLE", "ETC", "FIST", "DUAL", "DUALFIST", "FISHINGROD",
+                          "BIGSWORD", "BIGBLUNT", "DUALDAGGER"))
+ARMOR_KINDS = frozenset(("LIGHT", "HEAVY", "MAGIC"))
+
+
+def usable_with(skill_id: int, weapon: str, armor: str, shield: bool) -> bool:
+    """
+    The equipment meets the skill's ``<using kind>`` conditions (Power Shot needs a bow, Sonic skills
+    dual swords ...). ``weapon`` is the weapon type (``""`` / ``FIST`` without one), ``armor`` the body
+    armor type, ``shield`` whether something is in the left hand. A skill without such a condition is
+    always usable.
+    """
+    raw = _SKILL_RAW.get(skill_id)
+    for kinds in raw["using"] if raw else ():
+        weapons, armors = kinds & WEAPON_KINDS, kinds & ARMOR_KINDS
+        ok = (bool(weapons) and (weapon or "FIST") in weapons) or (bool(armors) and armor in armors) \
+            or ("SHIELD" in kinds and shield)
+        if not ok:
+            return False
+    return True
+
+
 def needs_summon(skill_id: int) -> bool:
     """The skill targets the character's summon (Servitor Heal, Bright Servitor ...): useless without one."""
     raw = _SKILL_RAW.get(skill_id)
@@ -255,6 +301,8 @@ def get_skill_info(skill_id: int, level: int = 1) -> SkillInfo | None:
     # Corpse-targeted skills need a dead monster as target, which the bots never select.
     if not is_active or effects & _NON_COMBAT_EFFECTS or "CORPSE" in raw["target_type"]:
         category = "other"
+    elif skill_id in _CATEGORY_OVERRIDES:
+        category = _CATEGORY_OVERRIDES[skill_id]
     elif effects & _SUMMON_EFFECTS:
         category = SUMMON_CATEGORY
     elif effects & _ATTACK_EFFECTS:
@@ -263,7 +311,7 @@ def get_skill_info(skill_id: int, level: int = 1) -> SkillInfo | None:
         category = "debuff"
     elif effects & _HEAL_EFFECTS:
         category = "heal"
-    elif "Buff" in effects or operate == "T":
+    elif "Buff" in effects or effects & _BUFF_EFFECTS or operate == "T":
         category = "buff"
     else:
         category = "other"
@@ -314,19 +362,23 @@ def best_level_for(skill_id: int, character_level: int) -> int:
     return best
 
 
-def combat_panel(skills: Iterable[tuple[int, int]], max_slots: int = 64) -> list[SkillInfo]:
+def combat_panel(skills: Iterable[tuple[int, int]], max_slots: int = 64,
+                 equipment: tuple[str, str, bool] | None = None) -> list[SkillInfo]:
     """
     The combat skill panel of a character: its learnable active skills of a combat category.
 
     :param skills: ``(skill_id, level)`` pairs the character knows (passives are dropped here)
     :param max_slots: panel size; when there are more skills, categories earlier in
         :data:`PANEL_CATEGORIES` win (attacks first, summons last), then lower skill ids
+    :param equipment: ``(weapon type, body armor type, has shield)`` of the character; skills its
+        equipment does not allow (Power Shot without a bow ...) stay off the panel. ``None`` = unknown
     :return: the panel in a stable order (category priority, then skill id)
     """
     best: dict[int, SkillInfo] = {}
     for skill_id, level in skills:
         info = get_skill_info(int(skill_id), int(level))
-        if info is not None and info.combat and (skill_id not in best or level > best[skill_id].level):
+        if info is not None and info.combat and (skill_id not in best or level > best[skill_id].level) \
+                and (equipment is None or usable_with(int(skill_id), *equipment)):
             best[int(skill_id)] = info
     ranked = sorted(best.values(), key=lambda s: (PANEL_CATEGORIES.index(s.category), s.skill_id))
     return ranked[:max_slots]

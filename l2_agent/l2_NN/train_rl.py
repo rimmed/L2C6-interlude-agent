@@ -470,6 +470,8 @@ class Trainer:
             "player": list(saved.get("player") or dl.player_feature_names(self.model_config["player_dim"])),
             "mob": list(saved.get("mob") or dl.mob_feature_names(self.model_config["mob_features"])),
             "skill": list(saved.get("skill") or dl.skill_feature_names(self.model_config["skill_features"])),
+            # the class panels the model was trained on (None: the per-character panels of older models)
+            "skill_panels": saved.get("skill_panels"),
         }
         self.demo_columns = {
             key: torch.tensor(dl.feature_columns(self.features[name], current))
