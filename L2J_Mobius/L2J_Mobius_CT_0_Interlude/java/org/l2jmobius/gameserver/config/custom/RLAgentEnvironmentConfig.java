@@ -120,6 +120,7 @@ public class RLAgentEnvironmentConfig
 	public static int RL_ARROW_COUNT;
 	public static boolean RL_DEATH_PENALTY;
 	public static boolean RL_RESET_LEVEL_ON_LEVEL_UP;
+	public static int RL_STUCK_SECONDS;
 	public static int RL_SKILL_ITEM_COUNT;
 	public static int RL_BEAST_SHOT_COUNT;
 	public static boolean RL_USE_BLESSED_SPIRITSHOTS;
@@ -223,6 +224,7 @@ public class RLAgentEnvironmentConfig
 		RL_ARROW_COUNT = config.getInt("RLArrowCount", 3000);
 		RL_DEATH_PENALTY = config.getBoolean("RLAgentDeathPenalty", false);
 		RL_RESET_LEVEL_ON_LEVEL_UP = config.getBoolean("RLResetLevelOnLevelUp", true);
+		RL_STUCK_SECONDS = Math.max(0, config.getInt("RLStuckRelocateSeconds", 0));
 		RL_SKILL_ITEM_COUNT = config.getInt("RLSkillItemCount", 100);
 		RL_BEAST_SHOT_COUNT = config.getInt("RLBeastShotCount", 1000);
 		RL_USE_BLESSED_SPIRITSHOTS = config.getBoolean("RLUseBlessedSpiritshots", true);

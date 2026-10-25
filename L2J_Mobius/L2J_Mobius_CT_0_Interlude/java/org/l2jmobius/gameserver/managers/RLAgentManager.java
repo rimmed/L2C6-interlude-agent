@@ -115,6 +115,10 @@ public class RLAgentManager
 	private static final String VAR_BASE_LEVEL = "RL_BASE_LEVEL";
 	/** The class an agent is created for (RLClassBalance): its level is drawn within that profession and its transfers lead to it. */
 	private static final String VAR_TARGET_CLASS = "RL_TARGET_CLASS";
+	/** How often agents are checked for being stuck (RLStuckRelocateSeconds), in ms. */
+	private static final long STUCK_CHECK_INTERVAL = 30000;
+	/** A move shorter than this does not count as progress of a stuck check. */
+	private static final int STUCK_MOVE_DISTANCE = 100;
 	/** How often a summoner agent without a servitor gets one (RLAutoSummon), in ms. */
 	private static final long AUTO_SUMMON_INTERVAL = 30000;
 	/** Level range of each profession (0 = starting class .. 3 = third profession) for RLClassBalance. */
@@ -214,6 +218,9 @@ public class RLAgentManager
 	private final Map<CrystalType, Map<Archetype, GearPool>> _gearPools = new ConcurrentHashMap<>();
 	/** Players whose setup is running; their own level-up events are ignored meanwhile. */
 	private final Set<Integer> _inSetup = ConcurrentHashMap.newKeySet();
+	/** Per agent: x, y and experience at its last progress, and the time of it (RLStuckRelocateSeconds). */
+	private final Map<Integer, long[]> _progress = new ConcurrentHashMap<>();
+	
 	/** Agents per target class (RLClassBalance), read from the database on the first creation. */
 	private Map<Integer, Integer> _targetCounts;
 	private final Map<Integer, ScheduledFuture<?>> _respawnTasks = new ConcurrentHashMap<>();
@@ -246,6 +253,7 @@ public class RLAgentManager
 	{
 		_farmAreas.release(event.getPlayer());
 		_buffs.release(event.getPlayer());
+		_progress.remove(event.getPlayer().getObjectId());
 		final ScheduledFuture<?> task = _respawnTasks.remove(event.getPlayer().getObjectId());
 		if (task != null)
 		{
@@ -302,6 +310,10 @@ public class RLAgentManager
 		if (RLAgentEnvironmentConfig.RL_AUTO_SUMMON)
 		{
 			ThreadPool.scheduleAtFixedRate(this::ensureSummons, AUTO_SUMMON_INTERVAL, AUTO_SUMMON_INTERVAL);
+		}
+		if (RLAgentEnvironmentConfig.RL_STUCK_SECONDS > 0)
+		{
+			ThreadPool.scheduleAtFixedRate(this::relocateStuck, STUCK_CHECK_INTERVAL, STUCK_CHECK_INTERVAL);
 		}
 		LOGGER.info(getClass().getSimpleName() + ": Agent levels " + RLAgentEnvironmentConfig.RL_MIN_LEVEL + "-" + RLAgentEnvironmentConfig.RL_MAX_LEVEL + ", accounts matching \"" + RLAgentEnvironmentConfig.RL_AGENT_ACCOUNT_PATTERN.pattern() + "\", " + RLAgentEnvironmentConfig.RL_FARM_ZONES.size() + " farm zone bracket(s).");
 	}
@@ -1113,6 +1125,43 @@ public class RLAgentManager
 	}
 	
 	/** The skill brings a servitor (the Summon effect handler reports no effect type of its own, so it is found by class). */
+	/**
+	 * Sends every agent that neither moved nor gained experience for RLStuckRelocateSeconds to another farm area: an agent that cannot reach or see its targets (behind a wall, across water) would
+	 * otherwise switch targets on the spot for the rest of the run.
+	 */
+	private void relocateStuck()
+	{
+		final long now = System.currentTimeMillis();
+		for (Player player : World.getInstance().getPlayers())
+		{
+			if (!isAgent(player))
+			{
+				continue;
+			}
+			runSafely(player, "stuck check", () ->
+			{
+				final long[] last = _progress.get(player.getObjectId());
+				if ((last == null) || player.isDead() || (Math.hypot(player.getX() - last[0], player.getY() - last[1]) > STUCK_MOVE_DISTANCE) || (player.getExp() != last[2]))
+				{
+					_progress.put(player.getObjectId(), new long[] { player.getX(), player.getY(), player.getExp(), now });
+					return;
+				}
+				if (((now - last[3]) < (RLAgentEnvironmentConfig.RL_STUCK_SECONDS * 1000L)) || !RLAgentEnvironmentConfig.RL_TELEPORT_TO_FARM_ZONE || !RLAgentEnvironmentConfig.RL_FARM_AUTO)
+				{
+					return;
+				}
+				final Location spot = _farmAreas.relocate(player);
+				LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " made no progress for " + ((now - last[3]) / 1000) + " s at " + player.getX() + "," + player.getY() + "," + player.getZ() + (spot != null ? ", moved to " + spot : ", no other farm area") + ".");
+				if (spot != null)
+				{
+					player.setTarget(null);
+					teleportTo(player, spot);
+				}
+				_progress.put(player.getObjectId(), new long[] { player.getX(), player.getY(), player.getExp(), now });
+			});
+		}
+	}
+	
 	/** Summons a servitor for every agent that can summon one and has none (RLAutoSummon). */
 	private void ensureSummons()
 	{
