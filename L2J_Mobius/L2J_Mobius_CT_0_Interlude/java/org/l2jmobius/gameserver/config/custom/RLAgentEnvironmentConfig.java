@@ -137,6 +137,7 @@ public class RLAgentEnvironmentConfig
 	public static int RL_FARM_MIN_MONSTERS;
 	public static int RL_FARM_MOBS_PER_AGENT;
 	public static List<String> RL_FARM_EXCLUDED_SPAWN_FOLDERS;
+	public static Set<Integer> RL_FARM_EXCLUDED_MONSTERS;
 	/** Buff set name -> weight, in the configured order. */
 	public static Map<String, Integer> RL_BUFF_SET_WEIGHTS;
 	public static Map<Integer, String> RL_BUFF_CLASS_SETS;
@@ -225,6 +226,14 @@ public class RLAgentEnvironmentConfig
 			if (!folder.isBlank())
 			{
 				RL_FARM_EXCLUDED_SPAWN_FOLDERS.add(folder.trim());
+			}
+		}
+		RL_FARM_EXCLUDED_MONSTERS = new HashSet<>();
+		for (String id : config.getString("RLFarmExcludedMonsters", "").split(","))
+		{
+			if (!id.isBlank())
+			{
+				RL_FARM_EXCLUDED_MONSTERS.add(Integer.parseInt(id.trim()));
 			}
 		}
 		RL_BUFF_SET_WEIGHTS = parseWeights(config.getString("RLBuffSetWeights", "none:15;newbie:20;support:30;dances_songs:15;full:20"));

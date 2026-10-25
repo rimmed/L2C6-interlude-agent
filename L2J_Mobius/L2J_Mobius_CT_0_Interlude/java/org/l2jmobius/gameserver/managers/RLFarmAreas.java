@@ -308,9 +308,17 @@ final class RLFarmAreas
 			return spot; // no safe spot among the tried monsters: the last one
 		}
 		
-		final Spawn spawn = area.spawns().get(Rnd.get(area.spawns().size()));
-		final Location base = spawn.isTerritoryBased() ? spawn.getSpawnTerritory().getRandomPoint() : spawn.getSpawnLocation();
-		return onGround(base, base.getX(), base.getY());
+		// A random spawn point; some territories give none, so try a few spawns before giving up.
+		for (int attempt = 0; attempt < SPOT_ATTEMPTS; attempt++)
+		{
+			final Spawn spawn = area.spawns().get(Rnd.get(area.spawns().size()));
+			final Location base = spawn.isTerritoryBased() ? spawn.getSpawnTerritory().getRandomPoint() : spawn.getSpawnLocation();
+			if (base != null)
+			{
+				return onGround(base, base.getX(), base.getY());
+			}
+		}
+		return null; // the caller falls back to the farm zone anchor
 	}
 	
 	/** A point next to the monster; next to an aggressive one, just outside its aggro range so it does not attack at once. */
@@ -385,7 +393,7 @@ final class RLFarmAreas
 		{
 			for (Spawn spawn : spawns)
 			{
-				if (!spawn.getTemplate().isType("Monster") || isExcluded(spawn))
+				if (!spawn.getTemplate().isType("Monster") || isExcluded(spawn) || RLAgentEnvironmentConfig.RL_FARM_EXCLUDED_MONSTERS.contains(spawn.getTemplate().getId()))
 				{
 					skipped++;
 					continue;
@@ -430,7 +438,8 @@ final class RLFarmAreas
 		final String path = file.replace('\\', '/');
 		for (String folder : RLAgentEnvironmentConfig.RL_FARM_EXCLUDED_SPAWN_FOLDERS)
 		{
-			if (path.contains("/" + folder + "/"))
+			// a folder (data/spawns/<folder>/) or a single spawn file (<name>.xml)
+			if (path.contains("/" + folder + "/") || path.endsWith("/" + folder + ".xml"))
 			{
 				return true;
 			}
