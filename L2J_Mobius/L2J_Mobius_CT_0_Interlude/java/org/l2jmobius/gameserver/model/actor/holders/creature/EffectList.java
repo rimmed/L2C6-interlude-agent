@@ -20,7 +20,6 @@
  */
 package org.l2jmobius.gameserver.model.actor.holders.creature;
 
-import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumSet;
 import java.util.LinkedList;
@@ -1378,27 +1377,15 @@ public class EffectList
 		// Remove first buff when buff list is full.
 		if (!skill.isDebuff() && !skill.isToggle() && !skill.is7Signs() && !doesStack(skill))
 		{
-			final int totalBuffs = getBuffCount() + getDanceCount();
-			final int maxTotalBuffs = _owner.getStat().getMaxBuffCount();
-			final int maxDances = PlayerConfig.DANCES_MAX_AMOUNT;
-			final int currentDances = getDanceCount();
-			if (((totalBuffs >= maxTotalBuffs) && !skill.isHealingPotionSkill()) || (skill.isDance() && (currentDances >= maxDances)))
+			// Buffs and songs / dances have separate slots (MaxBuffAmount, MaxDanceAmount), as in Interlude: a full kind loses its oldest effect.
+			final boolean dance = skill.isDance();
+			final boolean full = dance ? (getDanceCount() >= PlayerConfig.DANCES_MAX_AMOUNT) : ((getBuffCount() >= _owner.getStat().getMaxBuffCount()) && !skill.isHealingPotionSkill());
+			if (full)
 			{
-				// New list counting buff and dances/song all together.
-				final List<BuffInfo> allEffects = new ArrayList<>();
-				allEffects.addAll(_buffs);
-				allEffects.addAll(_dances);
-				
 				BuffInfo toRemove = null;
-				for (BuffInfo buffInfo : allEffects)
+				for (BuffInfo buffInfo : dance ? _dances : _buffs)
 				{
 					if (!buffInfo.isInUse())
-					{
-						continue;
-					}
-					
-					// Check if limit of dance/song is exceeded.
-					if (skill.isDance() && (currentDances >= maxDances) && !buffInfo.getSkill().isDance())
 					{
 						continue;
 					}
