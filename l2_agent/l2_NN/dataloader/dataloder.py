@@ -267,15 +267,24 @@ PLAYER_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "pet_dist_norm",
     "pet_attacking",
     "pet_casting",
+    # healing potions: the character carries one (logs without inventory: assumed yes) and its shared
+    # reuse (HEALING_POTION_REUSE_S of game time) has passed since the last one
+    "has_potion",
+    "potion_ready",
 )
 PLAYER_FEATURE_DIM: Final[int] = len(PLAYER_FEATURE_NAMES)
+#: The player features of models trained before the potion features existed.
+PET_PLAYER_FEATURE_NAMES: Final[tuple[str, ...]] = PLAYER_FEATURE_NAMES[: PLAYER_FEATURE_NAMES.index("has_potion")]
+#: Healing potions (Lesser / Healing / Greater) share this reuse in game seconds (``reuse_delay`` 10000).
+HEALING_POTION_IDS: Final[frozenset[int]] = frozenset((1060, 1061, 1539))
+HEALING_POTION_REUSE_S: Final[float] = 10.0
 #: The player features of models trained before summons were supported (a prefix of the current layout).
 LEGACY_PLAYER_FEATURE_NAMES: Final[tuple[str, ...]] = PLAYER_FEATURE_NAMES[: PLAYER_FEATURE_NAMES.index("has_pet")]
 
 
 def player_feature_names(dim: int) -> tuple[str, ...]:
     """The player feature layout of a model with ``dim`` player features (old checkpoints carry no names)."""
-    for names in (PLAYER_FEATURE_NAMES, LEGACY_PLAYER_FEATURE_NAMES):
+    for names in (PLAYER_FEATURE_NAMES, PET_PLAYER_FEATURE_NAMES, LEGACY_PLAYER_FEATURE_NAMES):
         if len(names) == dim:
             return names
     raise ValueError(f"no known player feature layout has {dim} features")
@@ -283,11 +292,20 @@ def player_feature_names(dim: int) -> tuple[str, ...]:
 
 #: ``by_other``: another player is on the monster's aggro list (format-2 logs, ``nearby_objects[].attackers``;
 #: always 0 in format-1 logs). ``is_pet_target``: the character's summon has it as its target.
-#: ``is_padded`` is always the last feature (the model masks the padding slots by it).
+#: ``attacking_me``: its target is the character (``me`` in newer logs) or it hit the character in the last
+#: :data:`ATTACKER_MEMORY_S` seconds. ``dir_sin`` / ``dir_cos``: direction from the character, 0 = north
+#: (newer logs; 0 / 0 when unknown). ``is_padded`` is always the last feature (the model masks padding by it).
 MOB_FEATURE_NAMES: Final[tuple[str, ...]] = (
-    "dist_norm", "lvl_diff", "is_current_target", "by_other", "is_pet_target", "is_padded",
+    "dist_norm", "lvl_diff", "is_current_target", "by_other", "is_pet_target", "attacking_me", "dir_sin", "dir_cos",
+    "is_padded",
 )
 MOB_FEATURE_DIM: Final[int] = len(MOB_FEATURE_NAMES)
+#: The mob features of models trained before attacking_me / the direction existed.
+PET_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = (
+    "dist_norm", "lvl_diff", "is_current_target", "by_other", "is_pet_target", "is_padded",
+)
+#: A monster that hit the character counts as attacking it this long (seconds of the log).
+ATTACKER_MEMORY_S: Final[float] = 5.0
 #: The mob features of models trained before summons were supported.
 BY_OTHER_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is_current_target", "by_other", "is_padded")
 #: The mob features of models trained before ``by_other`` existed.
@@ -296,7 +314,7 @@ LEGACY_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is
 
 def mob_feature_names(dim: int) -> tuple[str, ...]:
     """The mob feature layout of a model with ``dim`` mob features (old checkpoints carry no names)."""
-    for names in (MOB_FEATURE_NAMES, BY_OTHER_MOB_FEATURE_NAMES, LEGACY_MOB_FEATURE_NAMES):
+    for names in (MOB_FEATURE_NAMES, PET_MOB_FEATURE_NAMES, BY_OTHER_MOB_FEATURE_NAMES, LEGACY_MOB_FEATURE_NAMES):
         if len(names) == dim:
             return names
     raise ValueError(f"no known mob feature layout has {dim} features")
@@ -749,7 +767,7 @@ class Lineage2EventDataset(Dataset):
             canonical = "pet_attack" if command == "attack" else "pet_skill" if command.startswith("skill") else "pet_order"
         return self.action_to_id.get(canonical, UNKNOWN_ACTION_ID)
 
-    def _encode_player_state(self, row: Any) -> np.ndarray:
+    def _encode_player_state(self, row: Any, potion_ready: bool = True) -> np.ndarray:
         """
         Encode the player state vector ``V_player`` (``F_player`` values).
 
@@ -779,9 +797,17 @@ class Lineage2EventDataset(Dataset):
                 _ratio(atk_speed, MAX_ATK_SPEED),
                 _ratio(move_speed, MAX_MOVE_SPEED),
                 *self._encode_pet(row),
+                1.0 if self._has_potion(row) else 0.0,
+                1.0 if potion_ready else 0.0,
             ),
             dtype=np.float32,
         )
+
+    @staticmethod
+    def _has_potion(row: Any) -> bool:
+        """The character carries a healing potion: the logged count (``potions``) or, without it, yes."""
+        count = _optional_number(row, ("potions",))
+        return True if count is None else count > 0
 
     @staticmethod
     def _pet(row: Any) -> Optional[Mapping[str, Any]]:
@@ -809,7 +835,7 @@ class Lineage2EventDataset(Dataset):
         # ``sorted`` is stable, so entries with equal/absent distance keep their log order.
         return sorted(nearby, key=lambda mob: _as_float(mob.get("distance"), DEFAULT_DISTANCE))
 
-    def _encode_mobs_matrix(self, row: Any) -> tuple[np.ndarray, int, bool]:
+    def _encode_mobs_matrix(self, row: Any, hit_by: tuple[set, set] = (set(), set())) -> tuple[np.ndarray, int, bool]:
         """
         Encode the Top-K target-candidate matrix ``M`` (``(K, F_monster)``) and its label.
 
@@ -859,7 +885,13 @@ class Lineage2EventDataset(Dataset):
             by_other = 1.0 if attackers is not None and len(attackers) > 0 else 0.0
             is_pet_target = 1.0 if (pet_target is not None and mob_object_id is not None
                                     and int(mob_object_id) == int(pet_target)) else 0.0
-            matrix[slot_idx] = (dist_norm, lvl_diff, is_target, by_other, is_pet_target, 0.0)
+            attacking = _as_bool(mob.get("targets_me")) or (
+                int(mob_object_id) in hit_by[0] if mob_object_id is not None
+                else mob_npc_id is not None and int(mob_npc_id) in hit_by[1])
+            bearing = _optional_number(mob, ("bearing",))
+            dir_sin, dir_cos = (0.0, 0.0) if bearing is None else (math.sin(math.radians(bearing)), math.cos(math.radians(bearing)))
+            matrix[slot_idx] = (dist_norm, lvl_diff, is_target, by_other, is_pet_target, 1.0 if attacking else 0.0,
+                                dir_sin, dir_cos, 0.0)
 
         return matrix, pointer_idx, matched
 
@@ -1034,17 +1066,42 @@ class Lineage2EventDataset(Dataset):
         level = np.ones(count, dtype=np.float32)
 
         # The logs carry the character's cooldowns only: a summon skill's reuse starts at its PETSKILL event.
-        times = frame["timestamp"].astype("int64").to_numpy() / 1e9
+        # seconds; the unit cast matters: pandas may keep the timestamps in microseconds
+        times = frame["timestamp"].astype("datetime64[ns]").astype("int64").to_numpy() / 1e9
         sessions_column = frame["session_id"].to_numpy()
         pet_used = self.action_to_id["pet_used_skill"]
+        took_damage = self.action_to_id["took_damage"]
+        used_item = self.action_to_id["used_item"]
+        #: character id -> time of its last healing potion (the reuse outlives a fight)
+        last_potion_at: dict = {}
         pet_cooldown_until: dict[int, float] = {}
+        #: who hit the character lately: object id / npc id -> time of the hit
+        hit_by_object: dict[int, float] = {}
+        hit_by_npc: dict[int, float] = {}
         for position, (_, row) in enumerate(frame.iterrows()):
             if position == 0 or sessions_column[position] != sessions_column[position - 1]:
-                pet_cooldown_until = {}
+                pet_cooldown_until, hit_by_object, hit_by_npc = {}, {}, {}
             action_id = self._encode_action_type(row)
             action_type[position] = action_id
-            player_state[position] = self._encode_player_state(row)
-            mobs_matrix[position], pointer_idx[position], pointer_resolved[position] = self._encode_mobs_matrix(row)
+            now = times[position]
+            if action_id == took_damage:
+                oid = _optional_number(row, ("entity_object_id",))
+                npc = _optional_number(row, ("entity_npc_id",))
+                if oid is not None:
+                    hit_by_object[int(oid)] = now
+                elif npc is not None:
+                    hit_by_npc[int(npc)] = now
+            hit_by = ({o for o, t in hit_by_object.items() if now - t <= ATTACKER_MEMORY_S},
+                      {n for n, t in hit_by_npc.items() if now - t <= ATTACKER_MEMORY_S})
+            character = _optional_number(row, ("character_id",))
+            last_potion = last_potion_at.get(character)
+            player_state[position] = self._encode_player_state(
+                row, potion_ready=last_potion is None or not (0.0 <= now - last_potion < HEALING_POTION_REUSE_S))
+            if action_id == used_item:
+                item = _optional_number(row, ("entity_item_id",))
+                if item is not None and int(item) in HEALING_POTION_IDS:
+                    last_potion_at[character] = now
+            mobs_matrix[position], pointer_idx[position], pointer_resolved[position] = self._encode_mobs_matrix(row, hit_by)
             (skills_matrix[position], skill_ids[position], skill_slot[position],
              skill_resolved[position]) = self._encode_skills_matrix(row, action_id, pet_cooldown_until, times[position])
             if action_id == pet_used:

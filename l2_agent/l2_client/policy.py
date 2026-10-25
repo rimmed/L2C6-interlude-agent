@@ -68,6 +68,9 @@ SKILL_ACTIONS = ("used_skill", "pet_skill")
 #: The logged InCombat flag is the server's attack stance: it switches on with the first hit (not
 #: with target selection) and lapses this long after the last combat action.
 IN_COMBAT_TIMEOUT_S = 15.0
+#: Healing potions (Lesser / Healing / Greater) and their shared reuse in game seconds, as in the dataloader.
+HEALING_POTION_IDS = frozenset((1060, 1061, 1539))
+HEALING_POTION_REUSE_S = 10.0
 
 #: Monsters this far above or below the character are left out of the candidates: they stand on a
 #: cliff or in a pit, and walking to them straight runs into the terrain (the client has no pathfinding).
@@ -306,6 +309,8 @@ class CombatPolicy:
         self.max_target_dz = max_target_dz
         self._cast_at: dict[int, float] = {}
         self._last_combat_at = 0.0
+        #: real time of the last healing potion the model drank (``potion_ready``)
+        self._potion_used_at = -1e9
 
     # ------------------------------------------------------------------
     # Setup
@@ -523,7 +528,8 @@ class CombatPolicy:
             "attacked": target_alive or has_mobs,
             "used_skill": bool(usable_slots) and (target_alive or has_mobs),
             "picked_up": has_loot,
-            "used_item": has_potion,
+            # a healing potion only once its shared reuse has passed (a drink before is a wasted decision)
+            "used_item": has_potion and (now - self._potion_used_at) * self.server_speed >= HEALING_POTION_REUSE_S,
             "pet_attack": pet is not None and (target_alive or has_mobs),
             "pet_skill": bool(pet_slots),
         }
@@ -597,6 +603,8 @@ class CombatPolicy:
             if action == "pet_skill" and obs.pet_skills:
                 pet_skill = obs.pet_skills.get(skill_slot)
 
+        if action == "used_item":  # the executor drinks a healing potion: its reuse starts
+            self._potion_used_at = obs.t
         return Decision(action=action, mob_object_id=mob_id, skill_id=skill_id,
                         confidence=float(np.exp(logp_action[k])), action_id=action_id,
                         pointer_slot=pointer_slot, skill_slot=skill_slot, logp=logp,
@@ -696,6 +704,10 @@ class CombatPolicy:
             # Training never saw a real move speed - feed the same constant it was trained on.
             "move_speed": ratio(c["default_move_speed"], c["max_move_speed"]),
             **self._pet_features(char, now, pos),
+            # healing potions, as the training data has them: carried, and their shared reuse has passed
+            "has_potion": 1.0 if any(item.get("item_id") in HEALING_POTION_IDS and item.get("count", 0) > 0
+                                     for item in getattr(char, "items", None) or ()) else 0.0,
+            "potion_ready": 1.0 if (now - self._potion_used_at) * self.server_speed >= HEALING_POTION_REUSE_S else 0.0,
         }
         return np.array([values[name] for name in self._player_names], dtype=np.float32)
 
@@ -760,6 +772,11 @@ class CombatPolicy:
                 # another player hit it recently (the actor's WorldState marks the radar entry)
                 "by_other": 1.0 if mob.get("by_other_until", 0.0) > (time.time() if now is None else now) else 0.0,
                 "is_pet_target": 1.0 if pet_target and oid == pet_target else 0.0,
+                # it hit the character lately (the actor's WorldState marks the radar entry)
+                "attacking_me": 1.0 if mob.get("attacking_me_until", 0.0) > (time.time() if now is None else now) else 0.0,
+                # direction from the character, 0 = north (-y) / 90 = east, as the logs write it
+                "dir_sin": (mob["x"] - x) / dist if dist > 0 else 0.0,
+                "dir_cos": (y - mob["y"]) / dist if dist > 0 else 0.0,
                 "is_padded": 0.0,
             }
             matrix[slot] = [row[name] for name in self._mob_names]

@@ -33,6 +33,8 @@ log = logging.getLogger(__name__)
 CAST_MARGIN_S = 0.15
 #: A monster another player hit counts as "attacked by another player" this long (game seconds).
 OTHER_ATTACKER_MEMORY_S = 10.0
+#: A monster that hit the character counts as attacking it this long (game seconds): the ``attacking_me`` feature.
+ATTACKER_MEMORY_S = 5.0
 #: An attack of the summon counts as "attacking" this long (game seconds): the logs' ``atk`` flag.
 PET_ATTACK_MEMORY_S = 2.0
 
@@ -222,6 +224,7 @@ class WorldState:
             attack = packets.parse_attack(body)
             if attack:
                 pet = char.pet
+                self._note_attack_on_me(attack["attacker_id"], [hit[0] for hit in attack["hits"]], now)
                 if pet and attack["attacker_id"] == pet["object_id"]:
                     pet["target_id"] = attack["hits"][0][0]
                     pet["attacking_until"] = now + PET_ATTACK_MEMORY_S / self.server_speed
@@ -231,6 +234,8 @@ class WorldState:
         elif pid == GameServerPacket.MAGIC_SKILL_USE:
             cast = packets.parse_magic_skill_use(body)
             pet = char.pet
+            if cast:
+                self._note_attack_on_me(cast["caster_id"], [cast["target_id"]], now)
             if cast and pet and cast["caster_id"] == pet["object_id"]:
                 pet["casting_until"] = now + cast["hit_time"] / 1000.0 / self.server_speed + CAST_MARGIN_S
                 if cast["target_id"] != char.object_id and cast["target_id"] != pet["object_id"]:
@@ -306,6 +311,12 @@ class WorldState:
             return ["kill"]
         char.radar.remove(oid)
         return []
+
+    def _note_attack_on_me(self, attacker_id: int, target_ids: list[int], now: float) -> None:
+        """A monster on the radar attacked the character: it counts as attacking it for a while."""
+        mob = self.char.radar.entries.get(attacker_id)
+        if mob is not None and self.char.object_id in target_ids:
+            mob["attacking_me_until"] = now + ATTACKER_MEMORY_S / self.server_speed
 
     def _note_other_attack(self, attacker_id: int, target_ids: list[int], now: float) -> None:
         """
