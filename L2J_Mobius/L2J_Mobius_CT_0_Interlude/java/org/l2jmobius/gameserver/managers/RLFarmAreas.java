@@ -325,15 +325,27 @@ final class RLFarmAreas
 	/** A point next to the monster; next to an aggressive one, just outside its aggro range so it does not attack at once. */
 	private static Location spotNear(Npc npc)
 	{
+		// A random point next to the monster that it can walk to: a point behind a wall (Cemetery) would put the agent on the other side.
 		final Location base = npc.getLocation();
-		if (!npc.isAggressive())
+		for (int attempt = 0; attempt < SPOT_ATTEMPTS; attempt++)
 		{
-			return onGround(base, base.getX() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET), base.getY() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET));
+			final Location spot;
+			if (!npc.isAggressive())
+			{
+				spot = onGround(base, base.getX() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET), base.getY() + Rnd.get(-MONSTER_OFFSET, MONSTER_OFFSET));
+			}
+			else
+			{
+				final double angle = Rnd.nextDouble() * 2 * Math.PI;
+				final int distance = npc.getAggroRange() + AGGRO_MARGIN;
+				spot = onGround(base, base.getX() + (int) (Math.cos(angle) * distance), base.getY() + (int) (Math.sin(angle) * distance));
+			}
+			if (GeoEngine.getInstance().canMoveToTarget(base, spot))
+			{
+				return spot;
+			}
 		}
-		
-		final double angle = Rnd.nextDouble() * 2 * Math.PI;
-		final int distance = npc.getAggroRange() + AGGRO_MARGIN;
-		return onGround(base, base.getX() + (int) (Math.cos(angle) * distance), base.getY() + (int) (Math.sin(angle) * distance));
+		return base;
 	}
 	
 	/** A spot is unsafe when a monster above the level window is near, or an aggressive monster would reach it at once. */
