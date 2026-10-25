@@ -515,8 +515,49 @@ def seed_everything(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
+class _Tee:
+    """
+    A stream that also appends to the run's log file. Progress bars redraw their line with ``\\r``;
+    only what a line finally shows reaches the file, so tqdm does not flood it.
+    """
+
+    def __init__(self, stream, log) -> None:
+        self.stream, self.log, self._line = stream, log, ""
+
+    def write(self, data: str) -> int:
+        self.stream.write(data)
+        *done, self._line = (self._line + data).split("\n")
+        for line in done:
+            shown = line.rsplit("\r", 1)[-1].rstrip()
+            if shown:
+                self.log.write(shown + "\n")
+        self._line = self._line.rsplit("\r", 1)[-1]  # an unfinished line keeps only its last redraw
+        self.log.flush()
+        return len(data)
+
+    def flush(self) -> None:
+        self.stream.flush()
+        self.log.flush()
+
+    def isatty(self) -> bool:
+        return self.stream.isatty()
+
+    def __getattr__(self, name: str):
+        return getattr(self.stream, name)
+
+
+def log_to_file(path: Path) -> None:
+    """Copy everything printed from here on (stdout and stderr) to ``path`` (appended: a rerun keeps the earlier log)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    log = open(path, "a", encoding="utf-8", buffering=1)  # noqa: SIM115 - lives as long as the process
+    log.write(f"\n===== {time.strftime('%Y-%m-%d %H:%M:%S')} {' '.join(sys.argv)}\n")
+    sys.stdout = _Tee(sys.stdout, log)
+    sys.stderr = _Tee(sys.stderr, log)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
+    log_to_file(args.save_dir / "train.log")
     seed_everything(args.seed)
     device = torch.device(args.device)
     if device.type == "cuda" and not torch.cuda.is_available():
