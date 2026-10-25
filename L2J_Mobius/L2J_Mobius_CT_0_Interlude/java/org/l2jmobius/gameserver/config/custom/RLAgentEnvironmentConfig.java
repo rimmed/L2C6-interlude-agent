@@ -109,6 +109,7 @@ public class RLAgentEnvironmentConfig
 	public static double[] RL_CLASS_BALANCE_WEIGHTS;
 	public static boolean RL_AUTO_SUMMON;
 	public static Set<Integer> RL_AUTO_SUMMON_EXCLUDED;
+	public static Map<Integer, List<Integer>> RL_AUTO_SUMMON_PREFERRED;
 	public static boolean RL_AUTO_LEARN_SKILLS;
 	public static boolean RL_AUTO_CLASS_TRANSFER;
 	public static boolean RL_AUTO_EQUIP;
@@ -188,6 +189,23 @@ public class RLAgentEnvironmentConfig
 			if (!id.isBlank())
 			{
 				RL_AUTO_SUMMON_EXCLUDED.add(Integer.parseInt(id.trim()));
+			}
+		}
+		RL_AUTO_SUMMON_PREFERRED = new HashMap<>();
+		for (String entry : config.getString("RLAutoSummonPreferred", "").split(";"))
+		{
+			final String[] pair = entry.trim().split(":");
+			if (pair.length == 2)
+			{
+				final List<Integer> skills = new ArrayList<>();
+				for (String id : pair[1].split(","))
+				{
+					if (!id.isBlank())
+					{
+						skills.add(Integer.parseInt(id.trim()));
+					}
+				}
+				RL_AUTO_SUMMON_PREFERRED.put(Integer.parseInt(pair[0].trim()), skills);
 			}
 		}
 		final String[] weights = config.getString("RLClassBalanceWeights", "1,1,1,1").split(",");

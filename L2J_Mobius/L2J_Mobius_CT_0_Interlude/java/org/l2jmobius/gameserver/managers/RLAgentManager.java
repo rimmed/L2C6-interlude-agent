@@ -1126,7 +1126,7 @@ public class RLAgentManager
 	}
 	
 	/**
-	 * A summoner agent gets its servitor without the 15 s cast (RLAutoSummon), as a buffer gives its buffs: a cast in a fight is interrupted and the low-level summons have a 6 h reuse, so the agents would hardly ever play with a servitor. One of its summoning skills at random; the crystals are paid as for a cast.
+	 * A summoner agent gets its servitor without the 15 s cast (RLAutoSummon), as a buffer gives its buffs: a cast in a fight is interrupted and the low-level summons have a 6 h reuse, so the agents would hardly ever play with a servitor. The class's preferred servitor (RLAutoSummonPreferred), else one of its summoning skills at random; the crystals are paid as for a cast.
 	 * @param player the agent
 	 */
 	private static void ensureSummon(Player player)
@@ -1147,7 +1147,22 @@ public class RLAgentManager
 		{
 			return;
 		}
-		final Skill skill = summons.get(Rnd.get(summons.size()));
+		// The class's preferred servitor (RLAutoSummonPreferred) when it knows one, else any of them.
+		Skill skill = null;
+		for (int preferred : RLAgentEnvironmentConfig.RL_AUTO_SUMMON_PREFERRED.getOrDefault(player.getPlayerClass().getId(), List.of()))
+		{
+			for (Skill summon : summons)
+			{
+				if ((skill == null) && (summon.getId() == preferred))
+				{
+					skill = summon;
+				}
+			}
+		}
+		if (skill == null)
+		{
+			skill = summons.get(Rnd.get(summons.size()));
+		}
 		if ((skill.getItemConsumeId() > 0) && (skill.getItemConsumeCount() > 0) && !player.destroyItemByItemId(ItemProcessType.NONE, skill.getItemConsumeId(), skill.getItemConsumeCount(), null, false))
 		{
 			return;
