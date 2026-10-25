@@ -22,6 +22,7 @@ package org.l2jmobius.gameserver.config.custom;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -138,6 +139,7 @@ public class RLAgentEnvironmentConfig
 	public static List<String> RL_FARM_EXCLUDED_SPAWN_FOLDERS;
 	/** Buff set name -> weight, in the configured order. */
 	public static Map<String, Integer> RL_BUFF_SET_WEIGHTS;
+	public static Map<Integer, String> RL_BUFF_CLASS_SETS;
 	public static List<BuffEntry> RL_BUFF_NEWBIE;
 	public static Map<String, List<BuffEntry>> RL_BUFF_SUPPORT;
 	public static List<BuffEntry> RL_BUFF_DANCES_SONGS;
@@ -226,6 +228,15 @@ public class RLAgentEnvironmentConfig
 			}
 		}
 		RL_BUFF_SET_WEIGHTS = parseWeights(config.getString("RLBuffSetWeights", "none:15;newbie:20;support:30;dances_songs:15;full:20"));
+		RL_BUFF_CLASS_SETS = new HashMap<>();
+		for (String entry : config.getString("RLBuffClassSets", "").split(";"))
+		{
+			final String[] pair = entry.trim().split(":");
+			if (pair.length == 2)
+			{
+				RL_BUFF_CLASS_SETS.put(Integer.parseInt(pair[0].trim()), pair[1].trim().toLowerCase());
+			}
+		}
 		RL_BUFF_NEWBIE = parseBuffs(config.getString("RLBuffNewbie", ""));
 		RL_BUFF_SUPPORT = new LinkedHashMap<>();
 		for (String supportClass : BUFF_SUPPORT_CLASSES)

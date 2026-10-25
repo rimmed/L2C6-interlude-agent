@@ -35,6 +35,7 @@ import org.l2jmobius.gameserver.config.custom.RLAgentEnvironmentConfig.BuffEntry
 import org.l2jmobius.gameserver.data.xml.SkillData;
 import org.l2jmobius.gameserver.model.World;
 import org.l2jmobius.gameserver.model.actor.Player;
+import org.l2jmobius.gameserver.model.actor.Summon;
 import org.l2jmobius.gameserver.model.skill.AbnormalType;
 import org.l2jmobius.gameserver.model.skill.Skill;
 
@@ -44,10 +45,12 @@ import org.l2jmobius.gameserver.model.skill.Skill;
  * <li>{@code none}: no buffs;</li>
  * <li>{@code newbie}: the Newbie Helper buffs, with their level limits (an agent outside them falls back to another set);</li>
  * <li>{@code support}: the buffs of one random support class ({@code RLBuffSupport.<Class>});</li>
+ * <li>{@code prophet}: the Prophet's buffs ({@code RLBuffSupport.Prophet}), on top of its share of {@code support};</li>
  * <li>{@code dances_songs}: Swordsinger songs and Bladedancer dances;</li>
  * <li>{@code full}: a full NPC buffer set.</li>
  * </ul>
- * A buff is given at the highest level whose magic level the agent has reached, as if a support of the same level cast it; a buff whose first level is above the agent is left out, and so is a buff the agent casts itself (the same effect as one of its own active buffs: a Bladedancer gets no dances, a Prophet no Might). One buff per abnormal type is kept and the set is cut to the buff and dance slots, so the periodic refresh of expired buffs never pushes another one of the set out.
+ * A class listed in {@code RLBuffClassSets} always gets its set instead, own buffs included (a Prophet gets the Prophet's buffs).<br>
+ * A buff is given at the highest level whose magic level the agent has reached, as if a support of the same level cast it; a buff whose first level is above the agent is left out, and so is a buff the agent casts itself (the same effect as one of its own active buffs: a Bladedancer gets no dances). One buff per abnormal type is kept and the set is cut to the buff and dance slots, so the periodic refresh of expired buffs never pushes another one of the set out. The agent's summon gets the same set.
  */
 final class RLBuffs
 {
@@ -71,8 +74,10 @@ final class RLBuffs
 	 */
 	String assign(Player player)
 	{
-		String set = pickSet();
-		List<Skill> buffs = build(player, set);
+		// A class with a set of its own (a Prophet) always gets it, own buffs included: casting them all itself takes the start of every fight.
+		final String classSet = RLAgentEnvironmentConfig.RL_BUFF_CLASS_SETS.get(player.getPlayerClass().getId());
+		String set = classSet != null ? classSet : pickSet();
+		List<Skill> buffs = build(player, set, classSet != null);
 		if (buffs.isEmpty() && !set.equals("none"))
 		{
 			// e.g. the newbie buffs outside levels 8-25: take any set that gives something.
@@ -81,7 +86,7 @@ final class RLBuffs
 				if (!other.equals("none") && !other.equals("newbie"))
 				{
 					set = other;
-					buffs = build(player, set);
+					buffs = build(player, set, false);
 					break;
 				}
 			}
@@ -153,6 +158,18 @@ final class RLBuffs
 				skill.applyEffects(player, player);
 			}
 		}
+		// The agent's summon (servitor or pet) gets the same set, as a buffer buffs a party with its pets.
+		final Summon summon = player.getSummon();
+		if ((summon != null) && !summon.isDead())
+		{
+			for (Skill skill : buffs)
+			{
+				if (!summon.isAffectedBySkill(skill.getId()))
+				{
+					skill.applyEffects(player, summon);
+				}
+			}
+		}
 	}
 	
 	private static String pickSet()
@@ -179,7 +196,7 @@ final class RLBuffs
 		return "none";
 	}
 	
-	private static List<Skill> build(Player player, String set)
+	private static List<Skill> build(Player player, String set, boolean ownBuffsIncluded)
 	{
 		final List<BuffEntry> entries = switch (set)
 		{
@@ -190,6 +207,7 @@ final class RLBuffs
 				yield classes.isEmpty() ? List.of() : classes.get(Rnd.get(classes.size()));
 			}
 			case "dances_songs" -> RLAgentEnvironmentConfig.RL_BUFF_DANCES_SONGS;
+			case "prophet" -> RLAgentEnvironmentConfig.RL_BUFF_SUPPORT.getOrDefault("Prophet", List.of());
 			case "full" -> RLAgentEnvironmentConfig.RL_BUFF_FULL;
 			default -> List.of();
 		};
@@ -197,7 +215,7 @@ final class RLBuffs
 		final int level = player.getLevel();
 		final List<Skill> result = new ArrayList<>();
 		// Effects the agent has its own buffs for count as taken: it casts them itself.
-		final Set<AbnormalType> types = new HashSet<>(ownBuffTypes(player));
+		final Set<AbnormalType> types = ownBuffsIncluded ? new HashSet<>() : new HashSet<>(ownBuffTypes(player));
 		int buffSlots = player.getStat().getMaxBuffCount();
 		int danceSlots = PlayerConfig.DANCES_MAX_AMOUNT;
 		for (BuffEntry entry : entries)
