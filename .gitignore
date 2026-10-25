@@ -2,3 +2,5 @@ __pycache__
 *.py[cod]
 *.parquet
 .vscode
+client_textures/
+archive/
