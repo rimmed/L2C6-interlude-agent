@@ -165,11 +165,11 @@ final class RLFarmAreas
 		
 		if ((area == null) && undead)
 		{
-			area = leastCrowded(level, player.getObjectId(), true);
+			area = leastCrowded(level, player.getObjectId(), true, null);
 		}
 		if (area == null)
 		{
-			area = leastCrowded(level, player.getObjectId(), false);
+			area = leastCrowded(level, player.getObjectId(), false, null);
 			if (area == null)
 			{
 				_assignments.remove(player.getObjectId());
@@ -193,12 +193,35 @@ final class RLFarmAreas
 		return (area == null) || ((area.fittingMonsters(player.getLevel()) == 0) && (!undead || (area.fittingUndead(player.getLevel()) == 0)));
 	}
 	
+	/**
+	 * A spot in another area than the agent's current one (an agent reset to its base level after a level-up moves on, so it sees new places).
+	 * @param player the agent
+	 * @return the spot, or {@code null} when no other area suits its level
+	 */
+	synchronized Location relocate(Player player)
+	{
+		final int level = player.getLevel();
+		final boolean undead = RLAgentManager.buildOf(player) == RLAgentManager.Build.UNDEAD_MAGE;
+		final String current = _assignments.get(player.getObjectId());
+		Area area = undead ? leastCrowded(level, player.getObjectId(), true, current) : null;
+		if (area == null)
+		{
+			area = leastCrowded(level, player.getObjectId(), false, current);
+		}
+		if (area == null)
+		{
+			return null;
+		}
+		_assignments.put(player.getObjectId(), area.key());
+		return spotIn(area, level);
+	}
+	
 	void release(Player player)
 	{
 		_assignments.remove(player.getObjectId());
 	}
 	
-	private Area leastCrowded(int level, int objectId, boolean undead)
+	private Area leastCrowded(int level, int objectId, boolean undead, String excluded)
 	{
 		final Map<String, Integer> crowd = new HashMap<>();
 		for (Map.Entry<Integer, String> entry : _assignments.entrySet())
@@ -217,7 +240,7 @@ final class RLFarmAreas
 		int totalWeight = 0;
 		for (Area area : areas())
 		{
-			if (area.fitting(level, undead) == 0)
+			if ((area.fitting(level, undead) == 0) || area.key().equals(excluded))
 			{
 				continue;
 			}

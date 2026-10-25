@@ -5133,8 +5133,8 @@ public class Player extends Playable
 						}
 					}
 					
-					// Should not penalize player when lucky, in a non siege PvP zone or is in an event.
-					if (PlayerConfig.PLAYER_DELEVEL && !isLucky() && (insideSiegeZone || !insidePvpZone) && !isOnEvent())
+					// Should not penalize player when lucky, in a non siege PvP zone or is in an event (or an RL agent without death penalties).
+					if (PlayerConfig.PLAYER_DELEVEL && !isLucky() && (insideSiegeZone || !insidePvpZone) && !isOnEvent() && !isAgentWithoutDeathPenalty())
 					{
 						calculateDeathExpPenalty(killer, isAtWarWith(pk));
 					}
@@ -5170,7 +5170,10 @@ public class Player extends Playable
 		}
 		
 		// calculate death penalty buff
-		calculateDeathPenaltyBuffLevel(killer);
+		if (!isAgentWithoutDeathPenalty())
+		{
+			calculateDeathPenaltyBuffLevel(killer);
+		}
 		
 		if (hasSummon())
 		{
@@ -12347,6 +12350,16 @@ public class Player extends Playable
 	public void setDeathPenaltyBuffLevel(int level)
 	{
 		_deathPenaltyBuffLevel = level;
+	}
+	
+	/**
+	 * An RL agent of an environment that switches the death penalties off (RLAgentDeathPenalty = False): it loses neither experience nor stats when it dies, so the
+	 * environment does not drift under it during a long run (a death is already a negative reward).
+	 * @return {@code true} if this player's deaths are not penalized
+	 */
+	private boolean isAgentWithoutDeathPenalty()
+	{
+		return RLAgentEnvironmentConfig.RL_AGENT_ENABLED && !RLAgentEnvironmentConfig.RL_DEATH_PENALTY && RLAgentManager.getInstance().isAgent(this);
 	}
 	
 	public void calculateDeathPenaltyBuffLevel(Creature killer)

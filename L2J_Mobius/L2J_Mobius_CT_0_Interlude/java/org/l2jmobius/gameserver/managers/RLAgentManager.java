@@ -32,6 +32,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.function.Consumer;
 import java.util.function.Predicate;
+import java.util.logging.Level;
 import java.util.logging.Logger;
 
 import org.l2jmobius.commons.threads.ThreadPool;
@@ -104,6 +105,8 @@ public class RLAgentManager
 	private static final String VAR_GEAR_ARCHETYPE = "RL_GEAR_ARCHETYPE";
 	/** Build of a support class (see {@link Build}). */
 	private static final String VAR_BUILD = "RL_BUILD";
+	/** The level an agent was created with; a level-up resets it to this level (RLResetLevelOnLevelUp). */
+	private static final String VAR_BASE_LEVEL = "RL_BASE_LEVEL";
 	
 	/**
 	 * How a support class plays solo. Prophets, Elders, Bishops and their Oracle / Cleric base classes are strong casters only against undead, so they either hunt undead with spells or fight other monsters in melee; Warcryers and Overlords either cast (drains, poisons) or fight with a blunt in heavy armor.
@@ -241,6 +244,13 @@ public class RLAgentManager
 		final Player player = event.getPlayer();
 		if ((event.getNewLevel() > event.getOldLevel()) && isAgent(player) && !_inSetup.contains(player.getObjectId()))
 		{
+			final int baseLevel = player.getVariables().getInt(VAR_BASE_LEVEL, 0);
+			if (RLAgentEnvironmentConfig.RL_RESET_LEVEL_ON_LEVEL_UP && (baseLevel > 0) && (event.getNewLevel() > baseLevel))
+			{
+				// The level population stays as it was drawn: back to the base level, and on to another farm area.
+				ThreadPool.schedule(() -> runSafely(player, "level reset", () -> resetToBaseLevel(player, baseLevel)), LEVEL_CHANGE_DELAY);
+				return;
+			}
 			ThreadPool.schedule(() -> runSafely(player, "level-up progression", () ->
 			{
 				progress(player, false);
@@ -304,7 +314,7 @@ public class RLAgentManager
 		}
 		catch (Exception e)
 		{
-			LOGGER.warning(getClass().getSimpleName() + ": " + what + " failed for " + player + ": " + e);
+			LOGGER.log(Level.WARNING, getClass().getSimpleName() + ": " + what + " failed for " + player + ": " + e, e);
 		}
 	}
 	
@@ -418,6 +428,7 @@ public class RLAgentManager
 			}
 			// The server restores the buffs of the last session on login: a life starts with exactly one buff set.
 			player.stopAllEffectsExceptThoseThatLastThroughDeath();
+			clearDeathPenalty(player);
 			_buffs.assign(player);
 			
 			if (firstSetup)
@@ -431,6 +442,25 @@ public class RLAgentManager
 		finally
 		{
 			_inSetup.remove(player.getObjectId());
+		}
+	}
+	
+	/** Takes an agent that levelled up back to the start of its base level and moves it to another farm area. */
+	private void resetToBaseLevel(Player player, int baseLevel)
+	{
+		final long baseExp = ExperienceData.getInstance().getExpForLevel(baseLevel);
+		if (!player.isOnline() || (player.getExp() <= baseExp))
+		{
+			return;
+		}
+		player.removeExpAndSp(player.getExp() - baseExp, 0, false);
+		if (RLAgentEnvironmentConfig.RL_TELEPORT_TO_FARM_ZONE && RLAgentEnvironmentConfig.RL_FARM_AUTO && !player.isDead())
+		{
+			final Location spot = _farmAreas.relocate(player);
+			if (spot != null)
+			{
+				teleportTo(player, spot);
+			}
 		}
 	}
 	
@@ -454,6 +484,8 @@ public class RLAgentManager
 		{
 			targetLevel = Rnd.get(minLevel, maxLevel);
 		}
+		// The level the agent is created with: its level-ups are reset to it (RLResetLevelOnLevelUp).
+		player.getVariables().set(VAR_BASE_LEVEL, Math.max(targetLevel, player.getLevel()));
 		if (player.getLevel() >= targetLevel)
 		{
 			return;
@@ -508,10 +540,24 @@ public class RLAgentManager
 		}
 		
 		player.doRevive();
+		clearDeathPenalty(player);
 		restoreVitals(player);
 		teleportToFarmZone(player);
 		supply(player);
 		_buffs.assign(player); // a new life, a new buff set
+	}
+	
+	/** Removes the Death Penalty debuff an agent still carries (from before RLAgentDeathPenalty = False, or from a PvP death). */
+	private static void clearDeathPenalty(Player player)
+	{
+		if (RLAgentEnvironmentConfig.RL_DEATH_PENALTY)
+		{
+			return;
+		}
+		while (player.getDeathPenaltyBuffLevel() > 0)
+		{
+			player.reduceDeathPenaltyBuffLevel();
+		}
 	}
 	
 	private static void restoreVitals(Player player)
@@ -1122,6 +1168,11 @@ public class RLAgentManager
 			final int spread = RLAgentEnvironmentConfig.RL_FARM_ZONE_SPREAD;
 			destination = new Location(anchor.getX() + Rnd.get(-spread, spread), anchor.getY() + Rnd.get(-spread, spread), anchor.getZ());
 		}
+		teleportTo(player, destination);
+	}
+	
+	private static void teleportTo(Player player, Location destination)
+	{
 		player.teleToLocation(destination, false);
 		
 		// A headless client may never send Appearing; finish the teleport for it.
