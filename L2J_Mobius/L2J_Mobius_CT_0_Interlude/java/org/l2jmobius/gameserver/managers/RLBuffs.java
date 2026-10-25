@@ -172,6 +172,29 @@ final class RLBuffs
 		}
 	}
 	
+	/**
+	 * Casts the full buffer set ({@code RLBuffFull}) on any player and its summon, own buffs included: the {@code .fullbuff} command.
+	 * @param player the player
+	 * @return the number of buffs cast
+	 */
+	static int giveFull(Player player)
+	{
+		final List<Skill> buffs = build(player, "full", true);
+		for (Skill skill : buffs)
+		{
+			skill.applyEffects(player, player);
+		}
+		final Summon summon = player.getSummon();
+		if ((summon != null) && !summon.isDead())
+		{
+			for (Skill skill : buffs)
+			{
+				skill.applyEffects(player, summon);
+			}
+		}
+		return buffs.size();
+	}
+	
 	private static String pickSet()
 	{
 		int total = 0;

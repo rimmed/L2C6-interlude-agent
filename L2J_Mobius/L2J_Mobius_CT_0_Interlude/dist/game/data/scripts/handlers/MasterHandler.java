@@ -208,6 +208,7 @@ import handlers.chat.commands.voiced.Banking;
 import handlers.chat.commands.voiced.ChangePassword;
 import handlers.chat.commands.voiced.ChatAdmin;
 import handlers.chat.commands.voiced.ExperienceGain;
+import handlers.chat.commands.voiced.FullBuff;
 import handlers.chat.commands.voiced.Lang;
 import handlers.chat.commands.voiced.Offline;
 import handlers.chat.commands.voiced.OfflinePlay;
@@ -517,6 +518,7 @@ public class MasterHandler
 			// CastleHandler.class,
 			// ClanHandler.class,
 			ExperienceGain.class,
+			FullBuff.class,
 			WeddingConfig.ALLOW_WEDDING ? Wedding.class : null,
 			AutoPlayConfig.ENABLE_AUTO_PLAY ? AutoPlay.class : null,
 			BankingConfig.BANKING_SYSTEM_ENABLED ? Banking.class : null,

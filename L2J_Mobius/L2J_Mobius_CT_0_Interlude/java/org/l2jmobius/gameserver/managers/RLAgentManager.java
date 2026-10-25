@@ -316,6 +316,16 @@ public class RLAgentManager
 	}
 	
 	/**
+	 * Casts the full buffer set ({@code RLBuffFull}) on a player and its summon, for any player: the {@code .fullbuff} command.
+	 * @param player the player
+	 * @return the number of buffs cast
+	 */
+	public int giveFullBuff(Player player)
+	{
+		return RLBuffs.giveFull(player);
+	}
+	
+	/**
 	 * @param player the player to check
 	 * @return {@code true} if the automated environment manages this character
 	 */
