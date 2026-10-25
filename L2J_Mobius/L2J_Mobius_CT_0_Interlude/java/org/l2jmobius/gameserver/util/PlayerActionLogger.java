@@ -54,13 +54,13 @@ import org.l2jmobius.gameserver.model.skill.Skill;
  * <li>{@code me L18 hp 711/711 mp 231/231 cp 368/368 @x,y,z h<heading> wt<load %>} plus the flags {@code sit cast atk dead combat} when set;</li>
  * <li>{@code sel d<distance> los|nolos h<target heading>}: the selected target, relative to the character;</li>
  * <li>{@code pet Name#objectId(summon npcId Llvl) hp cur/max mp cur/max @x,y,z d<distance> tgt <objectId>|-} plus the flags {@code atk cast dead follow}: the character's summon (servitor or pet), when it has one;</li>
- * <li>{@code env items <ground items within 1000>; <npcId>#<objectId> L<lvl> d<distance> hp<hp %> [by:<players>]; ...}: the 10 nearest monsters within 3000, {@code by:} lists the other players on a monster's aggro list;</li>
+ * <li>{@code env items <ground items within 1000>; <npcId>#<objectId> L<lvl> d<distance> hp<hp %> a<direction> [me] [by:<players>]; ...}: the 10 nearest monsters within 3000; {@code a} is the direction from the character in degrees (0 = north, 90 = east), {@code me} marks a monster whose target is the character, {@code by:} lists the other players on its aggro list;</li>
  * <li>{@code cd <skillId>:<ms>,...}: skill reuse still running.</li>
  * </ul>
  * RL agents are not logged.
  * A summon's actions are written on its owner's lines: {@code SUMMON} / {@code UNSUMMON} / {@code PETDIED}, the owner's commands ({@code PETCMD}), its casts ({@code PETSKILL}), its damage ({@code DMG ... by pet}), its kills ({@code KILL ... by pet}) and the damage it takes ({@code PETHIT}).
  * A kill is one {@code KILL} line with every drop ({@code drop Name[count] auto|ground; ...}, {@code drop -} without drops).
- * Character state that rarely changes is written on its own lines, only when it changed: {@code STATS} (level, exp, sp and combat stats), {@code EQUIP} (paperdoll) and {@code SKILLS} (known skills). A parser keeps the last state per character.
+ * Character state that rarely changes is written on its own lines, only when it changed: {@code STATS} (level, exp, sp, combat stats, the class id {@code cls} and the healing potions carried {@code hpot}), {@code EQUIP} (paperdoll) and {@code SKILLS} (known skills). A parser keeps the last state per character.
  */
 public class PlayerActionLogger
 {
@@ -83,6 +83,9 @@ public class PlayerActionLogger
 	/** RequestActionUse actions that command a summon; the other summon actions are its skills (logged as {@code PETCMD skill<actionId>}, the cast itself as {@code PETSKILL}). */
 	private static final Map<Integer, String> SUMMON_COMMANDS = Map.of(15, "follow", 21, "follow", 16, "attack", 22, "attack", 17, "stop", 23, "stop", 19, "unsummon", 52, "unsummon", 53, "move", 54, "move");
 
+	/** Item ids of the healing potions counted in {@code STATS}. */
+	private static final int[] HEALING_POTIONS = { 1060, 1061, 1539 };
+	
 	/** Last {@code STATS} / {@code EQUIP} / {@code SKILLS} text written per character, so a line is only written on change. */
 	private static final Map<Integer, String> _lastStats = new ConcurrentHashMap<>();
 	private static final Map<Integer, String> _lastEquip = new ConcurrentHashMap<>();
@@ -279,6 +282,11 @@ public class PlayerActionLogger
 			sb.append(" L").append(monster.getLevel());
 			sb.append(" d").append((int) player.calculateDistance3D(monster));
 			sb.append(" hp").append((monster.getMaxHp() > 0) ? (int) Math.round((monster.getCurrentHp() * 100) / monster.getMaxHp()) : 0);
+			sb.append(" a").append(bearing(player, monster));
+			if (monster.getTarget() == player)
+			{
+				sb.append(" me");
+			}
 			final String others = otherAttackers(monster, player);
 			if (!others.isEmpty())
 			{
@@ -286,6 +294,13 @@ public class PlayerActionLogger
 			}
 		}
 		return sb.toString();
+	}
+	
+	/** Direction from {@code from} to {@code to} in whole degrees, 0 = north (-Y on the map), 90 = east. */
+	private static int bearing(WorldObject from, WorldObject to)
+	{
+		final double degrees = Math.toDegrees(Math.atan2(to.getX() - from.getX(), from.getY() - to.getY()));
+		return (int) Math.round((degrees + 360) % 360) % 360;
 	}
 	
 	/** Players (or the owners of their summons) on the monster's aggro list, other than {@code self}. */
@@ -362,7 +377,7 @@ public class PlayerActionLogger
 	
 	private static String stats(Player player)
 	{
-		return "L" + player.getLevel() + " exp " + player.getExp() + " sp " + player.getSp() + " patk " + (int) player.getPAtk(player) + " matk " + (int) player.getMAtk(player, null) + " pdef " + (int) player.getPDef(player) + " mdef " + (int) player.getMDef(player, null) + " acc " + player.getAccuracy() + " crit " + player.getCriticalHit(player, null) + " eva " + player.getEvasionRate(player) + " aspd " + player.getPAtkSpd() + " cspd " + player.getMAtkSpd() + " str " + player.getSTR() + " int " + player.getINT() + " dex " + player.getDEX() + " con " + player.getCON() + " wit " + player.getWIT();
+		return "L" + player.getLevel() + " exp " + player.getExp() + " sp " + player.getSp() + " patk " + (int) player.getPAtk(player) + " matk " + (int) player.getMAtk(player, null) + " pdef " + (int) player.getPDef(player) + " mdef " + (int) player.getMDef(player, null) + " acc " + player.getAccuracy() + " crit " + player.getCriticalHit(player, null) + " eva " + player.getEvasionRate(player) + " aspd " + player.getPAtkSpd() + " cspd " + player.getMAtkSpd() + " str " + player.getSTR() + " int " + player.getINT() + " dex " + player.getDEX() + " con " + player.getCON() + " wit " + player.getWIT() + " cls " + player.getPlayerClass().getId() + " hpot " + healingPotions(player);
 	}
 	
 	private static String equipment(Player player)
@@ -402,6 +417,17 @@ public class PlayerActionLogger
 			sb.append(skill.getId()).append('-').append(skill.getLevel());
 		}
 		return "active " + (active.length() > 0 ? active : "-") + " passive " + (passive.length() > 0 ? passive : "-");
+	}
+	
+	/** Healing potions (Lesser / Healing / Greater) in the inventory: the agents' {@code has_potion} feature. */
+	private static int healingPotions(Player player)
+	{
+		int count = 0;
+		for (int itemId : HEALING_POTIONS)
+		{
+			count += player.getInventory().getInventoryItemCount(itemId, -1);
+		}
+		return count;
 	}
 	
 	/** Writes the {@code STATS} / {@code EQUIP} lines of a character whose state changed since its last line. */

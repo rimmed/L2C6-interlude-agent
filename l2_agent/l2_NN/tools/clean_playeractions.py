@@ -281,7 +281,7 @@ GENERIC_NPC_OBJECT_TYPES: Final[frozenset[str]] = frozenset({"", "monster", "npc
 # ``object_id`` / ``hp_pct`` / ``attackers`` (other players hitting the monster) exist in format-2 logs only.
 ENV_STRUCT_SQL: Final = (
     "STRUCT(type VARCHAR, name VARCHAR, id BIGINT, lvl BIGINT, distance DOUBLE, object_id BIGINT, hp_pct DOUBLE, "
-    "attackers VARCHAR[])"
+    "attackers VARCHAR[], bearing DOUBLE, targets_me BOOLEAN)"
 )
 
 # ``selected_target`` lines carry the target name up to the character-status block
@@ -469,7 +469,8 @@ def clean_environment(con: duckdb.DuckDBPyConnection, actions: Path, cfg: Cleani
         f"""
         CREATE OR REPLACE TABLE cleaned_env AS
         WITH exploded AS (
-            SELECT r.rid, e.type, e.name, e.id, e.lvl, e.distance, e.object_id, e.hp_pct, e.attackers
+            SELECT r.rid, e.type, e.name, e.id, e.lvl, e.distance, e.object_id, e.hp_pct, e.attackers, e.bearing,
+                   e.targets_me
             FROM rows r, UNNEST(r.{ENV_COLUMN}) AS t(e)
             WHERE e.distance <= {cfg.max_monster_distance}
         ),
@@ -484,7 +485,8 @@ def clean_environment(con: duckdb.DuckDBPyConnection, actions: Path, cfg: Cleani
         ranked AS (
             SELECT rid,
                    struct_pack(type := type, name := name, id := id, lvl := lvl, distance := distance,
-                               object_id := object_id, hp_pct := hp_pct, attackers := attackers) AS obj,
+                               object_id := object_id, hp_pct := hp_pct, attackers := attackers,
+                               bearing := bearing, targets_me := targets_me) AS obj,
                    row_number() OVER (PARTITION BY rid ORDER BY distance ASC, id ASC) AS rn
             FROM relevant
         )

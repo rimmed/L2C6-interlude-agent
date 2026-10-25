@@ -598,6 +598,8 @@ ROW_FIELDS = (
     "exp",
     "sp",
     "lvl",
+    "class_id",
+    "potions",
     "char_stats",
     "equipment",
     "equipment_ids",
@@ -987,6 +989,8 @@ def _v2_apply_state(row: dict, state: v2.CharacterState) -> None:
     stats = state.stats
     if stats:
         row["lvl"] = stats.get("level")
+        row["class_id"] = stats.get("cls")  # written since the logs carry the class
+        row["potions"] = stats.get("hpot")  # healing potions carried (newer logs only)
         row["exp"] = stats.get("exp")
         row["sp"] = stats.get("sp")
         values = {old: stats.get(new) for new, old in V2_STATS.items()}
@@ -1048,7 +1052,8 @@ def parse_v2_line(line: str, resolver: EntityResolver, source_file: str, line_no
             info = resolver.resolve_npc(npc_id=mob["npc_id"])
             monsters.append({"type": "monster", "name": info["name"] if info else None, "id": mob["npc_id"],
                              "lvl": mob["level"], "distance": mob["distance"], "object_id": mob["object_id"],
-                             "hp_pct": mob["hp_pct"], "attackers": mob["attackers"] or None})
+                             "hp_pct": mob["hp_pct"], "attackers": mob["attackers"] or None,
+                             "bearing": mob.get("bearing"), "targets_me": bool(mob.get("targets_me"))})
         row["nearby_count"] = len(monsters)
         row["nearby_objects"] = monsters or None
     if "pet" in blocks:
@@ -1214,6 +1219,9 @@ def _build_schema() -> pa.Schema:
         ("object_id", pa.int64()),
         ("hp_pct", pa.float64()),
         ("attackers", pa.list_(pa.string())),
+        # newer format-2 logs: direction from the character (degrees, 0 = north) and "its target is me"
+        ("bearing", pa.float64()),
+        ("targets_me", pa.bool_()),
     ]))
     skill_list = pa.list_(pa.struct([("id", pa.int64()), ("level", pa.int64())]))
     cooldown_list = pa.list_(pa.struct([("skill_id", pa.int64()), ("remaining", pa.int64())]))
@@ -1290,6 +1298,8 @@ def _build_schema() -> pa.Schema:
         ("exp", pa.int64()),
         ("sp", pa.int64()),
         ("lvl", pa.int64()),
+        ("class_id", pa.int64()),
+        ("potions", pa.int64()),
         ("char_stats", char_stats),
         ("equipment", pa.struct([(slot, pa.string()) for slot in SLOTS])),
         ("equipment_ids", pa.struct([(slot, pa.int64()) for slot in SLOTS])),
@@ -1542,6 +1552,35 @@ def _fill_known_skills(rows: list[dict]) -> int:
     return filled
 
 
+def _fill_class_ids(rows: list[dict], names_by_id: dict[int, str]) -> int:
+    """
+    Give frames without a logged class (logs written before STATS carried ``cls``) the class their
+    character's known skills point to (``class_panels.infer_class``, the name as a tie-breaker).
+
+    :return: number of frames whose class was inferred
+    """
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from l2_client.tools.data import class_panels
+
+    # every skill the character knew at a level: the lists come in bursts, a half-filled one would
+    # point to a starting class (or another race's)
+    known_at: dict[tuple, set[int]] = {}
+    for row in rows:
+        if row.get("class_id") is None:
+            known_at.setdefault((row["character_id"], row.get("lvl")), set()).update(
+                int(s["id"]) for s in row.get("known_skills") or () if s.get("id") is not None)
+    classes = {key: class_panels.infer_class(known, names_by_id.get(key[0], "")) for key, known in known_at.items()}
+    inferred = 0
+    for row in rows:
+        if row.get("class_id") is not None:
+            continue
+        row["class_id"] = classes[(row["character_id"], row.get("lvl"))]
+        inferred += row["class_id"] is not None
+    return inferred
+
+
 def process_logs(
     input_path: str | Path,
     output_parquet: str | Path,
@@ -1614,6 +1653,8 @@ def process_logs(
         rows = unique
     known = _fill_known_skills(rows)
     print(f"known_skills filled for {known} of {len(rows)} frames")
+    inferred = _fill_class_ids(rows, {cid: name for name, cid in resolver.character_ids.items()})
+    print(f"class_id inferred from the known skills for {inferred} of {len(rows)} frames")
 
     if not rows:
         print("No action frames found to export.")

@@ -33,7 +33,7 @@ TELEPORT    ``x,y,z -> x,y,z via <method>``                                     
 DIED        ``@x,y,z killer <name>[id]``                                        died
 REVIVED     ``@x,y,z via <method>``                                             resurrected
 SKILLS      ``active <id>-<lvl>,...|- passive ...|-`` (state, on change)        skills_updated
-STATS       ``L<lvl> exp <n> sp <n> patk .. matk .. pdef .. mdef .. acc ..``     (state only)
+STATS       ``L<lvl> exp <n> sp <n> patk .. matk .. pdef .. mdef .. acc .. cls <class id> hpot <healing potions>``  (state only)
             ``crit .. eva .. aspd .. cspd .. str .. int .. dex .. con .. wit ..``
 EQUIP       ``weapon <item>[id]|- shield .. head .. chest .. gloves .. legs``    (state only)
             ``.. feet .. neck .. rear .. lear .. rfinger .. lfinger ..``
@@ -56,7 +56,8 @@ Tail blocks: ``me`` - the character (level, HP / MP / CP, position, heading, loa
 (distance, line of sight, its heading); ``pet`` - the character's summon while it has one
 (``<summon ref> mp cur/max @x,y,z d<distance> tgt <objectId>|-`` and the flags
 ``atk cast dead follow``); ``env`` - ground items within 1000 and the 10 nearest
-monsters within 3000 (``by:`` lists the other players on a monster's aggro list); ``cd`` -
+monsters within 3000 (``a<deg>`` the direction to it, 0 = north / 90 = east, newer logs only;
+``me`` - its target is the character; ``by:`` lists the other players on a monster's aggro list); ``cd`` -
 skill reuse still running in milliseconds.
 
 ``STATS`` / ``EQUIP`` / ``SKILLS`` lines are written only when they change; a reader keeps the
@@ -79,7 +80,8 @@ EVENTS = frozenset({
 
 REF = re.compile(r"^(?P<name>.+?)#(?P<oid>\d+|\?)\((?P<inside>[^)]*)\)(?: hp (?P<hp>-?\d+)/(?P<max_hp>\d+))?$")
 NAMED_ID = re.compile(r"^(?P<name>.+?)\[(?P<id>\d+)\]$")
-STAT_KEYS = ("patk", "matk", "pdef", "mdef", "acc", "crit", "eva", "aspd", "cspd", "str", "int", "dex", "con", "wit")
+STAT_KEYS = ("patk", "matk", "pdef", "mdef", "acc", "crit", "eva", "aspd", "cspd", "str", "int", "dex", "con", "wit",
+             "cls", "hpot")
 SLOT_KEYS = ("weapon", "shield", "head", "chest", "gloves", "legs", "feet", "neck", "rear", "lear", "rfinger", "lfinger")
 FLAGS = ("sit", "cast", "atk", "dead", "combat")
 PET_FLAGS = ("atk", "cast", "dead", "follow")
@@ -255,7 +257,7 @@ def parse_env(text: str) -> dict:
             continue
         npc, _, oid = tokens[0].partition("#")
         mob = {"npc_id": int(npc), "object_id": None if oid in ("", "?") else int(oid), "level": None,
-               "distance": None, "hp_pct": None, "attackers": []}
+               "distance": None, "hp_pct": None, "attackers": [], "bearing": None, "targets_me": False}
         for tok in tokens[1:]:
             if tok.startswith("L"):
                 mob["level"] = int(tok[1:])
@@ -265,6 +267,10 @@ def parse_env(text: str) -> dict:
                 mob["hp_pct"] = float(tok[2:])
             elif tok.startswith("by:"):
                 mob["attackers"] = tok[3:].split(",")
+            elif tok == "me":
+                mob["targets_me"] = True
+            elif tok.startswith("a") and tok[1:].isdigit():
+                mob["bearing"] = float(tok[1:])
         env["monsters"].append(mob)
     return env
 
@@ -276,6 +282,10 @@ def format_env(items: int | None, monsters: list[dict]) -> str:
         text = f"{mob['npc_id']}#{oid} L{mob.get('level') or 0} d{round(mob.get('distance') or 0)}"
         if mob.get("hp_pct") is not None:
             text += f" hp{int(round(mob['hp_pct']))}"
+        if mob.get("bearing") is not None:
+            text += f" a{int(round(mob['bearing'])) % 360}"
+        if mob.get("targets_me"):
+            text += " me"
         if mob.get("attackers"):
             text += " by:" + ",".join(mob["attackers"])
         parts.append(text)
