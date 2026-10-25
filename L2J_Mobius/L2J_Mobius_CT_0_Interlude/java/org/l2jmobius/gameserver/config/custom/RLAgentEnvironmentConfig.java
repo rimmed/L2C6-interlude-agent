@@ -22,9 +22,11 @@ package org.l2jmobius.gameserver.config.custom;
 
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.TreeMap;
 import java.util.logging.Logger;
 import java.util.regex.Pattern;
@@ -104,6 +106,8 @@ public class RLAgentEnvironmentConfig
 	public static double RL_LEVEL_STDDEV;
 	public static boolean RL_CLASS_BALANCE;
 	public static double[] RL_CLASS_BALANCE_WEIGHTS;
+	public static boolean RL_AUTO_SUMMON;
+	public static Set<Integer> RL_AUTO_SUMMON_EXCLUDED;
 	public static boolean RL_AUTO_LEARN_SKILLS;
 	public static boolean RL_AUTO_CLASS_TRANSFER;
 	public static boolean RL_AUTO_EQUIP;
@@ -174,6 +178,15 @@ public class RLAgentEnvironmentConfig
 		RL_LEVEL_MEAN = config.getDouble("RLLevelMean", 40);
 		RL_LEVEL_STDDEV = Math.max(0, config.getDouble("RLLevelStdDev", 15));
 		RL_CLASS_BALANCE = config.getBoolean("RLClassBalance", false);
+		RL_AUTO_SUMMON = config.getBoolean("RLAutoSummon", false);
+		RL_AUTO_SUMMON_EXCLUDED = new HashSet<>();
+		for (String id : config.getString("RLAutoSummonExcludedSkills", "13,299,448").split(","))
+		{
+			if (!id.isBlank())
+			{
+				RL_AUTO_SUMMON_EXCLUDED.add(Integer.parseInt(id.trim()));
+			}
+		}
 		final String[] weights = config.getString("RLClassBalanceWeights", "1,1,1,1").split(",");
 		RL_CLASS_BALANCE_WEIGHTS = new double[4];
 		for (int i = 0; i < 4; i++)

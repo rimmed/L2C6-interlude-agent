@@ -55,6 +55,7 @@ import org.l2jmobius.gameserver.model.effects.AbstractEffect;
 import org.l2jmobius.gameserver.model.skill.EffectScope;
 import org.l2jmobius.gameserver.model.skill.Skill;
 import org.l2jmobius.gameserver.model.Location;
+import org.l2jmobius.gameserver.model.World;
 import org.l2jmobius.gameserver.model.actor.Player;
 import org.l2jmobius.gameserver.model.actor.appearance.PlayerAppearance;
 import org.l2jmobius.gameserver.model.actor.enums.player.PlayerClass;
@@ -114,6 +115,8 @@ public class RLAgentManager
 	private static final String VAR_BASE_LEVEL = "RL_BASE_LEVEL";
 	/** The class an agent is created for (RLClassBalance): its level is drawn within that profession and its transfers lead to it. */
 	private static final String VAR_TARGET_CLASS = "RL_TARGET_CLASS";
+	/** How often a summoner agent without a servitor gets one (RLAutoSummon), in ms. */
+	private static final long AUTO_SUMMON_INTERVAL = 30000;
 	/** Level range of each profession (0 = starting class .. 3 = third profession) for RLClassBalance. */
 	private static final int[][] PROFESSION_LEVELS = { { 1, 19 }, { 20, 39 }, { 40, 75 }, { 76, 80 } };
 	
@@ -296,6 +299,10 @@ public class RLAgentManager
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LOGOUT, _playerLogoutEvent, this));
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LEVEL_CHANGED, _playerLevelChangedEvent, this));
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_CREATURE_DEATH, _creatureDeathEvent, this));
+		if (RLAgentEnvironmentConfig.RL_AUTO_SUMMON)
+		{
+			ThreadPool.scheduleAtFixedRate(this::ensureSummons, AUTO_SUMMON_INTERVAL, AUTO_SUMMON_INTERVAL);
+		}
 		LOGGER.info(getClass().getSimpleName() + ": Agent levels " + RLAgentEnvironmentConfig.RL_MIN_LEVEL + "-" + RLAgentEnvironmentConfig.RL_MAX_LEVEL + ", accounts matching \"" + RLAgentEnvironmentConfig.RL_AGENT_ACCOUNT_PATTERN.pattern() + "\", " + RLAgentEnvironmentConfig.RL_FARM_ZONES.size() + " farm zone bracket(s).");
 	}
 	
@@ -518,6 +525,7 @@ public class RLAgentManager
 			player.stopAllEffectsExceptThoseThatLastThroughDeath();
 			clearDeathPenalty(player);
 			_buffs.assign(player);
+			ensureSummon(player);
 			
 			if (firstSetup)
 			{
@@ -642,6 +650,7 @@ public class RLAgentManager
 		teleportToFarmZone(player);
 		supply(player);
 		_buffs.assign(player); // a new life, a new buff set
+		ensureSummon(player);
 	}
 	
 	/** Removes the Death Penalty debuff an agent still carries (from before RLAgentDeathPenalty = False, or from a PvP death). */
@@ -1085,6 +1094,48 @@ public class RLAgentManager
 	}
 	
 	/** The skill brings a servitor (the Summon effect handler reports no effect type of its own, so it is found by class). */
+	/** Summons a servitor for every agent that can summon one and has none (RLAutoSummon). */
+	private void ensureSummons()
+	{
+		for (Player player : World.getInstance().getPlayers())
+		{
+			if (isAgent(player))
+			{
+				runSafely(player, "auto summon", () -> ensureSummon(player));
+			}
+		}
+	}
+	
+	/**
+	 * A summoner agent gets its servitor without the 15 s cast (RLAutoSummon), as a buffer gives its buffs: a cast in a fight is interrupted and the low-level summons have a 6 h reuse, so the agents would hardly ever play with a servitor. One of its summoning skills at random; the crystals are paid as for a cast.
+	 * @param player the agent
+	 */
+	private static void ensureSummon(Player player)
+	{
+		if (!RLAgentEnvironmentConfig.RL_AUTO_SUMMON || !player.isOnline() || player.isDead() || player.hasSummon())
+		{
+			return;
+		}
+		final List<Skill> summons = new ArrayList<>();
+		for (Skill skill : player.getAllSkills())
+		{
+			if (!skill.isPassive() && summonsServitor(skill) && !RLAgentEnvironmentConfig.RL_AUTO_SUMMON_EXCLUDED.contains(skill.getId()))
+			{
+				summons.add(skill);
+			}
+		}
+		if (summons.isEmpty())
+		{
+			return;
+		}
+		final Skill skill = summons.get(Rnd.get(summons.size()));
+		if ((skill.getItemConsumeId() > 0) && (skill.getItemConsumeCount() > 0) && !player.destroyItemByItemId(ItemProcessType.NONE, skill.getItemConsumeId(), skill.getItemConsumeCount(), null, false))
+		{
+			return;
+		}
+		skill.applyEffects(player, player);
+	}
+	
 	private static boolean summonsServitor(Skill skill)
 	{
 		final List<AbstractEffect> effects = skill.getEffects(EffectScope.GENERAL);
