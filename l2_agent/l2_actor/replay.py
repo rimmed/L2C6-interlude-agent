@@ -42,6 +42,7 @@ array               shape / dtype    content
 ``type_mask``       T,A bool         executable action types at that step
 ``n_mobs``          T int16          valid pointer slots ``0..n_mobs-1``
 ``skill_mask``      T,N bool         castable skill slots
+``pointer_mask``    T,K bool         mob slots the pointer head chose from (the attackers, or all ``n_mobs``)
 ``header``          uint8            UTF-8 JSON: ``actor_id``, ``episode_id`` (a life), ``segment``,
                                      ``model_version``, ``terminal``, ``done_reason``, ``kills`` in
                                      the segment, character info
@@ -122,6 +123,7 @@ def encode_segment(transitions: list[Transition], bootstrap: dict[str, np.ndarra
     type_mask = np.zeros((steps, n_actions), dtype=bool)
     skill_mask = np.zeros((steps, max_skills), dtype=bool)
     n_mobs = np.zeros(steps, dtype=np.int16)
+    pointer_mask = np.zeros((steps, states[0]["mobs_matrix"].shape[-2]), dtype=bool)
     for i, t in enumerate(transitions):
         action[i] = t.action["type_id"]
         pointer[i] = -1 if t.action["pointer_idx"] is None else t.action["pointer_idx"]
@@ -129,8 +131,10 @@ def encode_segment(transitions: list[Transition], bootstrap: dict[str, np.ndarra
         type_mask[i, t.action_mask["types"]] = True
         skill_mask[i, t.action_mask["skill_slots"]] = True
         n_mobs[i] = t.action_mask["n_mobs"]
+        pointer_mask[i, t.action_mask.get("pointer_slots", list(range(n_mobs[i])))] = True
     arrays.update(
         action=action, pointer=pointer, skill=skill, type_mask=type_mask, skill_mask=skill_mask, n_mobs=n_mobs,
+        pointer_mask=pointer_mask,
         logp=np.array([t.action["logp"] for t in transitions], dtype=np.float32),
         reward=np.array([t.reward for t in transitions], dtype=np.float32),
         header=np.frombuffer(json.dumps({**header, "terminal": bootstrap is None}).encode(), dtype=np.uint8),

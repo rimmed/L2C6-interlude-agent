@@ -52,7 +52,7 @@ from typing import Any
 import numpy as np
 
 from . import skill_features
-from .tools.data import class_panels, item_data, skill_data, summon_data
+from .tools.data import class_panels, item_data, npc_data, skill_data, summon_data
 
 #: Action classes the bot can execute.  The rest of the label space (inflicted_damage, killed, ...)
 #: is the game answering the player and is never a valid command.
@@ -143,6 +143,12 @@ class Observation:
     pet_slots: tuple[int, ...] = ()
     #: slot -> the summon skill behind it
     pet_skills: dict[int, summon_data.PetSkill] | None = None
+    #: ``mobs_matrix`` slots the pointer head may choose (the monsters hitting the character), ``None`` = all
+    pointer_slots: tuple[int, ...] | None = None
+
+    def pointer_choices(self) -> tuple[int, ...]:
+        """The mob slots the pointer head chooses from."""
+        return self.pointer_slots if self.pointer_slots else tuple(range(len(self.mob_ids)))
 
     def skill_slots(self, action: str) -> tuple[int, ...]:
         """The skill slots the skill head chooses from for ``action``."""
@@ -509,9 +515,21 @@ class CombatPolicy:
         frame = self._snapshot(char, current_target_id, pos, now)
         has_mobs = bool(frame.mob_ids)
         target_alive = bool(current_target_id) and current_target_id in char.radar.entries
+        target = char.radar.entries.get(current_target_id) if current_target_id else None
+        target_race = npc_data.get_npc_race(target.get("npc_id", 0)) if target else ""
+        # Monsters hitting the character come first: while one does, the agent picks (and moves to) only
+        # them, and attacks or casts on its target only when that is one of them (skills on itself stay).
+        attackers = tuple(i for i, oid in enumerate(frame.mob_ids)
+                          if char.radar.entries.get(oid, {}).get("attacking_me_until", 0.0) > now)
+        on_attacker = not attackers or current_target_id in {frame.mob_ids[i] for i in attackers}
         usable_slots = tuple(
             i for i, info in self._own_slots.items()
             if self._skill_usable(info.skill_id, now) and char.cur_mp >= info.mp_cost
+            # Disrupt Undead & co. only on their race (the server refuses them otherwise), no MP-only damage
+            and skill_data.target_race(info.skill_id) in (None, target_race)
+            and not skill_data.burns_mana_only(info.skill_id)
+            and info.skill_id not in skill_data.SIEGE_WEAPON_SUMMONS
+            and (on_attacker or info.target == "self")
             # summon skills need a summon; a second servitor cannot be summoned while one is out
             and (pet is not None or not skill_data.needs_summon(info.skill_id))
             and (pet is None or not skill_data.summons_servitor(info.skill_id))
@@ -525,17 +543,18 @@ class CombatPolicy:
         valid = {
             "moved": True,
             "selected_target": has_mobs,
-            "attacked": target_alive or has_mobs,
+            "attacked": (target_alive or has_mobs) and on_attacker,
             "used_skill": bool(usable_slots) and (target_alive or has_mobs),
             "picked_up": has_loot,
             # a healing potion only once its shared reuse has passed (a drink before is a wasted decision)
             "used_item": has_potion and (now - self._potion_used_at) * self.server_speed >= HEALING_POTION_REUSE_S,
-            "pet_attack": pet is not None and (target_alive or has_mobs),
+            "pet_attack": pet is not None and (target_alive or has_mobs) and on_attacker,
             "pet_skill": bool(pet_slots),
         }
         panel = tuple(self.panel)
         return Observation(feeds=self._window(), mob_ids=frame.mob_ids, valid=valid, usable_slots=usable_slots,
-                           panel=panel, t=now, pet_slots=pet_slots, pet_skills=pet_skills,)
+                           panel=panel, t=now, pet_slots=pet_slots, pet_skills=pet_skills,
+                           pointer_slots=attackers or None)
 
     def panel_summary(self) -> dict:
         """The usable slots of the class panel (``[slot, skill id, level]``, the character's and the summon's) and the equipment."""
@@ -584,11 +603,13 @@ class CombatPolicy:
 
         mob_id = pointer_slot = None
         if obs.mob_ids:
-            logp_pointer = _log_softmax(logits_pointer[: len(obs.mob_ids)])
-            pointer_slot = choose(logp_pointer)
+            choices = obs.pointer_choices()
+            logp_pointer = _log_softmax(np.array([logits_pointer[i] for i in choices]))
+            j = choose(logp_pointer)
+            pointer_slot = choices[j]
             mob_id = obs.mob_ids[pointer_slot]
             if action in POINTER_ACTIONS:
-                logp += float(logp_pointer[pointer_slot])
+                logp += float(logp_pointer[j])
 
         skill_id = skill_slot = None
         pet_skill = None
@@ -749,6 +770,8 @@ class CombatPolicy:
         pet_target = pet.get("target_id") if pet else None
 
         def reachable(oid: int, mob: dict) -> bool:
+            if npc_data.is_boss(mob.get("npc_id", 0)):
+                return False  # raid and grand bosses are never candidates
             # The current target always stays visible: radar positions are spawn positions, so a monster
             # that came down to fight would otherwise vanish mid-fight.
             if self.max_target_dz is None or char_z is None or oid == current_target_id:

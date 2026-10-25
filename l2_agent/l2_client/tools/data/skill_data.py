@@ -201,6 +201,9 @@ def _read_raw(skill_elem: ET.Element, name: str, levels: int) -> dict:
         "using": tuple(frozenset(k.strip() for k in u.get("kind", "").split(",") if k.strip())
                        for c in skill_elem.findall("conditions") for u in c.iter("using") if u.get("kind")),
         "effects": frozenset(e.get("name") for e in skill_elem.iter("effect") if e.get("name")),
+        # <conditions><target race="UNDEAD"/>: the server refuses the skill on any other target
+        "target_race": next((t.get("race") for c in skill_elem.findall("conditions") for t in c.iter("target")
+                             if t.get("race")), None),
         "tables": tables,
         "values": values,
     }
@@ -276,6 +279,22 @@ def usable_with(skill_id: int, weapon: str, armor: str, shield: bool) -> bool:
         if not ok:
             return False
     return True
+
+
+#: Summons of siege weapons (Siege Golem, Wild Hog Cannon, Swoop Cannon): no use for farming monsters.
+SIEGE_WEAPON_SUMMONS: frozenset[int] = frozenset({13, 299, 448})
+
+
+def target_race(skill_id: int) -> str | None:
+    """The race the skill's target must be (``UNDEAD`` for Disrupt Undead ...), ``None`` for any."""
+    raw = _SKILL_RAW.get(skill_id)
+    return raw.get("target_race") if raw else None
+
+
+def burns_mana_only(skill_id: int) -> bool:
+    """The skill damages the target's MP, not its HP (Mana Burn): no use for killing a monster."""
+    raw = _SKILL_RAW.get(skill_id)
+    return bool(raw) and raw["effects"] == {"MagicalDamageMp"}
 
 
 def needs_summon(skill_id: int) -> bool:

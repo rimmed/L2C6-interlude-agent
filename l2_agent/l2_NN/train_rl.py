@@ -234,6 +234,8 @@ def collate_segments(segments: list[replay.Segment], device: torch.device) -> di
     type_mask = np.zeros((batch_size, t_max, first["type_mask"].shape[1]), dtype=bool)
     type_mask[..., 0] = True  # padded steps: any non-empty mask keeps the softmax finite
     skill_mask = np.zeros((batch_size, t_max, first["skill_mask"].shape[1]), dtype=bool)
+    pointer_mask = np.zeros((batch_size, t_max, first["mobs_matrix"].shape[-2]), dtype=bool)
+    pointer_mask[..., 0] = True  # padded steps (and steps without monsters): keeps the softmax finite
 
     offset = 0
     for i, segment in enumerate(segments):
@@ -249,6 +251,10 @@ def collate_segments(segments: list[replay.Segment], device: torch.device) -> di
             per_step[key][i, :steps] = a[key]
         type_mask[i, :steps] = a["type_mask"]
         skill_mask[i, :steps] = a["skill_mask"]
+        if "pointer_mask" in a:
+            pointer_mask[i, :steps] = a["pointer_mask"] | ~a["pointer_mask"].any(-1, keepdims=True) & (np.arange(pointer_mask.shape[-1]) == 0)
+        else:  # segments of older actors: every real slot
+            pointer_mask[i, :steps] = np.arange(pointer_mask.shape[-1]) < np.maximum(a["n_mobs"], 1)[:, None]
 
     batch = {key: torch.from_numpy(np.concatenate(parts)).to(device, non_blocking=True)
              for key, parts in states.items()}
@@ -258,7 +264,7 @@ def collate_segments(segments: list[replay.Segment], device: torch.device) -> di
     batch.update(
         step_state=torch.from_numpy(step_state).to(device), boot_state=torch.from_numpy(boot_state).to(device),
         valid=torch.from_numpy(valid).to(device), type_mask=torch.from_numpy(type_mask).to(device),
-        skill_mask=torch.from_numpy(skill_mask).to(device),
+        skill_mask=torch.from_numpy(skill_mask).to(device), pointer_mask=torch.from_numpy(pointer_mask).to(device),
     )
     return batch
 
@@ -314,8 +320,7 @@ def policy_terms(out: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], p
 
     action, pointer, skill = batch["action"], batch["pointer"], batch["skill"]
     logp_type = masked_log_softmax(logits_type, batch["type_mask"])
-    slots = torch.arange(logits_ptr.shape[-1], device=logits_ptr.device)
-    ptr_mask = slots < batch["n_mobs"].unsqueeze(-1)
+    ptr_mask = batch["pointer_mask"]
     logp_ptr = masked_log_softmax(logits_ptr, ptr_mask)
     logp_skill = masked_log_softmax(logits_skill, batch["skill_mask"])
 

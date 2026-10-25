@@ -442,6 +442,8 @@ class Actor:
         return {
             "types": [action_id for name, action_id in self.encoder.executable_actions if obs.valid[name]],
             "n_mobs": len(obs.mob_ids),
+            # the mob slots the pointer head chose from (the monsters hitting the character, or all)
+            "pointer_slots": list(obs.pointer_choices()),
             # the slots the skill head chose from: the summon's skills for pet_skill, the character's otherwise
             "skill_slots": list(obs.skill_slots(decision.action)),
         }

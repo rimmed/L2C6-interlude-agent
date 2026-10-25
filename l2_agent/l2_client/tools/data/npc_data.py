@@ -33,6 +33,10 @@ DEFAULT_NPC_XML_PATH = "../L2J_Mobius/L2J_Mobius_CT_0_Interlude/dist/game/data/s
 _npc_names: dict[int, str] = {}
 _npc_levels: dict[int, int] = {}
 _npc_hp: dict[int, float] = {}
+#: npc template id -> race (``<race>``)
+_npc_race: dict[int, str] = {}
+#: npc template id -> type (``Monster``, ``RaidBoss``, ``GrandBoss`` ...)
+_npc_type: dict[int, str] = {}
 _loaded = False
 
 
@@ -47,7 +51,7 @@ def load_npc_names(path: str = DEFAULT_NPC_XML_PATH) -> dict[int, str]:
     :param path: directory containing ``20000-20099.xml`` etc.
     :returns: dict mapping npc template id -> name
     """
-    global _npc_names, _npc_levels, _npc_hp, _loaded
+    global _npc_names, _npc_levels, _npc_hp, _npc_race, _npc_type, _loaded
     if _loaded:
         return _npc_names
 
@@ -58,6 +62,7 @@ def load_npc_names(path: str = DEFAULT_NPC_XML_PATH) -> dict[int, str]:
 
     pattern = re.compile(r'<npc\s+id="(\d+)"\s+level="(\d+)"[^>]*\sname="([^"]+)"')
     vitals = re.compile(r'<vitals\s+hp="([\d.]+)"')
+    race = re.compile(r'<race>([A-Z_]+)</race>')
     count = 0
     for fname in sorted(os.listdir(path)):
         if not fname.endswith(".xml"):
@@ -75,11 +80,17 @@ def load_npc_names(path: str = DEFAULT_NPC_XML_PATH) -> dict[int, str]:
             name = m.group(3)
             _npc_names[npc_id] = name
             _npc_levels[npc_id] = level
+            kind_attr = re.search(r'\stype="([A-Za-z]+)"', m.group(0))
+            if kind_attr:
+                _npc_type[npc_id] = kind_attr.group(1)
             # The first <vitals> before the next <npc> belongs to this one.
             block_end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
             hp = vitals.search(text, m.end(), block_end)
             if hp:
                 _npc_hp[npc_id] = float(hp.group(1))
+            kind = race.search(text, m.end(), block_end)
+            if kind:
+                _npc_race[npc_id] = kind.group(1)
             count += 1
 
     _loaded = True
@@ -95,6 +106,16 @@ def get_npc_name(template_id: int) -> str:
 def get_npc_level(template_id: int) -> int:
     """Return the level for an NPC template ID, or 0 if unknown."""
     return _npc_levels.get(template_id, 0)
+
+
+def is_boss(template_id: int) -> bool:
+    """A raid boss or grand boss: group content, never a farming target."""
+    return _npc_type.get(template_id) in ("RaidBoss", "GrandBoss")
+
+
+def get_npc_race(template_id: int) -> str:
+    """Return the race of an NPC template (``UNDEAD``, ``ANIMAL`` ...), or ``""`` if unknown."""
+    return _npc_race.get(template_id, "")
 
 
 def get_npc_max_hp(template_id: int) -> float:
