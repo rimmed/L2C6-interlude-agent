@@ -215,11 +215,17 @@ class Actor:
             log.info("Waiting for the trainer to publish a model...")
             time.sleep(5.0)
         version, onnx_bytes, meta = published
+        # One file per model version, shared by every actor of the fleet (a copy per actor was 1.3 GB
+        # per fleet start); written under a temporary name and renamed, so no actor reads half a file.
         folder = Path(self.cfg.output_dir) / "models"
         folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"combat_policy_{self.actor_id}.onnx"
-        path.write_bytes(onnx_bytes)
-        path.with_suffix(".json").write_text(json.dumps(meta))
+        path = folder / f"combat_policy_v{version}.onnx"
+        if not path.exists() or not path.with_suffix(".json").exists():
+            tmp = folder / f".{self.actor_id}.tmp"
+            tmp.with_suffix(".onnx").write_bytes(onnx_bytes)
+            tmp.with_suffix(".json").write_text(json.dumps(meta))
+            tmp.with_suffix(".json").replace(path.with_suffix(".json"))
+            tmp.with_suffix(".onnx").replace(path)
         self.model_version = version
         self.model_name = f"redis:v{version}"
         return path
