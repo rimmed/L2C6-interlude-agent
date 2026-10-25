@@ -151,6 +151,10 @@ class Actor:
         #: decisions of the current fight per action type, and per skill (``"<id>"``, ``"pet:<id>"`` for the summon's)
         self.episode_actions: dict[str, int] = {}
         self.episode_skills: dict[str, int] = {}
+        #: target choices of the current fight by distance rank (``"0"`` = the nearest monster on the radar)
+        self.episode_target_ranks: dict[str, int] = {}
+        #: decisions of the current fight with a living summon
+        self.episode_pet_steps = 0
         self.episode_started = 0.0
         self.total_steps = 0
         self.totals = {"episodes": 0, "kills": 0, "deaths": 0, "transitions": 0, "return": 0.0}
@@ -308,9 +312,14 @@ class Actor:
         decision = self.encoder.act(obs, sample=self.sample, rng=self.np_rng)
         executed = self.executor.execute(decision, now)
         self.episode_actions[decision.action] = self.episode_actions.get(decision.action, 0) + 1
+        if self.encoder._live_pet(world.char) is not None:
+            self.episode_pet_steps += 1
         if decision.action in ("used_skill", "pet_skill") and decision.skill_id is not None:
             key = f"pet:{decision.skill_id}" if decision.action == "pet_skill" else str(decision.skill_id)
             self.episode_skills[key] = self.episode_skills.get(key, 0) + 1
+        if decision.action == "selected_target" and decision.pointer_slot is not None:
+            rank = str(decision.pointer_slot)  # the radar slots are sorted by distance
+            self.episode_target_ranks[rank] = self.episode_target_ranks.get(rank, 0) + 1
         log.debug("[ep %d step %d] %s -> %s", self.episode_id, self.episode_step, decision.describe(), executed)
 
         self._pending = Transition(
@@ -391,6 +400,8 @@ class Actor:
                 "steps": self.episode_step, "return": round(self.episode_return, 4),
                 "reward_terms": {name: round(value, 4) for name, value in self.episode_terms.items()},
                 "actions": self.episode_actions, "skills": self.episode_skills,
+                "target_ranks": self.episode_target_ranks, "panel": self.encoder.panel_summary(),
+                "pet_share": round(self.episode_pet_steps / self.episode_step, 3),
                 "duration_s": round(time.time() - self.episode_started, 2),
                 "character": self.conn.character_name, "level": char.level, "class_id": char.class_id,
                 "t": round(time.time(), 1),
@@ -407,6 +418,8 @@ class Actor:
         self.episode_terms = {}
         self.episode_actions = {}
         self.episode_skills = {}
+        self.episode_target_ranks = {}
+        self.episode_pet_steps = 0
         self.episode_started = time.time()
         self.encoder.reset_session()
 
