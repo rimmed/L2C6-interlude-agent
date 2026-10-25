@@ -20,9 +20,13 @@
  */
 package org.l2jmobius.gameserver.managers;
 
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.EnumMap;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -35,6 +39,7 @@ import java.util.function.Predicate;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
+import org.l2jmobius.commons.database.DatabaseFactory;
 import org.l2jmobius.commons.threads.ThreadPool;
 import org.l2jmobius.commons.util.Rnd;
 import org.l2jmobius.gameserver.config.custom.AllowedPlayerRacesConfig;
@@ -107,6 +112,10 @@ public class RLAgentManager
 	private static final String VAR_BUILD = "RL_BUILD";
 	/** The level an agent was created with; a level-up resets it to this level (RLResetLevelOnLevelUp). */
 	private static final String VAR_BASE_LEVEL = "RL_BASE_LEVEL";
+	/** The class an agent is created for (RLClassBalance): its level is drawn within that profession and its transfers lead to it. */
+	private static final String VAR_TARGET_CLASS = "RL_TARGET_CLASS";
+	/** Level range of each profession (0 = starting class .. 3 = third profession) for RLClassBalance. */
+	private static final int[][] PROFESSION_LEVELS = { { 1, 19 }, { 20, 39 }, { 40, 75 }, { 76, 80 } };
 	
 	/**
 	 * How a support class plays solo. Prophets, Elders, Bishops and their Oracle / Cleric base classes are strong casters only against undead, so they either hunt undead with spells or fight other monsters in melee; Warcryers and Overlords either cast (drains, poisons) or fight with a blunt in heavy armor.
@@ -202,6 +211,8 @@ public class RLAgentManager
 	private final Map<CrystalType, Map<Archetype, GearPool>> _gearPools = new ConcurrentHashMap<>();
 	/** Players whose setup is running; their own level-up events are ignored meanwhile. */
 	private final Set<Integer> _inSetup = ConcurrentHashMap.newKeySet();
+	/** Agents per target class (RLClassBalance), read from the database on the first creation. */
+	private Map<Integer, Integer> _targetCounts;
 	private final Map<Integer, ScheduledFuture<?>> _respawnTasks = new ConcurrentHashMap<>();
 	private final RLFarmAreas _farmAreas = new RLFarmAreas();
 	private final RLBuffs _buffs = new RLBuffs();
@@ -348,7 +359,8 @@ public class RLAgentManager
 			return;
 		}
 		
-		final PlayerClass baseClass = baseClasses.get(Rnd.get(baseClasses.size()));
+		final PlayerClass target = RLAgentEnvironmentConfig.RL_CLASS_BALANCE ? pickTargetClass(baseClasses) : null;
+		final PlayerClass baseClass = target != null ? target.getRootClass() : baseClasses.get(Rnd.get(baseClasses.size()));
 		final PlayerTemplate template = PlayerTemplateData.getInstance().getTemplate(baseClass);
 		final boolean female = Rnd.nextBoolean();
 		final PlayerAppearance appearance = new PlayerAppearance((byte) Rnd.get(0, 2), (byte) Rnd.get(0, 3), (byte) Rnd.get(0, female ? 6 : 4), female);
@@ -378,7 +390,83 @@ public class RLAgentManager
 		newChar.setCurrentHp(newChar.getMaxHp());
 		newChar.setCurrentMp(newChar.getMaxMp());
 		CharacterCreate.initNewChar(client, newChar);
-		LOGGER.info(getClass().getSimpleName() + ": Created agent character " + newChar.getName() + " (" + baseClass + ") for account " + account + ".");
+		if (target != null)
+		{
+			newChar.getVariables().set(VAR_TARGET_CLASS, target.getId());
+			newChar.getVariables().storeMe();
+		}
+		LOGGER.info(getClass().getSimpleName() + ": Created agent character " + newChar.getName() + " (" + baseClass + (target != null ? ", for " + target : "") + ") for account " + account + ".");
+	}
+	
+	/**
+	 * The class with the fewest agents (ties at random) among every class whose starting class may be created: the agents spread evenly over all professions.
+	 * @param baseClasses the starting classes that may be created
+	 * @return the class the new agent is created for
+	 */
+	private synchronized PlayerClass pickTargetClass(List<PlayerClass> baseClasses)
+	{
+		if (_targetCounts == null)
+		{
+			_targetCounts = new HashMap<>();
+			try (Connection con = DatabaseFactory.getConnection();
+				PreparedStatement ps = con.prepareStatement("SELECT val, COUNT(*) FROM character_variables WHERE var=? GROUP BY val");)
+			{
+				ps.setString(1, VAR_TARGET_CLASS);
+				try (ResultSet rs = ps.executeQuery())
+				{
+					while (rs.next())
+					{
+						_targetCounts.put(Integer.parseInt(rs.getString(1)), rs.getInt(2));
+					}
+				}
+			}
+			catch (Exception e)
+			{
+				LOGGER.warning(getClass().getSimpleName() + ": Could not count the agents per class: " + e);
+			}
+		}
+		
+		final List<PlayerClass> fewest = new ArrayList<>();
+		double lowest = Double.MAX_VALUE;
+		for (PlayerClass playerClass : PlayerClass.values())
+		{
+			if ((playerClass.level() >= PROFESSION_LEVELS.length) || !baseClasses.contains(playerClass.getRootClass()) || !professionReachable(playerClass.level()))
+			{
+				continue;
+			}
+			// Agents per unit of the profession's weight: a profession with weight 0.5 gets half the agents per class.
+			final double weight = RLAgentEnvironmentConfig.RL_CLASS_BALANCE_WEIGHTS[Math.min(playerClass.level(), RLAgentEnvironmentConfig.RL_CLASS_BALANCE_WEIGHTS.length - 1)];
+			if (weight <= 0)
+			{
+				continue;
+			}
+			final double load = _targetCounts.getOrDefault(playerClass.getId(), 0) / weight;
+			if (load < (lowest - 1e-9))
+			{
+				lowest = load;
+				fewest.clear();
+			}
+			if (Math.abs(load - lowest) < 1e-9)
+			{
+				fewest.add(playerClass);
+			}
+		}
+		if (fewest.isEmpty())
+		{
+			return null;
+		}
+		final PlayerClass target = fewest.get(Rnd.get(fewest.size()));
+		_targetCounts.merge(target.getId(), 1, Integer::sum);
+		return target;
+	}
+	
+	/**
+	 * @param profession 0 (starting class) .. 3 (third profession)
+	 * @return {@code true} when the profession's level range overlaps [RLMinLevel, RLMaxLevel]
+	 */
+	private static boolean professionReachable(int profession)
+	{
+		return (PROFESSION_LEVELS[profession][0] <= RLAgentEnvironmentConfig.RL_MAX_LEVEL) && (PROFESSION_LEVELS[profession][1] >= RLAgentEnvironmentConfig.RL_MIN_LEVEL);
 	}
 	
 	private static boolean isRaceAllowed(PlayerClass playerClass)
@@ -469,7 +557,16 @@ public class RLAgentManager
 		final int maxLevel = Math.min(RLAgentEnvironmentConfig.RL_MAX_LEVEL, ExperienceData.getInstance().getMaxLevel() - 1);
 		final int minLevel = Math.min(RLAgentEnvironmentConfig.RL_MIN_LEVEL, maxLevel);
 		final int targetLevel;
-		if (RLAgentEnvironmentConfig.RL_LEVEL_STDDEV > 0)
+		final int targetClass = player.getVariables().getInt(VAR_TARGET_CLASS, -1);
+		if (RLAgentEnvironmentConfig.RL_CLASS_BALANCE && (targetClass >= 0) && (PlayerClass.getPlayerClass(targetClass) != null))
+		{
+			// Uniformly within the levels of the target class's profession (and the configured range).
+			final int[] range = PROFESSION_LEVELS[Math.min(PlayerClass.getPlayerClass(targetClass).level(), PROFESSION_LEVELS.length - 1)];
+			final int low = Math.max(range[0], minLevel);
+			final int high = Math.max(low, Math.min(range[1], maxLevel));
+			targetLevel = Rnd.get(low, high);
+		}
+		else if (RLAgentEnvironmentConfig.RL_LEVEL_STDDEV > 0)
 		{
 			// Gaussian around RLLevelMean, redrawn until it falls into the level range (a truncated normal distribution).
 			int level;
@@ -588,7 +685,24 @@ public class RLAgentManager
 				break;
 			}
 			
-			final PlayerClass next = options.get(Rnd.get(options.size()));
+			// An agent created for a class (RLClassBalance) goes the way to it; any other one takes a random branch.
+			final PlayerClass target = PlayerClass.getPlayerClass(player.getVariables().getInt(VAR_TARGET_CLASS, -1));
+			PlayerClass next = null;
+			if (target != null)
+			{
+				for (PlayerClass option : options)
+				{
+					if (target.equalsOrChildOf(option))
+					{
+						next = option;
+						break;
+					}
+				}
+			}
+			if (next == null)
+			{
+				next = options.get(Rnd.get(options.size()));
+			}
 			player.setPlayerClass(next.getId());
 			if (player.isSubClassActive())
 			{

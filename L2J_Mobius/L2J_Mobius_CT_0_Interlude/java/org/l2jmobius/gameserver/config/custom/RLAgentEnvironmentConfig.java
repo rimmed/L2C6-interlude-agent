@@ -102,6 +102,8 @@ public class RLAgentEnvironmentConfig
 	public static int RL_MAX_LEVEL;
 	public static double RL_LEVEL_MEAN;
 	public static double RL_LEVEL_STDDEV;
+	public static boolean RL_CLASS_BALANCE;
+	public static double[] RL_CLASS_BALANCE_WEIGHTS;
 	public static boolean RL_AUTO_LEARN_SKILLS;
 	public static boolean RL_AUTO_CLASS_TRANSFER;
 	public static boolean RL_AUTO_EQUIP;
@@ -171,6 +173,13 @@ public class RLAgentEnvironmentConfig
 		RL_MAX_LEVEL = Math.max(RL_MIN_LEVEL, config.getInt("RLMaxLevel", 80));
 		RL_LEVEL_MEAN = config.getDouble("RLLevelMean", 40);
 		RL_LEVEL_STDDEV = Math.max(0, config.getDouble("RLLevelStdDev", 15));
+		RL_CLASS_BALANCE = config.getBoolean("RLClassBalance", false);
+		final String[] weights = config.getString("RLClassBalanceWeights", "1,1,1,1").split(",");
+		RL_CLASS_BALANCE_WEIGHTS = new double[4];
+		for (int i = 0; i < 4; i++)
+		{
+			RL_CLASS_BALANCE_WEIGHTS[i] = i < weights.length ? Math.max(0, Double.parseDouble(weights[i].trim())) : 1;
+		}
 		RL_AUTO_LEARN_SKILLS = config.getBoolean("RLAutoLearnSkills", true);
 		RL_AUTO_CLASS_TRANSFER = config.getBoolean("RLAutoClassTransfer", true);
 		RL_AUTO_EQUIP = config.getBoolean("RLAutoEquip", true);
