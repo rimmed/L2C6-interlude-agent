@@ -170,13 +170,14 @@ final class RLFarmAreas
 		if (area == null)
 		{
 			area = leastCrowded(level, player.getObjectId(), false, null);
-			if (area == null)
-			{
-				_assignments.remove(player.getObjectId());
-				return null;
-			}
-			_assignments.put(player.getObjectId(), area.key());
 		}
+		if (area == null)
+		{
+			_assignments.remove(player.getObjectId());
+			return null;
+		}
+		// Recorded for undead hunters too: the crowd of an area counts every agent sent there.
+		_assignments.put(player.getObjectId(), area.key());
 		return spotIn(area, level);
 	}
 	

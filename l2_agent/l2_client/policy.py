@@ -71,6 +71,9 @@ IN_COMBAT_TIMEOUT_S = 15.0
 #: Healing potions (Lesser / Healing / Greater) and their shared reuse in game seconds, as in the dataloader.
 HEALING_POTION_IDS = frozenset((1060, 1061, 1539))
 HEALING_POTION_REUSE_S = 10.0
+#: Support classes that fight in melee when not in a robe (Cleric, Bishop, Prophet, Elven / Shillien Oracle
+#: and Elder, their 3rd classes): their attack spells are strong only against undead, as robed casters.
+MELEE_SUPPORT_CLASSES = frozenset((15, 16, 17, 29, 30, 42, 43, 97, 98, 105, 112))
 
 #: Monsters this far above or below the character are left out of the candidates: they stand on a
 #: cliff or in a pit, and walking to them straight runs into the terrain (the client has no pathfinding).
@@ -522,6 +525,9 @@ class CombatPolicy:
         attackers = tuple(i for i, oid in enumerate(frame.mob_ids)
                           if char.radar.entries.get(oid, {}).get("attacking_me_until", 0.0) > now)
         on_attacker = not attackers or current_target_id in {frame.mob_ids[i] for i in attackers}
+        # a support in light or heavy armor fights in melee: no attack spells
+        melee_support = (getattr(char, "class_id", None) in MELEE_SUPPORT_CLASSES and getattr(self, "_equipment", None)
+                         and self._equipment[1] in ("LIGHT", "HEAVY"))
         usable_slots = tuple(
             i for i, info in self._own_slots.items()
             if self._skill_usable(info.skill_id, now) and char.cur_mp >= info.mp_cost
@@ -529,6 +535,7 @@ class CombatPolicy:
             and skill_data.target_race(info.skill_id) in (None, target_race)
             and not skill_data.burns_mana_only(info.skill_id)
             and info.skill_id not in skill_data.SIEGE_WEAPON_SUMMONS
+            and not (melee_support and info.category == "attack" and info.is_magic)
             and (on_attacker or info.target == "self")
             # summon skills need a summon; a second servitor cannot be summoned while one is out
             and (pet is not None or not skill_data.needs_summon(info.skill_id))
