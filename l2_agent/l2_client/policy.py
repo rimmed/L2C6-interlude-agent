@@ -52,6 +52,7 @@ from typing import Any
 import numpy as np
 
 from . import skill_features
+from .mob_features import MOB_TEMPLATE_FEATURES, encode_mob_template
 from .tools.data import class_panels, item_data, npc_data, skill_data, summon_data
 
 #: Action classes the bot can execute.  The rest of the label space (inflicted_damage, killed, ...)
@@ -775,6 +776,7 @@ class CombatPolicy:
         char_z = getattr(char, "z", None)
         pet = self._live_pet(char)
         pet_target = pet.get("target_id") if pet else None
+        weapon_type = self._equipment[0] if getattr(self, "_equipment", None) else "FIST"
 
         def reachable(oid: int, mob: dict) -> bool:
             if npc_data.is_boss(mob.get("npc_id", 0)):
@@ -807,6 +809,13 @@ class CombatPolicy:
                 # direction from the character, 0 = north (-y) / 90 = east, as the logs write it
                 "dir_sin": (mob["x"] - x) / dist if dist > 0 else 0.0,
                 "dir_cos": (y - mob["y"]) / dist if dist > 0 else 0.0,
+                # the server sends StatusUpdate for the character's own target only (the logs are masked alike)
+                "hp_ratio": min(max(mob["cur_hp"] / mob["max_hp"], 0.0), 1.0)
+                if oid == current_target_id and mob.get("max_hp", 0) > 0 else 1.0,
+                "hp_known": 1.0 if oid == current_target_id and mob.get("max_hp", 0) > 0 else 0.0,
+                **dict(zip(MOB_TEMPLATE_FEATURES, encode_mob_template(
+                    mob.get("npc_id"), weapon_type=weapon_type, p_atk=char.p_atk, m_atk=char.m_atk,
+                    level=char.level, max_distance=c["max_distance"]))),
                 "is_padded": 0.0,
             }
             matrix[slot] = [row[name] for name in self._mob_names]

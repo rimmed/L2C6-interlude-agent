@@ -41,6 +41,9 @@ logged column                 consumed as
 ``nearby_objects[].id``       monster npc id (the key is ``id``, **not** ``npc_id``)
 ``.attackers`` (same list)    other players on the monster's aggro list -> ``by_other``
                               (format-2 logs only, see ``tools/playeraction_v2.py``)
+``.hp_pct`` (same list)       the monster's HP % -> ``hp_ratio``, for the character's target only
+``char_stats.p_atk`` /        with ``equipment_ids.Weapon``: the template features of every monster
+``char_stats.m_atk``          (``l2_client/mob_features.py``)
 ``entity_npc_id``             npc id of the target of the current event
 ``active_skills[].id`` and    skill panel; there is **no** ``available_skills`` column
 ``cooldowns[].skill_id`` /    and no per-skill MP cost anywhere in the logs
@@ -126,8 +129,9 @@ import torch
 from torch.utils.data import Dataset
 
 from l2_client import skill_features
+from l2_client.mob_features import MOB_TEMPLATE_FEATURES, encode_mob_template
 from l2_client.skill_features import COOLDOWN_SCALE_S, SKILL_SLOT_DIM, SKILL_SLOT_FEATURES, encode_skill_slot
-from l2_client.tools.data import class_panels, item_data, skill_data, summon_data
+from l2_client.tools.data import class_panels, item_data, npc_data, skill_data, summon_data
 
 from .augment import AugmentConfig
 
@@ -294,12 +298,23 @@ def player_feature_names(dim: int) -> tuple[str, ...]:
 #: always 0 in format-1 logs). ``is_pet_target``: the character's summon has it as its target.
 #: ``attacking_me``: its target is the character (``me`` in newer logs) or it hit the character in the last
 #: :data:`ATTACKER_MEMORY_S` seconds. ``dir_sin`` / ``dir_cos``: direction from the character, 0 = north
-#: (newer logs; 0 / 0 when unknown). ``is_padded`` is always the last feature (the model masks padding by it).
+#: (newer logs; 0 / 0 when unknown). ``hp_ratio`` / ``hp_known``: the monster's HP, known for the target the
+#: character held before the event only - the client gets StatusUpdate for its own target alone (1 / 0 for the
+#: rest). Then the template features of ``l2_client/mob_features.py``. ``is_padded`` is always the last feature
+#: (the model masks padding by it).
 MOB_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "dist_norm", "lvl_diff", "is_current_target", "by_other", "is_pet_target", "attacking_me", "dir_sin", "dir_cos",
+    "hp_ratio", "hp_known", *MOB_TEMPLATE_FEATURES,
     "is_padded",
 )
 MOB_FEATURE_DIM: Final[int] = len(MOB_FEATURE_NAMES)
+MOB_HP_RATIO_INDEX: Final[int] = MOB_FEATURE_NAMES.index("hp_ratio")
+MOB_HP_KNOWN_INDEX: Final[int] = MOB_FEATURE_NAMES.index("hp_known")
+#: The mob features of models trained before the monster's HP and template existed.
+DIRECTION_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = (
+    "dist_norm", "lvl_diff", "is_current_target", "by_other", "is_pet_target", "attacking_me", "dir_sin", "dir_cos",
+    "is_padded",
+)
 #: The mob features of models trained before attacking_me / the direction existed.
 PET_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = (
     "dist_norm", "lvl_diff", "is_current_target", "by_other", "is_pet_target", "is_padded",
@@ -314,7 +329,8 @@ LEGACY_MOB_FEATURE_NAMES: Final[tuple[str, ...]] = ("dist_norm", "lvl_diff", "is
 
 def mob_feature_names(dim: int) -> tuple[str, ...]:
     """The mob feature layout of a model with ``dim`` mob features (old checkpoints carry no names)."""
-    for names in (MOB_FEATURE_NAMES, PET_MOB_FEATURE_NAMES, BY_OTHER_MOB_FEATURE_NAMES, LEGACY_MOB_FEATURE_NAMES):
+    for names in (MOB_FEATURE_NAMES, DIRECTION_MOB_FEATURE_NAMES, PET_MOB_FEATURE_NAMES, BY_OTHER_MOB_FEATURE_NAMES,
+                  LEGACY_MOB_FEATURE_NAMES):
         if len(names) == dim:
             return names
     raise ValueError(f"no known mob feature layout has {dim} features")
@@ -566,6 +582,7 @@ class Lineage2EventDataset(Dataset):
         skill_data.load_skill_data(str(DATAPACK_SKILLS))
         item_data.load_item_data(str(DATAPACK_SKILLS.parent / "items"))
         summon_data.load_summon_data(str(DATAPACK_SKILLS.parent / "npcs"))  # absolute: train.py runs from any CWD
+        npc_data.load_monster_templates(str(DATAPACK_SKILLS.parent / "npcs"))
         if "known_skills" not in self.data.columns:
             print("Warning: no known_skills column (re-run playeraction_log2parquet.py) - every skill panel is empty")
         #: every combat skill of the datapack: the pool distractor skills are drawn from
@@ -835,13 +852,16 @@ class Lineage2EventDataset(Dataset):
         # ``sorted`` is stable, so entries with equal/absent distance keep their log order.
         return sorted(nearby, key=lambda mob: _as_float(mob.get("distance"), DEFAULT_DISTANCE))
 
-    def _encode_mobs_matrix(self, row: Any, hit_by: tuple[set, set] = (set(), set())) -> tuple[np.ndarray, int, bool]:
+    def _encode_mobs_matrix(self, row: Any, hit_by: tuple[set, set] = (set(), set()),
+                            held_target: tuple[Optional[int], Optional[int]] = (None, None)) -> tuple[np.ndarray, int, bool]:
         """
         Encode the Top-K target-candidate matrix ``M`` (``(K, F_monster)``) and its label.
 
         Rows are the ``K`` closest monsters; every unused slot is flagged with
         ``is_padded = 1.0``.  ``is_current_target`` compares the monster's ``id`` (the real
-        key in the Parquet list) with the event's ``entity_npc_id``.
+        key in the Parquet list) with the event's ``entity_npc_id``. ``held_target`` is the
+        ``(object id, npc id)`` of the monster the character had targeted before this event: the
+        only one whose HP the client knows (the closest of its template when the object id is unknown).
 
         :return: ``(matrix, target_pointer_idx, resolved)`` where ``target_pointer_idx`` is the
             slot of the targeted monster and ``resolved`` tells whether the target really was
@@ -857,6 +877,12 @@ class Lineage2EventDataset(Dataset):
         target_object_id = _optional_number(row, ("entity_object_id",))
         pet = self._pet(row)
         pet_target = None if pet is None else _optional_number(pet, ("target_id",))
+        equipment = self._equipment(row)
+        weapon_type = equipment[0] if equipment is not None else "FIST"
+        p_atk = _feature_number(row, ("char_stats.p_atk",), 0.0)
+        m_atk = _feature_number(row, ("char_stats.m_atk",), 0.0)
+        held_object_id, held_npc_id = held_target
+        hp_shown = False
 
         pointer_idx = 0
         matched = False
@@ -890,8 +916,17 @@ class Lineage2EventDataset(Dataset):
                 else mob_npc_id is not None and int(mob_npc_id) in hit_by[1])
             bearing = _optional_number(mob, ("bearing",))
             dir_sin, dir_cos = (0.0, 0.0) if bearing is None else (math.sin(math.radians(bearing)), math.cos(math.radians(bearing)))
+            hp_ratio, hp_known = 1.0, 0.0
+            held = (int(mob_object_id) == held_object_id if held_object_id is not None and mob_object_id is not None
+                    else held_object_id is None and held_npc_id is not None and mob_npc_id is not None
+                    and int(mob_npc_id) == held_npc_id)
+            hp_pct = _optional_number(mob, ("hp_pct",))
+            if held and not hp_shown and hp_pct is not None:
+                hp_ratio, hp_known, hp_shown = min(max(hp_pct / 100.0, 0.0), 1.0), 1.0, True
+            template = encode_mob_template(mob_npc_id, weapon_type=weapon_type, p_atk=p_atk, m_atk=m_atk,
+                                           level=player_level, max_distance=MAX_DISTANCE)
             matrix[slot_idx] = (dist_norm, lvl_diff, is_target, by_other, is_pet_target, 1.0 if attacking else 0.0,
-                                dir_sin, dir_cos, 0.0)
+                                dir_sin, dir_cos, hp_ratio, hp_known, *template, 0.0)
 
         return matrix, pointer_idx, matched
 
@@ -1078,9 +1113,14 @@ class Lineage2EventDataset(Dataset):
         #: who hit the character lately: object id / npc id -> time of the hit
         hit_by_object: dict[int, float] = {}
         hit_by_npc: dict[int, float] = {}
+        #: the monster the character has targeted, ``(object id, npc id)``, as of the previous event
+        held_target: tuple[Optional[int], Optional[int]] = (None, None)
+        targeting = {self.action_to_id[name] for name in ("selected_target", "attacked", "used_skill", "inflicted_damage")}
+        selected = self.action_to_id["selected_target"]
         for position, (_, row) in enumerate(frame.iterrows()):
             if position == 0 or sessions_column[position] != sessions_column[position - 1]:
                 pet_cooldown_until, hit_by_object, hit_by_npc = {}, {}, {}
+                held_target = (None, None)
             action_id = self._encode_action_type(row)
             action_type[position] = action_id
             now = times[position]
@@ -1101,7 +1141,15 @@ class Lineage2EventDataset(Dataset):
                 item = _optional_number(row, ("entity_item_id",))
                 if item is not None and int(item) in HEALING_POTION_IDS:
                     last_potion_at[character] = now
-            mobs_matrix[position], pointer_idx[position], pointer_resolved[position] = self._encode_mobs_matrix(row, hit_by)
+            mobs_matrix[position], pointer_idx[position], pointer_resolved[position] = self._encode_mobs_matrix(
+                row, hit_by, held_target)
+            if action_id in targeting:
+                # after the row: the event's own target must not leak into its features
+                if _lookup(row, "entity_kind", None) == "npc":
+                    oid, npc = _optional_number(row, ("entity_object_id",)), _optional_number(row, ("entity_npc_id",))
+                    held_target = (None if oid is None else int(oid), None if npc is None else int(npc))
+                elif action_id == selected:
+                    held_target = (None, None)  # an item or a player
             (skills_matrix[position], skill_ids[position], skill_slot[position],
              skill_resolved[position]) = self._encode_skills_matrix(row, action_id, pet_cooldown_until, times[position])
             if action_id == pet_used:
@@ -1254,12 +1302,15 @@ class Lineage2EventDataset(Dataset):
 
     @staticmethod
     def _add_noise(player_state: np.ndarray, mobs_matrix: np.ndarray, std: float, rng: np.random.Generator) -> None:
-        """Jitter the HP/MP/CP ratios and the distance of the real monster slots."""
+        """Jitter the HP/MP/CP ratios, the distance of the real monster slots and the target's HP."""
         hp_mp_cp = slice(0, 3)
         player_state[:, hp_mp_cp] = np.clip(player_state[:, hp_mp_cp] + rng.normal(0.0, std, player_state[:, hp_mp_cp].shape), 0.0, 1.0)
         real = mobs_matrix[..., MOB_PADDED_INDEX] == 0.0
         jitter = rng.normal(0.0, std, real.shape)
         mobs_matrix[..., 0] = np.where(real, np.clip(mobs_matrix[..., 0] + jitter, 0.0, 1.0), mobs_matrix[..., 0])
+        known = mobs_matrix[..., MOB_HP_KNOWN_INDEX] == 1.0
+        hp = mobs_matrix[..., MOB_HP_RATIO_INDEX]
+        mobs_matrix[..., MOB_HP_RATIO_INDEX] = np.where(known, np.clip(hp + rng.normal(0.0, std, hp.shape), 0.0, 1.0), hp)
 
     def _shuffle_mobs(self, mobs_matrix: np.ndarray, pointer_label: int, rng: np.random.Generator) -> int:
         """Permute the monster slots of every row independently; return the moved label of the last row."""
