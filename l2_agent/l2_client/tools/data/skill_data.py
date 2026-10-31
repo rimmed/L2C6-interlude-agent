@@ -206,6 +206,11 @@ def _read_raw(skill_elem: ET.Element, name: str, levels: int) -> dict:
                              if t.get("race")), None),
         "tables": tables,
         "values": values,
+        # a passive (NPC) skill's <mul stat="maxHp">#table</mul> and <effect name="DefenceTrait"><BOW>-30</BOW>
+        "stat_mul": {m.get("stat"): (m.text or "").strip() for e in skill_elem.iter("effect")
+                     for m in e.findall("mul") if m.get("stat")},
+        "defence_traits": {t.tag: (t.text or "").strip() for e in skill_elem.iter("effect")
+                           if e.get("name") == "DefenceTrait" for t in e},
     }
 
 
@@ -240,7 +245,11 @@ def _load_learnable(directory: str) -> None:
 
 def _level_value(raw: dict, tag: str, level: int, default: float = 0.0) -> float:
     """Value of ``tag`` at ``level``: a literal, or the level's entry of a ``#table``."""
-    text = raw["values"].get(tag, "")
+    return _value_at(raw, raw["values"].get(tag, ""), level, default)
+
+
+def _value_at(raw: dict, text: str, level: int, default: float = 0.0) -> float:
+    """``text`` at ``level``: a literal, or the level's entry of the skill's ``#table``."""
     if text.startswith("#"):
         table = raw["tables"].get(text, [])
         if not table:
@@ -283,6 +292,26 @@ def usable_with(skill_id: int, weapon: str, armor: str, shield: bool) -> bool:
 
 #: Summons of siege weapons (Siege Golem, Wild Hog Cannon, Swoop Cannon): no use for farming monsters.
 SIEGE_WEAPON_SUMMONS: frozenset[int] = frozenset({13, 299, 448})
+
+
+def stat_multipliers(skill_id: int, level: int) -> dict[str, float]:
+    """``stat -> multiplier`` of a passive skill at ``level`` (``{"maxHp": 12.0}`` for HP Increase), ``{}`` if none."""
+    raw = _SKILL_RAW.get(skill_id)
+    if not raw or raw["operate_type"] != "P":
+        return {}
+    return {stat: _value_at(raw, text, level, 1.0) for stat, text in raw["stat_mul"].items()}
+
+
+def defence_traits(skill_id: int, level: int) -> dict[str, float]:
+    """
+    ``trait -> value`` of a ``DefenceTrait`` skill at ``level``: below 0 a weak point, above 0 a resistance.
+
+    The damage of that trait is multiplied by ``1 - value / 100`` (Formulas.calcWeaponTraitBonus).
+    """
+    raw = _SKILL_RAW.get(skill_id)
+    if not raw:
+        return {}
+    return {trait: _value_at(raw, text, level) for trait, text in raw["defence_traits"].items()}
 
 
 def target_race(skill_id: int) -> str | None:
