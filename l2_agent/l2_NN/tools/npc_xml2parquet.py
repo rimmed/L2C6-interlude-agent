@@ -35,6 +35,8 @@ def parse_single_npc(npc_element: ET.Element) -> dict:
         "walk_speed": 0.0,
         "run_speed": 0.0,
     }
+    attack_type = ""
+    attack_range = 0
 
     if stats_el is not None:
         vitals = stats_el.find("vitals")
@@ -46,6 +48,8 @@ def parse_single_npc(npc_element: ET.Element) -> dict:
         if attack is not None:
             stats["p_atack"] = float(attack.attrib.get("physical", 0.0))
             stats["m_atack"] = float(attack.attrib.get("magical", 0.0))
+            attack_type = attack.attrib.get("type", "")
+            attack_range = int(attack.attrib.get("range", 0))
 
         defence = stats_el.find("defence")
         if defence is not None:
@@ -101,13 +105,12 @@ def parse_single_npc(npc_element: ET.Element) -> dict:
                 "chance": float(spoil_item.attrib.get("chance", 0.0))
             })
 
-    # AI & Aggro
+    # AI & Aggro: the server (NpcTemplate) reads isAggressive with the default true,
+    # and a monster without an aggro range never attacks first.
     ai_el = npc_element.find("ai")
-    is_aggressive = False
-    aggro_range = 0
-    if ai_el is not None:
-        is_aggressive = ai_el.attrib.get("isAggressive", "false").lower() == "true"
-        aggro_range = int(ai_el.attrib.get("aggroRange", 0))
+    aggro_range = int(ai_el.attrib.get("aggroRange", 0)) if ai_el is not None else 0
+    is_aggressive = aggro_range > 0 and (
+        ai_el is None or ai_el.attrib.get("isAggressive", "true").lower() == "true")
 
     # Text Representation for RAG / Vector Search
     skills_str = ", ".join([f"SkillID:{s['id']} (Lvl {s['level']})" for s in skills])
@@ -137,6 +140,8 @@ def parse_single_npc(npc_element: ET.Element) -> dict:
         "stats": stats,
         "is_aggressive": is_aggressive,
         "aggro_range": aggro_range,
+        "attack_type": attack_type,
+        "attack_range": attack_range,
         "skills": skills,
         "drop_list": drop_items,
         "spoil_list": spoil_items,
@@ -149,8 +154,9 @@ def process_directory(input_dir: str, output_parquet: str):
     if not input_path.exists() or not input_path.is_dir():
         raise ValueError(f"Target directory does not exist: {input_dir}")
 
-    # Recursively find all .xml files in directory and subdirectories
-    xml_files = list(input_path.rglob("*.xml"))
+    # Recursively find all .xml files in directory and subdirectories; sorted so that custom/
+    # comes after the main files and overrides them, as the server loads it
+    xml_files = sorted(input_path.rglob("*.xml"), key=lambda path: (path.parent != input_path, str(path)))
     print(f"Found {len(xml_files)} XML files in '{input_dir}'")
 
     all_npcs = []
@@ -161,8 +167,9 @@ def process_directory(input_dir: str, output_parquet: str):
             tree = ET.parse(file_path)
             root = tree.getroot()
 
-            # Handle both root <list><npc>...</npc></list> and standalone <npc> root tags
-            npc_elements = root.findall(".//npc") if root.tag != "npc" else [root]
+            # Handle both root <list><npc>...</npc></list> and standalone <npc> root tags; only the
+            # direct children: a <minions> list holds <npc id=... count=...> references too
+            npc_elements = root.findall("npc") if root.tag != "npc" else [root]
 
             for npc_el in npc_elements:
                 npc_data = parse_single_npc(npc_el)
@@ -178,8 +185,8 @@ def process_directory(input_dir: str, output_parquet: str):
         print("No NPC records found to export.")
         return
 
-    # Convert to pandas DataFrame
-    df = pd.DataFrame(all_npcs)
+    # Convert to pandas DataFrame; a custom/ template replaces the main one with its id
+    df = pd.DataFrame(all_npcs).drop_duplicates(subset="id", keep="last")
 
     # Save to Parquet
     df.to_parquet(output_parquet, engine="pyarrow", index=False)
