@@ -38,6 +38,7 @@ import java.util.logging.Logger;
 import org.l2jmobius.commons.threads.ThreadPool;
 import org.l2jmobius.commons.time.TimeScale;
 import org.l2jmobius.commons.util.Rnd;
+import org.l2jmobius.gameserver.GameTimeController;
 import org.l2jmobius.gameserver.ai.Action;
 import org.l2jmobius.gameserver.ai.AttackableAI;
 import org.l2jmobius.gameserver.ai.CreatureAI;
@@ -2236,7 +2237,7 @@ public abstract class Creature extends WorldObject
 	{
 		if ((group > 0) && !_reuseTimeStampsItems.isEmpty())
 		{
-			final long currentTime = System.currentTimeMillis();
+			final long currentTime = GameTimeController.currentTimeMillis(); // the clock of the stamps
 			for (TimeStamp ts : _reuseTimeStampsItems.values())
 			{
 				if (ts.getSharedReuseGroup() == group)

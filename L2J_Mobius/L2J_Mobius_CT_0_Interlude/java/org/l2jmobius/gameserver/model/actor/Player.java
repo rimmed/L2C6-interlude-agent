@@ -49,6 +49,7 @@ import java.util.logging.Level;
 import org.l2jmobius.commons.database.DatabaseFactory;
 import org.l2jmobius.commons.threads.ThreadPool;
 import org.l2jmobius.commons.util.Rnd;
+import org.l2jmobius.gameserver.GameTimeController;
 import org.l2jmobius.gameserver.LoginServerThread;
 import org.l2jmobius.gameserver.ai.CreatureAI;
 import org.l2jmobius.gameserver.ai.Intention;
@@ -7415,7 +7416,10 @@ public class Player extends Playable
 			
 			int buffIndex = 0;
 			final List<Integer> storedSkills = new ArrayList<>();
-			final long currentTime = System.currentTimeMillis();
+			// Reuse stamps run on the game clock (TimeScale), which starts again at the real time on every server start:
+			// the database keeps the real time of the end, with the remaining game time (restoreEffects).
+			final long currentTime = GameTimeController.currentTimeMillis();
+			final long realTime = System.currentTimeMillis();
 			
 			// Store all effect data along with calulated remaining
 			// reuse delays for matching skills. 'restore_type'= 0.
@@ -7464,7 +7468,7 @@ public class Player extends Playable
 						
 						final TimeStamp t = getSkillReuseTimeStamp(skill.getReuseHashCode());
 						statement.setLong(5, (t != null) && (currentTime < t.getStamp()) ? t.getReuse() : 0);
-						statement.setLong(6, (t != null) && (currentTime < t.getStamp()) ? t.getStamp() : 0);
+						statement.setLong(6, (t != null) && (currentTime < t.getStamp()) ? realTime + (t.getStamp() - currentTime) : 0);
 						statement.setInt(7, 0); // Store type 0, active buffs/debuffs.
 						statement.setInt(8, _classIndex);
 						statement.setInt(9, ++buffIndex);
@@ -7491,7 +7495,7 @@ public class Player extends Playable
 						statement.setInt(3, t.getSkillLevel());
 						statement.setInt(4, -1);
 						statement.setLong(5, t.getReuse());
-						statement.setLong(6, t.getStamp());
+						statement.setLong(6, realTime + (t.getStamp() - currentTime));
 						statement.setInt(7, 1); // Restore type 1, skill reuse.
 						statement.setInt(8, _classIndex);
 						statement.setInt(9, ++buffIndex);
@@ -7517,7 +7521,9 @@ public class Player extends Playable
 			ps1.setInt(1, getObjectId());
 			ps1.execute();
 			
-			final long currentTime = System.currentTimeMillis();
+			// Game clock stamps, stored as the real time of the end (see storeEffect).
+			final long currentTime = GameTimeController.currentTimeMillis();
+			final long realTime = System.currentTimeMillis();
 			for (TimeStamp ts : getItemReuseTimeStamps().values())
 			{
 				if ((ts != null) && (currentTime < ts.getStamp()))
@@ -7526,7 +7532,7 @@ public class Player extends Playable
 					ps2.setInt(2, ts.getItemId());
 					ps2.setInt(3, ts.getItemObjectId());
 					ps2.setLong(4, ts.getReuse());
-					ps2.setLong(5, ts.getStamp());
+					ps2.setLong(5, realTime + (ts.getStamp() - currentTime));
 					ps2.addBatch();
 				}
 			}
@@ -7879,11 +7885,12 @@ public class Player extends Playable
 						continue;
 					}
 					
+					// systime is the real time of the end; the stamp runs on the game clock.
 					final long time = systime - currentTime;
 					if (time > 10)
 					{
 						disableSkill(skill, time);
-						addTimeStamp(skill, reuseDelay, systime);
+						addTimeStamp(skill, reuseDelay, GameTimeController.currentTimeMillis() + time);
 					}
 					
 					// Restore Type 1 The remaning skills lost effect upon logout but were still under a high reuse delay.
@@ -7950,7 +7957,7 @@ public class Player extends Playable
 						remainingTime = systime - currentTime;
 						if (remainingTime > 10)
 						{
-							addTimeStampItem(item, reuseDelay, systime);
+							addTimeStampItem(item, reuseDelay, GameTimeController.currentTimeMillis() + remainingTime);
 							if (isInInventory && item.isEtcItem())
 							{
 								final int group = item.getSharedReuseGroup();
