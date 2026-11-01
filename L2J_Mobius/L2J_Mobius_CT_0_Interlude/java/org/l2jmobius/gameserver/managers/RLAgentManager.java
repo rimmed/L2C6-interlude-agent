@@ -64,6 +64,7 @@ import org.l2jmobius.gameserver.model.events.Containers;
 import org.l2jmobius.gameserver.model.events.EventType;
 import org.l2jmobius.gameserver.model.events.ListenersContainer;
 import org.l2jmobius.gameserver.model.events.holders.actor.creature.OnCreatureDeath;
+import org.l2jmobius.gameserver.model.events.holders.actor.npc.attackable.OnAttackableKill;
 import org.l2jmobius.gameserver.model.events.holders.actor.player.OnPlayerCreate;
 import org.l2jmobius.gameserver.model.events.holders.actor.player.OnPlayerLevelChanged;
 import org.l2jmobius.gameserver.model.events.holders.actor.player.OnPlayerLogin;
@@ -222,6 +223,8 @@ public class RLAgentManager
 	private final Set<Integer> _inSetup = ConcurrentHashMap.newKeySet();
 	/** Per agent: x, y and experience at its last progress, and the time of it (RLStuckRelocateSeconds). */
 	private final Map<Integer, long[]> _progress = new ConcurrentHashMap<>();
+	/** Per agent: deaths since its last kill (RLDeathLoopDeaths). */
+	private final Map<Integer, Integer> _deathsWithoutKill = new ConcurrentHashMap<>();
 	
 	/** Agents per target class (RLClassBalance), read from the database on the first creation. */
 	private Map<Integer, Integer> _targetCounts;
@@ -256,6 +259,7 @@ public class RLAgentManager
 		_farmAreas.release(event.getPlayer());
 		_buffs.release(event.getPlayer());
 		_progress.remove(event.getPlayer().getObjectId());
+		_deathsWithoutKill.remove(event.getPlayer().getObjectId());
 		final ScheduledFuture<?> task = _respawnTasks.remove(event.getPlayer().getObjectId());
 		if (task != null)
 		{
@@ -298,7 +302,18 @@ public class RLAgentManager
 		final Player player = event.getTarget().asPlayer();
 		if (isAgent(player))
 		{
+			_deathsWithoutKill.merge(player.getObjectId(), 1, Integer::sum);
 			_respawnTasks.put(player.getObjectId(), ThreadPool.schedule(() -> runSafely(player, "respawn", () -> respawn(player)), RLAgentEnvironmentConfig.RL_RESPAWN_DELAY));
+		}
+	};
+	
+	// Registered on the monsters' container: a monster's death does not reach the players' one.
+	private final Consumer<OnAttackableKill> _attackableKillEvent = event ->
+	{
+		final Player player = event.getAttacker();
+		if ((player != null) && isAgent(player))
+		{
+			_deathsWithoutKill.remove(player.getObjectId());
 		}
 	};
 	
@@ -309,6 +324,10 @@ public class RLAgentManager
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LOGOUT, _playerLogoutEvent, this));
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LEVEL_CHANGED, _playerLevelChangedEvent, this));
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_CREATURE_DEATH, _creatureDeathEvent, this));
+		if (RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS > 0)
+		{
+			Containers.Monsters().addListener(new ConsumerEventListener(Containers.Monsters(), EventType.ON_ATTACKABLE_KILL, _attackableKillEvent, this));
+		}
 		if (RLAgentEnvironmentConfig.RL_AUTO_SUMMON)
 		{
 			ThreadPool.scheduleAtFixedRate(this::ensureSummons, AUTO_SUMMON_INTERVAL, AUTO_SUMMON_INTERVAL);
@@ -719,11 +738,38 @@ public class RLAgentManager
 		player.doRevive();
 		clearDeathPenalty(player);
 		restoreVitals(player);
-		teleportToFarmZone(player);
+		if (!leaveDeathLoop(player))
+		{
+			teleportToFarmZone(player);
+		}
 		ensureWeapon(player);
 		supply(player);
 		_buffs.assign(player); // a new life, a new buff set
 		ensureSummon(player);
+	}
+	
+	/**
+	 * An agent that died RLDeathLoopDeaths times in a row without a kill goes to another farm area (respawned in place it would die there for the rest of the run).
+	 * @param player the revived agent
+	 * @return {@code true} when it was moved
+	 */
+	private boolean leaveDeathLoop(Player player)
+	{
+		final int deaths = _deathsWithoutKill.getOrDefault(player.getObjectId(), 0);
+		if ((RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS <= 0) || (deaths < RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS) || !RLAgentEnvironmentConfig.RL_FARM_AUTO)
+		{
+			return false;
+		}
+		
+		final Location destination = _farmAreas.relocate(player);
+		if (destination == null)
+		{
+			return false;
+		}
+		_deathsWithoutKill.remove(player.getObjectId());
+		LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ") died " + deaths + " times without a kill: moved to another farm area.");
+		teleportTo(player, destination);
+		return true;
 	}
 	
 	/** Removes the Death Penalty debuff an agent still carries (from before RLAgentDeathPenalty = False, or from a PvP death). */
