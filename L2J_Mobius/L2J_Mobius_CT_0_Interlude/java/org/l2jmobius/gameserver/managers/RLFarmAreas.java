@@ -39,6 +39,7 @@ import org.l2jmobius.gameserver.model.World;
 import org.l2jmobius.gameserver.model.actor.Npc;
 import org.l2jmobius.gameserver.model.actor.Player;
 import org.l2jmobius.gameserver.model.actor.enums.creature.Race;
+import org.l2jmobius.gameserver.model.actor.enums.player.PlayerClass;
 import org.l2jmobius.gameserver.model.actor.instance.Monster;
 import org.l2jmobius.gameserver.model.spawns.Spawn;
 
@@ -70,8 +71,9 @@ final class RLFarmAreas
 	 * @param amounts monster count per level
 	 * @param undeadAmounts undead monster count per level
 	 * @param maxLevel highest monster level
+	 * @param aggressiveShare share of the monsters that attack on sight, in %
 	 */
-	private record Area(String key, List<Spawn> spawns, Map<Integer, Integer> amounts, Map<Integer, Integer> undeadAmounts, int maxLevel)
+	private record Area(String key, List<Spawn> spawns, Map<Integer, Integer> amounts, Map<Integer, Integer> undeadAmounts, int maxLevel, int aggressiveShare)
 	{
 		/** Undead monsters fitting an undead hunter of {@code level} (a wider window below), 0 when the area does not suit it. */
 		int fittingUndead(int level)
@@ -141,6 +143,9 @@ final class RLFarmAreas
 	private final Map<String, Area> _byKey = new HashMap<>();
 	/** Agent object id -> key of its area. */
 	private final Map<Integer, String> _assignments = new ConcurrentHashMap<>();
+	/** Per agent: kills and deaths in its current area (RLPoorAreaDeaths). */
+	private final Map<Integer, Integer> _areaKills = new ConcurrentHashMap<>();
+	private final Map<Integer, Integer> _areaDeaths = new ConcurrentHashMap<>();
 	
 	/**
 	 * Picks the farm spot of an agent: its current area while that still suits its level, otherwise the least crowded suitable area.
@@ -157,19 +162,15 @@ final class RLFarmAreas
 		if (current != null)
 		{
 			final Area assigned = _byKey.get(current);
-			if ((assigned != null) && ((undead && (assigned.fittingUndead(level) > 0)) || (!undead && (assigned.fittingMonsters(level) > 0))))
+			if ((assigned != null) && (assigned.aggressiveShare() <= maxAggressive(player)) && ((undead && (assigned.fittingUndead(level) > 0)) || (!undead && (assigned.fittingMonsters(level) > 0))))
 			{
 				area = assigned;
 			}
 		}
 		
-		if ((area == null) && undead)
-		{
-			area = leastCrowded(level, player.getObjectId(), true, null);
-		}
 		if (area == null)
 		{
-			area = leastCrowded(level, player.getObjectId(), false, null);
+			area = pick(player, undead, null);
 		}
 		if (area == null)
 		{
@@ -205,11 +206,7 @@ final class RLFarmAreas
 		final int level = player.getLevel();
 		final boolean undead = RLAgentManager.buildOf(player) == RLAgentManager.Build.UNDEAD_MAGE;
 		final String current = _assignments.get(player.getObjectId());
-		Area area = undead ? leastCrowded(level, player.getObjectId(), true, current) : null;
-		if (area == null)
-		{
-			area = leastCrowded(level, player.getObjectId(), false, current);
-		}
+		final Area area = pick(player, undead, current);
 		if (area == null)
 		{
 			return null;
@@ -220,10 +217,12 @@ final class RLFarmAreas
 	}
 	
 	/** Logs an agent's move to another area (the K/D per area is read from these lines and the agents' episodes). */
-	private static void logAssignment(Player player, Area area, String previous)
+	private void logAssignment(Player player, Area area, String previous)
 	{
 		if (!area.key().equals(previous))
 		{
+			_areaKills.remove(player.getObjectId());
+			_areaDeaths.remove(player.getObjectId());
 			LOGGER.info(RLFarmAreas.class.getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ") assigned to " + area.key() + ".");
 		}
 	}
@@ -231,9 +230,59 @@ final class RLFarmAreas
 	void release(Player player)
 	{
 		_assignments.remove(player.getObjectId());
+		_areaKills.remove(player.getObjectId());
+		_areaDeaths.remove(player.getObjectId());
 	}
 	
-	private Area leastCrowded(int level, int objectId, boolean undead, String excluded)
+	void recordKill(Player player)
+	{
+		_areaKills.merge(player.getObjectId(), 1, Integer::sum);
+	}
+	
+	void recordDeath(Player player)
+	{
+		_areaDeaths.merge(player.getObjectId(), 1, Integer::sum);
+	}
+	
+	/**
+	 * @param player the agent
+	 * @return its kills/deaths in its area when these are too poor to stay there (RLPoorAreaDeaths, RLPoorAreaKD), else {@code null}
+	 */
+	String poorAreaRecord(Player player)
+	{
+		final int deaths = _areaDeaths.getOrDefault(player.getObjectId(), 0);
+		final int kills = _areaKills.getOrDefault(player.getObjectId(), 0);
+		final boolean poor = (RLAgentEnvironmentConfig.RL_POOR_AREA_DEATHS > 0) && !RLAgentEnvironmentConfig.RL_POOR_AREA_EXCLUDED_CLASSES.contains(player.getPlayerClass().getId()) && (deaths >= RLAgentEnvironmentConfig.RL_POOR_AREA_DEATHS) && (kills < (deaths * RLAgentEnvironmentConfig.RL_POOR_AREA_KD));
+		return poor ? kills + "/" + deaths : null;
+	}
+	
+	/** The share of aggressive monsters an agent's area may have: a mystic without a profession dies to them. */
+	private static int maxAggressive(Player player)
+	{
+		final PlayerClass playerClass = player.getPlayerClass();
+		return playerClass.isMage() && (playerClass.level() == 0) ? RLAgentEnvironmentConfig.RL_FARM_BASE_MYSTIC_MAX_AGGRESSIVE : 100;
+	}
+	
+	/** An area for the agent, without the excluded one: within its share of aggressive monsters first, then any; of undead first for an undead hunter. */
+	private Area pick(Player player, boolean undead, String excluded)
+	{
+		final int level = player.getLevel();
+		final int limit = maxAggressive(player);
+		Area area = null;
+		if (limit < 100)
+		{
+			area = undead ? leastCrowded(level, player.getObjectId(), true, excluded, limit) : null;
+			area = area != null ? area : leastCrowded(level, player.getObjectId(), false, excluded, limit);
+		}
+		if (area == null)
+		{
+			area = undead ? leastCrowded(level, player.getObjectId(), true, excluded, 100) : null;
+			area = area != null ? area : leastCrowded(level, player.getObjectId(), false, excluded, 100);
+		}
+		return area;
+	}
+	
+	private Area leastCrowded(int level, int objectId, boolean undead, String excluded, int maxAggressive)
 	{
 		final Map<String, Integer> crowd = new HashMap<>();
 		for (Map.Entry<Integer, String> entry : _assignments.entrySet())
@@ -252,7 +301,7 @@ final class RLFarmAreas
 		int totalWeight = 0;
 		for (Area area : areas())
 		{
-			if ((area.fitting(level, undead) == 0) || area.key().equals(excluded))
+			if ((area.fitting(level, undead) == 0) || area.key().equals(excluded) || (area.aggressiveShare() > maxAggressive))
 			{
 				continue;
 			}
@@ -434,17 +483,24 @@ final class RLFarmAreas
 			final Map<Integer, Integer> amounts = new HashMap<>();
 			final Map<Integer, Integer> undeadAmounts = new HashMap<>();
 			int maxLevel = 0;
+			int monsters = 0;
+			int aggressive = 0;
 			for (Spawn spawn : entry.getValue())
 			{
 				final int level = spawn.getTemplate().getLevel();
 				amounts.merge(level, Math.max(1, spawn.getAmount()), Integer::sum);
+				monsters += Math.max(1, spawn.getAmount());
+				if (spawn.getTemplate().isAggressive() && (spawn.getTemplate().getAggroRange() > 0))
+				{
+					aggressive += Math.max(1, spawn.getAmount());
+				}
 				if (spawn.getTemplate().getRace() == Race.UNDEAD)
 				{
 					undeadAmounts.merge(level, Math.max(1, spawn.getAmount()), Integer::sum);
 				}
 				maxLevel = Math.max(maxLevel, level);
 			}
-			areas.add(new Area(entry.getKey(), List.copyOf(entry.getValue()), Map.copyOf(amounts), Map.copyOf(undeadAmounts), maxLevel));
+			areas.add(new Area(entry.getKey(), List.copyOf(entry.getValue()), Map.copyOf(amounts), Map.copyOf(undeadAmounts), maxLevel, (aggressive * 100) / monsters));
 		}
 		
 		LOGGER.info(RLFarmAreas.class.getSimpleName() + ": " + areas.size() + " farm areas from monster spawns (" + skipped + " other spawns ignored), level window -" + RLAgentEnvironmentConfig.RL_FARM_LEVEL_BELOW + "/+" + RLAgentEnvironmentConfig.RL_FARM_LEVEL_ABOVE + ", " + RLAgentEnvironmentConfig.RL_FARM_MOBS_PER_AGENT + " monsters per agent.");

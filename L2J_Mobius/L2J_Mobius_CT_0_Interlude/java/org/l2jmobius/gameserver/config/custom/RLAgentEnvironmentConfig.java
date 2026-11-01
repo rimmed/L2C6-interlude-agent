@@ -123,6 +123,10 @@ public class RLAgentEnvironmentConfig
 	public static boolean RL_RESET_LEVEL_ON_LEVEL_UP;
 	public static int RL_STUCK_SECONDS;
 	public static int RL_DEATH_LOOP_DEATHS;
+	public static int RL_POOR_AREA_DEATHS;
+	public static double RL_POOR_AREA_KD;
+	public static Set<Integer> RL_POOR_AREA_EXCLUDED_CLASSES;
+	public static int RL_NO_EXP_SECONDS;
 	public static int RL_SKILL_ITEM_COUNT;
 	public static int RL_BEAST_SHOT_COUNT;
 	public static boolean RL_USE_BLESSED_SPIRITSHOTS;
@@ -140,6 +144,7 @@ public class RLAgentEnvironmentConfig
 	public static int RL_FARM_MIN_SHARE;
 	public static int RL_FARM_MIN_MONSTERS;
 	public static int RL_FARM_MOBS_PER_AGENT;
+	public static int RL_FARM_BASE_MYSTIC_MAX_AGGRESSIVE;
 	public static List<String> RL_FARM_EXCLUDED_SPAWN_FOLDERS;
 	public static Set<Integer> RL_FARM_EXCLUDED_MONSTERS;
 	/** Buff set name -> weight, in the configured order. */
@@ -236,6 +241,17 @@ public class RLAgentEnvironmentConfig
 		RL_RESET_LEVEL_ON_LEVEL_UP = config.getBoolean("RLResetLevelOnLevelUp", true);
 		RL_STUCK_SECONDS = Math.max(0, config.getInt("RLStuckRelocateSeconds", 0));
 		RL_DEATH_LOOP_DEATHS = Math.max(0, config.getInt("RLDeathLoopDeaths", 0));
+		RL_POOR_AREA_DEATHS = Math.max(0, config.getInt("RLPoorAreaDeaths", 0));
+		RL_POOR_AREA_KD = config.getDouble("RLPoorAreaKD", 5.0);
+		RL_POOR_AREA_EXCLUDED_CLASSES = new HashSet<>();
+		for (String id : config.getString("RLPoorAreaExcludedClasses", "").split(","))
+		{
+			if (!id.isBlank())
+			{
+				RL_POOR_AREA_EXCLUDED_CLASSES.add(Integer.parseInt(id.trim()));
+			}
+		}
+		RL_NO_EXP_SECONDS = Math.max(0, config.getInt("RLNoExpRelocateSeconds", 0));
 		RL_SKILL_ITEM_COUNT = config.getInt("RLSkillItemCount", 100);
 		RL_BEAST_SHOT_COUNT = config.getInt("RLBeastShotCount", 1000);
 		RL_USE_BLESSED_SPIRITSHOTS = config.getBoolean("RLUseBlessedSpiritshots", true);
@@ -251,6 +267,7 @@ public class RLAgentEnvironmentConfig
 		RL_FARM_MIN_SHARE = Math.min(100, Math.max(0, config.getInt("RLFarmMinShare", 70)));
 		RL_FARM_MIN_MONSTERS = Math.max(1, config.getInt("RLFarmMinMonsters", 4));
 		RL_FARM_MOBS_PER_AGENT = Math.max(1, config.getInt("RLFarmMobsPerAgent", 5));
+		RL_FARM_BASE_MYSTIC_MAX_AGGRESSIVE = config.getInt("RLFarmBaseMysticMaxAggressive", 100);
 		RL_FARM_EXCLUDED_SPAWN_FOLDERS = new ArrayList<>();
 		for (String folder : config.getString("RLFarmExcludedSpawnFolders", "Castles,Catacombs,SevenSigns").split(","))
 		{

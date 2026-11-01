@@ -227,6 +227,8 @@ public class RLAgentManager
 	private final Set<Integer> _inSetup = ConcurrentHashMap.newKeySet();
 	/** Per agent: x, y and experience at its last progress, and the time of it (RLStuckRelocateSeconds). */
 	private final Map<Integer, long[]> _progress = new ConcurrentHashMap<>();
+	/** Per agent: experience at its last gain, and the time of it (RLNoExpRelocateSeconds). */
+	private final Map<Integer, long[]> _expProgress = new ConcurrentHashMap<>();
 	/** Per agent: deaths since its last kill (RLDeathLoopDeaths). */
 	private final Map<Integer, Integer> _deathsWithoutKill = new ConcurrentHashMap<>();
 	
@@ -263,6 +265,7 @@ public class RLAgentManager
 		_farmAreas.release(event.getPlayer());
 		_buffs.release(event.getPlayer());
 		_progress.remove(event.getPlayer().getObjectId());
+		_expProgress.remove(event.getPlayer().getObjectId());
 		_deathsWithoutKill.remove(event.getPlayer().getObjectId());
 		final ScheduledFuture<?> task = _respawnTasks.remove(event.getPlayer().getObjectId());
 		if (task != null)
@@ -307,6 +310,7 @@ public class RLAgentManager
 		if (isAgent(player))
 		{
 			_deathsWithoutKill.merge(player.getObjectId(), 1, Integer::sum);
+			_farmAreas.recordDeath(player);
 			_respawnTasks.put(player.getObjectId(), ThreadPool.schedule(() -> runSafely(player, "respawn", () -> respawn(player)), RLAgentEnvironmentConfig.RL_RESPAWN_DELAY));
 		}
 	};
@@ -318,6 +322,7 @@ public class RLAgentManager
 		if ((player != null) && isAgent(player))
 		{
 			_deathsWithoutKill.remove(player.getObjectId());
+			_farmAreas.recordKill(player);
 		}
 	};
 	
@@ -328,7 +333,7 @@ public class RLAgentManager
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LOGOUT, _playerLogoutEvent, this));
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_PLAYER_LEVEL_CHANGED, _playerLevelChangedEvent, this));
 		_listenerContainer.addListener(new ConsumerEventListener(_listenerContainer, EventType.ON_CREATURE_DEATH, _creatureDeathEvent, this));
-		if (RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS > 0)
+		if ((RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS > 0) || (RLAgentEnvironmentConfig.RL_POOR_AREA_DEATHS > 0))
 		{
 			Containers.Monsters().addListener(new ConsumerEventListener(Containers.Monsters(), EventType.ON_ATTACKABLE_KILL, _attackableKillEvent, this));
 		}
@@ -742,7 +747,7 @@ public class RLAgentManager
 		player.doRevive();
 		clearDeathPenalty(player);
 		restoreVitals(player);
-		if (!leaveDeathLoop(player))
+		if (!leaveBadArea(player))
 		{
 			teleportToFarmZone(player);
 		}
@@ -753,14 +758,16 @@ public class RLAgentManager
 	}
 	
 	/**
-	 * An agent that died RLDeathLoopDeaths times in a row without a kill goes to another farm area (respawned in place it would die there for the rest of the run).
+	 * An agent that died RLDeathLoopDeaths times in a row without a kill, or that has a K/D below RLPoorAreaKD after RLPoorAreaDeaths deaths in its farm area, goes to another area (respawned in place it would go on dying there: between deaths it kills enough not to count as a death loop).
 	 * @param player the revived agent
 	 * @return {@code true} when it was moved
 	 */
-	private boolean leaveDeathLoop(Player player)
+	private boolean leaveBadArea(Player player)
 	{
 		final int deaths = _deathsWithoutKill.getOrDefault(player.getObjectId(), 0);
-		if ((RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS <= 0) || (deaths < RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS) || !RLAgentEnvironmentConfig.RL_FARM_AUTO)
+		final boolean deathLoop = (RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS > 0) && (deaths >= RLAgentEnvironmentConfig.RL_DEATH_LOOP_DEATHS);
+		final String poorRecord = _farmAreas.poorAreaRecord(player);
+		if ((!deathLoop && (poorRecord == null)) || !RLAgentEnvironmentConfig.RL_FARM_AUTO)
 		{
 			return false;
 		}
@@ -771,7 +778,7 @@ public class RLAgentManager
 			return false;
 		}
 		_deathsWithoutKill.remove(player.getObjectId());
-		LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ") died " + deaths + " times without a kill: moved to another farm area.");
+		LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ") " + (deathLoop ? "died " + deaths + " times without a kill" : "has kills/deaths " + poorRecord + " in its farm area") + ": moved to another one.");
 		teleportTo(player, destination);
 		return true;
 	}
@@ -1336,8 +1343,21 @@ public class RLAgentManager
 			runSafely(player, "stuck check", () ->
 			{
 				ensureWeapon(player);
+				// Walking counts as progress below, so an agent that walks around without ever hurting anything is caught by its experience.
+				final long[] gained = _expProgress.get(player.getObjectId());
+				if ((gained == null) || player.isDead() || player.isSitting() || (player.getExp() != gained[0]))
+				{
+					_expProgress.put(player.getObjectId(), new long[] { player.getExp(), now });
+				}
+				else if ((RLAgentEnvironmentConfig.RL_NO_EXP_SECONDS > 0) && ((now - gained[1]) >= (RLAgentEnvironmentConfig.RL_NO_EXP_SECONDS * 1000L)) && RLAgentEnvironmentConfig.RL_TELEPORT_TO_FARM_ZONE && RLAgentEnvironmentConfig.RL_FARM_AUTO)
+				{
+					moveStuck(player, "gained no experience for " + ((now - gained[1]) / 1000) + " s");
+					_expProgress.put(player.getObjectId(), new long[] { player.getExp(), now });
+					_progress.remove(player.getObjectId());
+					return;
+				}
 				final long[] last = _progress.get(player.getObjectId());
-				if ((last == null) || player.isDead() || (Math.hypot(player.getX() - last[0], player.getY() - last[1]) > STUCK_MOVE_DISTANCE) || (player.getExp() != last[2]))
+				if ((last == null) || player.isDead() || player.isSitting() || (Math.hypot(player.getX() - last[0], player.getY() - last[1]) > STUCK_MOVE_DISTANCE) || (player.getExp() != last[2]))
 				{
 					_progress.put(player.getObjectId(), new long[] { player.getX(), player.getY(), player.getExp(), now });
 					return;
@@ -1346,15 +1366,20 @@ public class RLAgentManager
 				{
 					return;
 				}
-				final Location spot = _farmAreas.relocate(player);
-				LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " made no progress for " + ((now - last[3]) / 1000) + " s at " + player.getX() + "," + player.getY() + "," + player.getZ() + (spot != null ? ", moved to " + spot : ", no other farm area") + ".");
-				if (spot != null)
-				{
-					player.setTarget(null);
-					teleportTo(player, spot);
-				}
+				moveStuck(player, "made no progress for " + ((now - last[3]) / 1000) + " s");
 				_progress.put(player.getObjectId(), new long[] { player.getX(), player.getY(), player.getExp(), now });
 			});
+		}
+	}
+	
+	private void moveStuck(Player player, String reason)
+	{
+		final Location spot = _farmAreas.relocate(player);
+		LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " " + reason + " at " + player.getX() + "," + player.getY() + "," + player.getZ() + (spot != null ? ", moved to " + spot : ", no other farm area") + ".");
+		if (spot != null)
+		{
+			player.setTarget(null);
+			teleportTo(player, spot);
 		}
 	}
 	
