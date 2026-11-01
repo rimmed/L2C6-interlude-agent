@@ -47,6 +47,7 @@ import org.l2jmobius.gameserver.model.item.type.MaterialType;
 import org.l2jmobius.gameserver.model.skill.Skill;
 import org.l2jmobius.gameserver.model.skill.holders.SkillHolder;
 import org.l2jmobius.gameserver.model.stats.functions.AbstractFunction;
+import org.l2jmobius.gameserver.model.stats.Stat;
 import org.l2jmobius.gameserver.model.stats.functions.FuncTemplate;
 import org.l2jmobius.gameserver.network.SystemMessageId;
 import org.l2jmobius.gameserver.network.serverpackets.SystemMessage;
@@ -636,6 +637,26 @@ public abstract class ItemTemplate extends ListenersContainer
 		}
 		
 		return funcs;
+	}
+	
+	/**
+	 * @param stat a stat
+	 * @return what this item adds to the stat before enchants and conditions (P. Atk., P. Def. ...)
+	 */
+	public double getBaseStat(Stat stat)
+	{
+		double value = 0;
+		if (_funcTemplates != null)
+		{
+			for (FuncTemplate template : _funcTemplates)
+			{
+				if (template.getStat() == stat)
+				{
+					value += template.getValue();
+				}
+			}
+		}
+		return value;
 	}
 	
 	/**

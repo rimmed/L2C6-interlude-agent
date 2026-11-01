@@ -25,6 +25,7 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.Comparator;
 import java.util.EnumMap;
 import java.util.HashMap;
 import java.util.HashSet;
@@ -82,6 +83,7 @@ import org.l2jmobius.gameserver.model.item.type.ArmorType;
 import org.l2jmobius.gameserver.model.item.type.CrystalType;
 import org.l2jmobius.gameserver.model.item.type.WeaponType;
 import org.l2jmobius.gameserver.model.skill.holders.SkillHolder;
+import org.l2jmobius.gameserver.model.stats.Stat;
 import org.l2jmobius.gameserver.network.GameClient;
 import org.l2jmobius.gameserver.network.clientpackets.CharacterCreate;
 import org.l2jmobius.gameserver.network.serverpackets.ExAutoSoulShot;
@@ -112,6 +114,8 @@ public class RLAgentManager
 	private static final String VAR_GEAR_ARCHETYPE = "RL_GEAR_ARCHETYPE";
 	/** The third of its grade's level range the agent's gear was picked for (see {@link #gearBand}). */
 	private static final String VAR_GEAR_BAND = "RL_GEAR_BAND";
+	/** Item id of the weapon of the agent's gear set (see {@link #ensureWeapon}). */
+	private static final String VAR_GEAR_WEAPON = "RL_GEAR_WEAPON";
 	/** Build of a support class (see {@link Build}). */
 	private static final String VAR_BUILD = "RL_BUILD";
 	/** The level an agent was created with; a level-up resets it to this level (RLResetLevelOnLevelUp). */
@@ -178,7 +182,7 @@ public class RLAgentManager
 	/** Raid boss jewelry is far above the gear of its grade: never part of an agent's set. */
 	private static final String[] BOSS_JEWELRY = { "Queen Ant", "Core", "Orfen", "Antharas", "Valakas", "Baium", "Zaken", "Frintezza" };
 	/** Bumped when the equipment rules change, so existing agents get a new set once (2: jewelry). */
-	private static final String GEAR_VERSION = "/3";
+	private static final String GEAR_VERSION = "/4";
 	
 	/** Equipment style of a class. */
 	private enum Archetype
@@ -1086,18 +1090,26 @@ public class RLAgentManager
 		
 		player.getVariables().set(VAR_GEAR_GRADE, grade.name());
 		player.getVariables().set(VAR_GEAR_BAND, gearBand(player.getLevel()));
+		player.getVariables().set(VAR_GEAR_WEAPON, weapon != null ? weapon.getId() : 0);
 		player.getVariables().set(VAR_GEAR_ARCHETYPE, archetypeFor(player).name() + GEAR_VERSION);
 		player.sendItemList(false);
 		player.broadcastUserInfo();
 	}
 	
 	/**
-	 * Gives an agent that lost its weapon (seen on ~5% of the fleet, cause unknown: the weapon lies unequipped in the inventory) a new gear set, and logs what it had to find the cause.
+	 * Gives an agent without the weapon of its gear set a new set, and logs what it had to find the cause: seen with an empty hand (the weapon unequipped in the inventory) and with a picked-up Club in the hand.
 	 * @param player the agent
 	 */
 	private void ensureWeapon(Player player)
 	{
-		if (!RLAgentEnvironmentConfig.RL_AUTO_EQUIP || player.isDead() || (player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_RHAND) != null))
+		// A cursed weapon replaces the agent's own one until it is gone.
+		if (!RLAgentEnvironmentConfig.RL_AUTO_EQUIP || player.isDead() || player.isCursedWeaponEquipped())
+		{
+			return;
+		}
+		final Item weapon = player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_RHAND);
+		final int expected = player.getVariables().getInt(VAR_GEAR_WEAPON, 0);
+		if ((weapon != null) && ((expected == 0) || (weapon.getId() == expected)))
 		{
 			return;
 		}
@@ -1109,7 +1121,7 @@ public class RLAgentManager
 				loose.append(loose.isEmpty() ? "" : ",").append(item.getId());
 			}
 		}
-		LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ", gear " + player.getVariables().getString(VAR_GEAR_GRADE, "-") + " " + player.getVariables().getString(VAR_GEAR_ARCHETYPE, "-") + ") has no weapon, unequipped weapons [" + loose + "]: new gear set.");
+		LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ", gear " + player.getVariables().getString(VAR_GEAR_GRADE, "-") + " " + player.getVariables().getString(VAR_GEAR_ARCHETYPE, "-") + ") " + (weapon == null ? "has no weapon" : "holds weapon " + weapon.getId() + " instead of " + expected) + ", unequipped weapons [" + loose + "]: new gear set.");
 		equip(player, gradeForLevel(player.getLevel()));
 	}
 	
@@ -1145,8 +1157,8 @@ public class RLAgentManager
 	}
 	
 	/**
-	 * The candidates that suit a position in the grade's level range, the rest after them: the pool sorted by price (the stronger, the dearer within a grade), a window of 30 % of it that moves from the
-	 * cheapest pieces at position 0 to the dearest ones at position 1.
+	 * The candidates that suit a position in the grade's level range, the rest after them: the pool sorted by strength (not by price: a dearer no-grade breastplate can have less P. Def.), a window of 30 % of it
+	 * that moves from the weakest pieces at position 0 to the strongest ones at position 1.
 	 * @param candidates the slot's candidates of the grade
 	 * @param position the level's position in the grade, 0 to 1
 	 * @return the window's candidates shuffled, then the others shuffled (tried when none of the window fits)
@@ -1154,7 +1166,7 @@ public class RLAgentManager
 	private static List<ItemTemplate> forLevel(List<ItemTemplate> candidates, double position)
 	{
 		final List<ItemTemplate> sorted = new ArrayList<>(candidates);
-		sorted.sort((a, b) -> Long.compare(a.getReferencePrice(), b.getReferencePrice()));
+		sorted.sort(Comparator.comparingDouble(RLAgentManager::strength).thenComparingLong(ItemTemplate::getReferencePrice));
 		final int size = sorted.size();
 		final int width = Math.min(size, Math.max(3, (int) Math.ceil(size * 0.3)));
 		final int from = (int) Math.round((size - width) * position);
@@ -1165,6 +1177,19 @@ public class RLAgentManager
 		Collections.shuffle(rest);
 		window.addAll(rest);
 		return window;
+	}
+	
+	/**
+	 * @param item a piece of gear
+	 * @return what makes it better: the attack of a weapon (M. Atk. of a magic one), the defences of the others
+	 */
+	private static double strength(ItemTemplate item)
+	{
+		if (item.isWeapon())
+		{
+			return item.getBaseStat(item.isMagicWeapon() ? Stat.MAGIC_ATTACK : Stat.POWER_ATTACK);
+		}
+		return item.getBaseStat(Stat.POWER_DEFENCE) + item.getBaseStat(Stat.MAGIC_DEFENCE) + item.getBaseStat(Stat.SHIELD_DEFENCE);
 	}
 	
 	/**
