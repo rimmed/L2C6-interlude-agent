@@ -4,3 +4,5 @@ __pycache__
 .vscode
 client_textures/
 archive/
+client_files/
+geodata_work/
