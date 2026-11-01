@@ -168,6 +168,7 @@ class Actor:
         #: decisions of the current fight with a living summon
         self.episode_pet_steps = 0
         self.episode_started = 0.0
+        self.episode_level = 0
         self.total_steps = 0
         self.totals = {"episodes": 0, "kills": 0, "deaths": 0, "transitions": 0, "return": 0.0}
 
@@ -200,7 +201,8 @@ class Actor:
         self.conn.enter_world()
         self.world = WorldState(self.encoder, self.conn.send, cfg.server_speed)
         self.executor = ActionExecutor(self.conn.send, self.world, self.encoder,
-                                       ExecutorConfig(), rng=self.rng)
+                                       ExecutorConfig(caster_classes=BASE_MYSTICS if cfg.nuke_only_base_mystics else frozenset()),
+                                       rng=self.rng)
 
         # 1) the character data; 2) the RL-environment setup (level boost, class transfer, gear,
         # farm-zone teleport) runs right after login - give it time to land before acting.
@@ -282,6 +284,7 @@ class Actor:
         try:
             self.connect()
             self.episode_started = time.time()
+            self.episode_level = self.world.char.level
             while not self._limit_reached():
                 self._pump(0.05)
                 self._tick(time.time())
@@ -420,8 +423,11 @@ class Actor:
                 "pet_share": round(self.episode_pet_steps / self.episode_step, 3),
                 "duration_s": round(time.time() - self.episode_started, 2),
                 "rest_s": round(self.executor.rest_s, 1),
+                "heals": self.executor.heals,
                 "mp_end": round(char.cur_mp / char.max_mp, 3) if char.max_mp else None,
-                "character": self.conn.character_name, "level": char.level, "class_id": char.class_id,
+                "attackers": sum(mob.get("attacking_me_until", 0.0) > time.time() for mob in char.radar.entries.values()),
+                # The lower one: a kill that levels up ends a fight on the next level, and the reset to the base level comes after the next fight began.
+                "character": self.conn.character_name, "level": min(self.episode_level, char.level), "class_id": char.class_id,
                 "t": round(time.time(), 1),
             }
             self.episodes_path.parent.mkdir(parents=True, exist_ok=True)
@@ -439,7 +445,9 @@ class Actor:
         self.episode_target_ranks = {}
         self.episode_pet_steps = 0
         self.episode_started = time.time()
+        self.episode_level = self.world.char.level
         self.executor.rest_s = 0.0
+        self.executor.heals = 0
         self.encoder.reset_session()
 
     def stop(self) -> None:

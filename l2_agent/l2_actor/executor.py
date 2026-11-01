@@ -58,8 +58,13 @@ class ExecutorConfig:
     cooldown_sync_s: float = 1.0
     #: sit down out of combat below this share of MP ...
     rest_mp: float = 0.3
+    #: ... of MP for these classes: they fight with nukes only, and a fight started low on MP is lost far more often
+    rest_mp_caster: float = 0.5
+    caster_classes: frozenset[int] = frozenset()
     #: ... or of HP ...
     rest_hp: float = 0.4
+    #: ... ask for a full restore (.heal) once seated, again after this time when it did not come ...
+    rest_heal_retry_s: float = 2.0
     #: ... and stand up when both are back at this share (or when attacked)
     rest_until: float = 0.95
     #: re-send the sit / stand toggle when ChangeWaitType did not come in this time
@@ -103,7 +108,10 @@ class ActionExecutor:
         self._toggle_at = 0.0
         #: real time spent resting in the current fight (episode statistics)
         self.rest_s = 0.0
+        #: times the character asked for .heal in the current fight (episode statistics)
+        self.heals = 0
         self._rest_tick = 0.0
+        self._heal_at = 0.0
 
     # ------------------------------------------------------------------
     # Gating
@@ -119,17 +127,22 @@ class ActionExecutor:
 
     def rest(self, now: float) -> bool:
         """
-        Sit down to regenerate when MP or HP is low out of combat; stand up when both are nearly full or a
-        monster attacks. Scripted like the buff potions. ``True`` while the character rests: no decision then.
+        Sit down when MP or HP is low out of combat, restore both with .heal and stand up; stand up as well when
+        a monster attacks. Scripted like the buff potions. ``True`` while the character rests: no decision then.
         """
         world, char, cfg = self.world, self.world.char, self.cfg
         attacked = any(mob.get("attacking_me_until", 0.0) > now for mob in char.radar.entries.values())
         mp = char.cur_mp / char.max_mp if char.max_mp else 1.0
         hp = char.cur_hp / char.max_hp if char.max_hp else 1.0
+        rest_mp = cfg.rest_mp_caster if char.class_id in cfg.caster_classes else cfg.rest_mp
         if world.sitting:
             self.rest_s += now - self._rest_tick if self._rest_tick else 0.0
             self._rest_tick = now
             if not attacked and (mp < cfg.rest_until or hp < cfg.rest_until):
+                if now - self._heal_at >= cfg.rest_heal_retry_s:
+                    self._send(packets.build_say2(".heal"))
+                    self._heal_at = now
+                    self.heals += 1
                 return True
             if now - self._toggle_at >= cfg.rest_retry_s:
                 self._send(packets.build_request_action_use(0))  # 0 = sit / stand
@@ -137,8 +150,8 @@ class ActionExecutor:
             return True  # until ChangeWaitType says it stands
         self._rest_tick = 0.0
         if now - self._toggle_at < cfg.rest_retry_s:
-            return now - self._toggle_at < 1.0 and (mp < cfg.rest_mp or hp < cfg.rest_hp)  # a sit on its way
-        if attacked or world.target_alive or self.busy(now) or (mp >= cfg.rest_mp and hp >= cfg.rest_hp):
+            return now - self._toggle_at < 1.0 and (mp < rest_mp or hp < cfg.rest_hp)  # a sit on its way
+        if attacked or world.target_alive() or self.busy(now) or (mp >= rest_mp and hp >= cfg.rest_hp):
             return False
         self._send(packets.build_request_action_use(0))
         self._toggle_at = now
