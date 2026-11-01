@@ -91,6 +91,8 @@ class Episodes:
         self.skills: dict[int, list] = defaultdict(lambda: [0, defaultdict(int)])
         #: character -> [kills, deaths, class id, level] (class and level of its latest fight)
         self.by_char: dict[str, list] = defaultdict(lambda: [0, 0, -1, 0])
+        #: level range -> character -> [kills, deaths, class id, level] of its fights in that range
+        self.by_level_char: dict[str, dict[str, list]] = defaultdict(lambda: defaultdict(lambda: [0, 0, -1, 0]))
 
     def update(self) -> None:
         for file in sorted(self.directory.glob("episodes_*.jsonl")):
@@ -118,9 +120,9 @@ class Episodes:
             row = table[key]
             row[0 if kill else 1] += 1
             row[2].add(character)
-        char = self.by_char[character]
-        char[0 if kill else 1] += 1
-        char[2], char[3] = class_id, level
+        for char in (self.by_char[character], self.by_level_char[level_range(level)][character]):
+            char[0 if kill else 1] += 1
+            char[2], char[3] = class_id, level
         if "t" in record:
             self.timed.append((float(record["t"]), class_id, level, kill))
         if record.get("actions") is not None:
@@ -277,11 +279,12 @@ class Dashboard:
         def kd(kills: int, deaths: int) -> float | None:
             return kills / deaths if deaths else None
 
-        def members(names: set) -> list[dict]:
+        def members(names: set, stats: dict[str, list] = e.by_char) -> list[dict]:
             out = []
             for name in names:
-                k, d, _, lv = e.by_char[name]
-                out.append({"name": name, "level": lv, "kills": k, "deaths": d, "kd": kd(k, d)})
+                k, d, c, lv = stats[name]
+                out.append({"name": name, "class": self.names.get(c, f"class {c}"), "level": lv, "kills": k, "deaths": d,
+                            "kd": kd(k, d)})
             return sorted(out, key=lambda m: (m["kd"] is None, -(m["kd"] or 0)))
 
         classes = [{"tier": self.tiers.get(c), "name": self.names.get(c, f"class {c}"), "chars": len(r[2]), "kills": r[0], "deaths": r[1],
@@ -289,7 +292,7 @@ class Dashboard:
                     "members": members(r[2])}
                    for c, r in e.by_class.items()]
         levels = [{"name": lv, "chars": len(r[2]), "kills": r[0], "deaths": r[1], "kd": kd(r[0], r[1]),
-                   "recent_kd": kd(*recent_level[lv]) if lv in recent_level else None}
+                   "recent_kd": kd(*recent_level[lv]) if lv in recent_level else None, "members": members(r[2], e.by_level_char[lv])}
                   for lv, r in sorted(e.by_level.items())]
         actions = []
         for c, (fights, counts) in e.actions.items():
@@ -471,7 +474,7 @@ PAGE = r"""<!doctype html>
     <div class="card"><h2>Policy lag and entropy</h2><div class="legend" id="lg-rho"></div><svg id="ch-rho"></svg></div>
     <div class="card"><h2>Throughput</h2><div class="legend" id="lg-speed"></div><svg id="ch-speed"></svg></div>
     <div class="card wide"><h2>K/D by class <span class="muted" id="recentNote"></span></h2><div class="scroll"><table id="t-class"></table></div></div>
-    <div class="card"><h2>K/D by level</h2><table id="t-level"></table></div>
+    <div class="card"><h2>K/D by level</h2><div class="scroll"><table id="t-level"></table></div></div>
     <div class="card"><h2>Fights in this fleet directory</h2><div id="totals"></div></div>
     <div class="card wide"><h2>Actions per class (share of decisions, %)</h2><div class="scroll"><table id="t-actions"></table></div></div>
     <div class="card wide"><h2>Skills per class (share of casts)</h2><div class="scroll"><table id="t-skills"></table></div></div>
@@ -631,7 +634,9 @@ function render(s) {
   table("t-class", [{key: "tier", label: "prof", f: v => v ?? "–"}, ...kdCols], fi.classes, {key: "name", dir: 1}, r =>
     `<table class="members"><tr><th>character</th><th>level</th><th>kills</th><th>deaths</th><th>K/D</th></tr>`
     + r.members.map(m => `<tr><td>${m.name}</td><td>${m.level}</td><td>${int(m.kills)}</td><td>${int(m.deaths)}</td><td>${fmt(m.kd)}</td></tr>`).join("") + "</table>");
-  table("t-level", [{...kdCols[0], label: "levels"}, ...kdCols.slice(1)], fi.levels, {key: "name", dir: 1});
+  table("t-level", [{...kdCols[0], label: "levels"}, ...kdCols.slice(1)], fi.levels, {key: "name", dir: 1}, r =>
+    `<table class="members"><tr><th>character</th><th>class</th><th>level</th><th>kills</th><th>deaths</th><th>K/D</th></tr>`
+    + r.members.map(m => `<tr><td>${m.name}</td><td>${m.class}</td><td>${m.level}</td><td>${int(m.kills)}</td><td>${int(m.deaths)}</td><td>${fmt(m.kd)}</td></tr>`).join("") + "</table>");
   $("totals").innerHTML = `<table><tr><td>fights</td><td>${int(fi.total.fights)}</td></tr><tr><td>kills</td><td>${int(fi.total.kills)}</td></tr>`
     + `<tr><td>deaths</td><td>${int(fi.total.deaths)}</td></tr><tr><td>K/D</td><td>${fmt(fi.total.kd)}</td></tr></table>`;
   if (!fi.actions.length) {
