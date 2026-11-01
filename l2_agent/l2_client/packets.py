@@ -518,6 +518,24 @@ def parse_user_info(body: bytes) -> dict:
     return info
 
 
+def _parse_item(body: bytes, pos: int) -> tuple[dict, int]:
+    """One item of ItemList / InventoryUpdate (32 bytes) at ``pos``; returns it and the position after it."""
+    item = {}
+    item['type1'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
+    item['object_id'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
+    item['item_id'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
+    item['count'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
+    item['type2'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
+    item['custom_type1'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
+    item['equipped'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
+    item['body_part'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
+    item['enchant'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
+    item['custom_type2'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
+    item['augmentation_bonus'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
+    item['mana'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
+    return item, pos
+
+
 def parse_item_list(body: bytes) -> dict:
     """Parse ItemList (0x1B) -- inventory contents."""
     if len(body) < 5:
@@ -529,21 +547,26 @@ def parse_item_list(body: bytes) -> dict:
     for _ in range(item_count):
         if pos + 32 > len(body):
             break
-        item = {}
-        item['type1'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
-        item['object_id'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
-        item['item_id'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
-        item['count'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
-        item['type2'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
-        item['custom_type1'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
-        item['equipped'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
-        item['body_part'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
-        item['enchant'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
-        item['custom_type2'] = struct.unpack_from("<H", body, pos)[0]; pos += 2
-        item['augmentation_bonus'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
-        item['mana'] = struct.unpack_from("<i", body, pos)[0]; pos += 4
+        item, pos = _parse_item(body, pos)
         items.append(item)
     return {"show_window": show_window != 0, "items": items}
+
+
+def parse_inventory_update(body: bytes) -> list[dict]:
+    """Parse InventoryUpdate (0x27): the changed items, each with ``change`` 1 = added, 2 = modified, 3 = removed."""
+    if len(body) < 3:
+        return []
+    pos = 1
+    count = struct.unpack_from("<H", body, pos)[0]; pos += 2
+    items = []
+    for _ in range(count):
+        if pos + 34 > len(body):
+            break
+        change = struct.unpack_from("<H", body, pos)[0]; pos += 2
+        item, pos = _parse_item(body, pos)
+        item['change'] = change
+        items.append(item)
+    return items
 
 
 def parse_skill_list(body: bytes) -> dict:

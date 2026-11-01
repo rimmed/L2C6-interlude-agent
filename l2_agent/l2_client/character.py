@@ -186,6 +186,20 @@ class L2Character:
         """Store items from a parsed ItemList (0x1B) dict."""
         self.items = pl.get("items", [])
 
+    def apply_inventory_update(self, changes: list[dict]):
+        """
+        Apply an InventoryUpdate (0x27): a used-up potion stack leaves the list, so its object id (which the
+        server may give to a new item, e.g. a picked-up weapon) is never used again.
+        """
+        by_id = {item["object_id"]: item for item in self.items}
+        for change in changes:
+            item = {key: value for key, value in change.items() if key != "change"}
+            if change["change"] == 3:
+                by_id.pop(item["object_id"], None)
+            else:
+                by_id[item["object_id"]] = item
+        self.items = list(by_id.values())
+
     def apply_skill_list(self, sl: dict):
         """Store skills from a parsed SkillList (0x58) dict."""
         self.skills = sl.get("skills", [])

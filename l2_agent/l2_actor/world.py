@@ -212,6 +212,9 @@ class WorldState:
             char.apply_item_list(packets.parse_item_list(body))
             self.has_items = True
 
+        elif pid == GameServerPacket.INVENTORY_UPDATE:
+            char.apply_inventory_update(packets.parse_inventory_update(body))
+
         elif pid == GameServerPacket.SKILL_LIST:
             char.apply_skill_list(packets.parse_skill_list(body))
             self.has_skills = True
