@@ -67,11 +67,10 @@ log = logging.getLogger("l2_actor")
 AGENT_ROOT = Path(__file__).resolve().parents[1]
 DATAPACK = AGENT_ROOT.parent / "L2J_Mobius" / "L2J_Mobius_CT_0_Interlude" / "dist" / "game" / "data" / "stats"
 
-#: Human, Elven and Dark Mystic (levels 1-19), the weak bracket of K/D: lives in which a base mystic cast only
-#: heals, cures and debuffs ended in a death 78% of the time (4% with only nukes), and early in a run it hits with
-#: its staff a quarter of the time - the support players of the BC data play so. Heal, Cure Poison, Group Heal,
-#: Might, Curse: Weakness, Curse: Poison and Wind Shackle are left off its panel, and it does not hit with its
-#: weapon nor switch from a live target while it can cast an attack spell.
+#: Human, Elven and Dark Mystic (levels 1-19), the weak bracket of K/D: with MP to spare they hit with the staff in
+#: 30% of their actions and cast in 12% (K/D 1.1 at levels 10-19 against 16.8 of the fighters; 2.0 with these rules).
+#: Heal, Cure Poison, Group Heal, Might, Curse: Weakness, Curse: Poison and Wind Shackle are left off the panel, and
+#: a base mystic does not hit with its weapon nor switch from a live target while it can cast an attack spell.
 BASE_MYSTICS = frozenset((10, 25, 38))
 _BASE_MYSTIC_SUPPORT = frozenset((1011, 1012, 1027, 1068, 1164, 1168, 1206))
 BASE_MYSTIC_EXCLUDED_SKILLS = dict.fromkeys(BASE_MYSTICS, _BASE_MYSTIC_SUPPORT)
@@ -112,7 +111,7 @@ class ActorConfig:
     #: sit down to regenerate when low on MP / HP out of combat (ExecutorConfig.rest_*)
     rest: bool = True
     #: base mystics cast no heals / cures / debuffs (BASE_MYSTIC_EXCLUDED_SKILLS) and nuke instead of meleeing
-    nuke_only_base_mystics: bool = False
+    nuke_only_base_mystics: bool = True
     #: onnxruntime threads of the model (``None`` = all cores; ``l2_actor.fleet`` uses 1)
     threads: int | None = None
 

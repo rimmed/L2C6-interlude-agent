@@ -211,7 +211,7 @@ class CombatPolicy:
         :param class_excluded_skills: class id -> skill ids never offered to that class, on top of
             ``excluded_skills``
         :param caster_classes: classes that do not hit with their weapon and keep their live target while an
-            attack spell is usable (a monster hitting them can still be picked)
+            attack spell is usable (from a target that does not hit them, a monster hitting them can still be picked)
         :param threads: onnxruntime intra-op threads (``None`` = its default, one per core); many
             actors in one process need 1, or every session starts a pool of all cores
         """
@@ -564,7 +564,7 @@ class CombatPolicy:
         valid = {
             "moved": True,
             # a caster keeps nuking its target instead of switching (each cast is one decision, at x5 a lost one)
-            "selected_target": has_mobs and not (caster_with_spell and target_alive and not attackers),
+            "selected_target": has_mobs and not (caster_with_spell and target_alive and on_attacker),
             "attacked": (target_alive or has_mobs) and on_attacker and not caster_with_spell,
             "used_skill": bool(usable_slots) and (target_alive or has_mobs),
             "picked_up": has_loot,
