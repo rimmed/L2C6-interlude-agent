@@ -16,7 +16,8 @@ This process:
 4. publishes the policy to Redis (ONNX + metadata, a new version) every ``--publish-interval`` seconds,
    exported in a child process so learning does not stop for the export;
 5. logs to ``<save-dir>/metrics.jsonl`` and keeps ``latest.pth`` / ``best.pth`` (best = highest reward
-   per 100 steps over the latest segments; an episode is one life, so lives vary a lot in length). The checkpoints have the layout of
+   per 100 steps over the latest segments; an episode is one life, so lives vary a lot in length) and
+   ``best_kd.pth`` (highest K/D over the latest ``--kd-window`` segments). The checkpoints have the layout of
    ``train.py``'s, so ``export_onnx.py`` exports them as well.
 
 The probability of one decision is a product over the heads (``l2_client.policy.CombatPolicy.act``):
@@ -137,6 +138,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     g.add_argument("--save-every", type=int, default=500, help="Write latest.pth every N updates")
     g.add_argument("--log-every", type=int, default=20)
     g.add_argument("--return-window", type=int, default=100, help="Lives in the mean return per life (logged)")
+    g.add_argument("--kd-window", type=int, default=20000,
+                   help="Latest segments in the K/D that picks best_kd.pth (800 actors send ~2000 a minute)")
     return p.parse_args(argv)
 
 
@@ -438,13 +441,17 @@ class Trainer:
 
         self.update = 0
         self.best_return = -math.inf
+        self.best_kd = -math.inf
         self.returns: deque[float] = deque(maxlen=args.return_window)
+        #: (kills, deaths) of the latest segments: the K/D of the current policy, not of the whole run
+        self._kd_window: deque[tuple[int, int]] = deque(maxlen=args.kd_window)
         self.totals = {"segments": 0, "steps": 0, "episodes": 0, "kills": 0, "deaths": 0, "trained_steps": 0,
                        "stale_dropped": 0}
         if args.resume:
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             rl = checkpoint["rl_state"]
             self.update, self.best_return = rl["update"], rl["best_return"]
+            self.best_kd = rl.get("best_kd", -math.inf)
             self.returns.extend(rl["returns"])
             self.totals.update(rl["totals"])
             print(f"Resumed {source} at update {self.update}")
@@ -507,6 +514,7 @@ class Trainer:
         key = (str(h.get("actor_id")), int(h.get("episode_id", -1)))
         total = self._episode_returns.pop(key, 0.0) + float(rewards.sum())
         reason = h.get("done_reason")
+        self._kd_window.append((int(h.get("kills", 0)), int(reason == "death")))
         if reason is None:
             self._episode_returns[key] = total
             return
@@ -519,6 +527,11 @@ class Trainer:
         reward = sum(r for r, _ in self._reward_window)
         steps = sum(n for _, n in self._reward_window)
         return 100.0 * reward / steps if steps else math.nan
+
+    def window_kd(self) -> float:
+        kills = sum(k for k, _ in self._kd_window)
+        deaths = sum(d for _, d in self._kd_window)
+        return kills / deaths if deaths else math.nan
 
     # -- learning ------------------------------------------------------------------------
 
@@ -574,7 +587,8 @@ class Trainer:
             "val_metrics": None,
             "split": None,
             "rl_args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(self.args).items()},
-            "rl_state": {"update": self.update, "best_return": self.best_return, "returns": list(self.returns),
+            "rl_state": {"update": self.update, "best_return": self.best_return, "best_kd": self.best_kd,
+                         "returns": list(self.returns),
                          "totals": dict(self.totals), "model_version": self.version},
         }
 
@@ -651,6 +665,12 @@ class Trainer:
                         self.best_return = score
                         self.save("best.pth")
                         print(f"New best reward per 100 steps {score:+.3f} -> best.pth", flush=True)
+                    kd = self.window_kd()
+                    if len(self._kd_window) == self._kd_window.maxlen and kd > self.best_kd:
+                        self.best_kd = kd
+                        self.save("best_kd.pth")
+                        print(f"New best K/D over the latest {len(self._kd_window)} segments {kd:.2f} -> best_kd.pth",
+                              flush=True)
         except KeyboardInterrupt:
             print("Interrupted", flush=True)
         finally:
@@ -667,7 +687,7 @@ class Trainer:
             "updates_per_s": len(window) / max(seconds, 1e-9), "buffer_steps": self.buffer.steps,
             "queue": self.incoming.qsize(), "replay_ratio": self.totals["trained_steps"] / max(1, self.totals["steps"]),
             "mean_return": self.mean_return(), "reward_per_100_steps": self.reward_per_100_steps(),
-            "lr": self.optimizer.param_groups[0]["lr"],
+            "window_kd": self.window_kd(), "lr":self.optimizer.param_groups[0]["lr"],
             **self.totals, **avg,
         }
         with self.metrics_path.open("a", encoding="utf-8") as fh:
@@ -679,6 +699,7 @@ class Trainer:
             f"rho {avg['rho_mean']:.2f} ({avg['rho_far']:.0%} far) | "
             f"buf {self.buffer.steps} recv {self.totals['steps']} ratio {record['replay_ratio']:.1f} | "
             f"lives {self.totals['episodes']} K/D {self.totals['kills']}/{self.totals['deaths']} "
+            f"(latest {record['window_kd']:.2f}) "
             f"R/life {record['mean_return']:+.3f} R/100 {record['reward_per_100_steps']:+.3f} | "
             f"{record['updates_per_s']:.1f} upd/s",
             flush=True,
