@@ -188,7 +188,9 @@ def recv_packet(sock: socket.socket) -> bytes:
     :returns: raw packet body (without the 2-byte length header)
     """
     h = sock.recv(2)
-    if not h or len(h) != 2:
+    if len(h) == 1:  # TCP may split the header too
+        h += sock.recv(1)
+    if len(h) != 2:
         raise ConnectionError("recv header")
     sz = struct.unpack_from("<H", h)[0]
     p = bytearray()
