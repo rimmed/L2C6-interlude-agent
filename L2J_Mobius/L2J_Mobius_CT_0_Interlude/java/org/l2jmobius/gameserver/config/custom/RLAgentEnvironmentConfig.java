@@ -107,6 +107,7 @@ public class RLAgentEnvironmentConfig
 	public static double RL_LEVEL_STDDEV;
 	public static boolean RL_CLASS_BALANCE;
 	public static double[] RL_CLASS_BALANCE_WEIGHTS;
+	public static Set<Integer> RL_EXCLUDED_CLASSES;
 	public static boolean RL_AUTO_SUMMON;
 	public static Set<Integer> RL_AUTO_SUMMON_EXCLUDED;
 	public static Map<Integer, List<Integer>> RL_AUTO_SUMMON_PREFERRED;
@@ -214,6 +215,14 @@ public class RLAgentEnvironmentConfig
 		for (int i = 0; i < 4; i++)
 		{
 			RL_CLASS_BALANCE_WEIGHTS[i] = i < weights.length ? Math.max(0, Double.parseDouble(weights[i].trim())) : 1;
+		}
+		RL_EXCLUDED_CLASSES = new HashSet<>();
+		for (String id : config.getString("RLExcludedClasses", "").split(","))
+		{
+			if (!id.isBlank())
+			{
+				RL_EXCLUDED_CLASSES.add(Integer.parseInt(id.trim()));
+			}
 		}
 		RL_AUTO_LEARN_SKILLS = config.getBoolean("RLAutoLearnSkills", true);
 		RL_AUTO_CLASS_TRANSFER = config.getBoolean("RLAutoClassTransfer", true);

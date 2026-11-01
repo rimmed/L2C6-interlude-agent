@@ -109,6 +109,8 @@ public class RLAgentManager
 	private static final String VAR_GEAR_GRADE = "RL_GEAR_GRADE";
 	/** Archetype of the equipment set given last, so a changed weapon rule re-equips existing agents. */
 	private static final String VAR_GEAR_ARCHETYPE = "RL_GEAR_ARCHETYPE";
+	/** The third of its grade's level range the agent's gear was picked for (see {@link #gearBand}). */
+	private static final String VAR_GEAR_BAND = "RL_GEAR_BAND";
 	/** Build of a support class (see {@link Build}). */
 	private static final String VAR_BUILD = "RL_BUILD";
 	/** The level an agent was created with; a level-up resets it to this level (RLResetLevelOnLevelUp). */
@@ -175,7 +177,7 @@ public class RLAgentManager
 	/** Raid boss jewelry is far above the gear of its grade: never part of an agent's set. */
 	private static final String[] BOSS_JEWELRY = { "Queen Ant", "Core", "Orfen", "Antharas", "Valakas", "Baium", "Zaken", "Frintezza" };
 	/** Bumped when the equipment rules change, so existing agents get a new set once (2: jewelry). */
-	private static final String GEAR_VERSION = "/2";
+	private static final String GEAR_VERSION = "/3";
 	
 	/** Equipment style of a class. */
 	private enum Archetype
@@ -372,6 +374,44 @@ public class RLAgentManager
 	// --------------------------------------------------------------------------------
 	
 	/**
+	 * Deletes the account's characters of an excluded class (RLExcludedClasses), so that the account gets a new character right away.
+	 * @param account the agent account
+	 */
+	private void deleteExcludedCharacters(String account)
+	{
+		if (RLAgentEnvironmentConfig.RL_EXCLUDED_CLASSES.isEmpty())
+		{
+			return;
+		}
+		final List<int[]> excluded = new ArrayList<>();
+		try (Connection con = DatabaseFactory.getConnection();
+			PreparedStatement ps = con.prepareStatement("SELECT charId, classid FROM characters WHERE account_name=?"))
+		{
+			ps.setString(1, account);
+			try (ResultSet rs = ps.executeQuery())
+			{
+				while (rs.next())
+				{
+					if (RLAgentEnvironmentConfig.RL_EXCLUDED_CLASSES.contains(rs.getInt("classid")))
+					{
+						excluded.add(new int[] { rs.getInt("charId"), rs.getInt("classid") });
+					}
+				}
+			}
+		}
+		catch (Exception e)
+		{
+			LOGGER.warning(getClass().getSimpleName() + ": Could not read the characters of " + account + ": " + e);
+			return;
+		}
+		for (int[] character : excluded)
+		{
+			LOGGER.info(getClass().getSimpleName() + ": Deleting " + CharInfoTable.getInstance().getNameById(character[0]) + " of " + account + ", excluded class " + PlayerClass.getPlayerClass(character[1]) + ".");
+			GameClient.deleteCharByObjId(character[0]);
+		}
+	}
+	
+	/**
 	 * Called right before the character list is sent to a freshly authenticated client: an agent account without characters gets a random one, so a headless client can select slot 0 immediately.
 	 * @param client the authenticated client
 	 */
@@ -382,11 +422,12 @@ public class RLAgentManager
 		{
 			return;
 		}
+		deleteExcludedCharacters(account);
 		
 		final List<PlayerClass> baseClasses = new ArrayList<>();
 		for (PlayerClass playerClass : PlayerClass.values())
 		{
-			if ((playerClass.level() == 0) && isRaceAllowed(playerClass) && (PlayerTemplateData.getInstance().getTemplate(playerClass) != null))
+			if ((playerClass.level() == 0) && isRaceAllowed(playerClass) && !RLAgentEnvironmentConfig.RL_EXCLUDED_CLASSES.contains(playerClass.getId()) && (PlayerTemplateData.getInstance().getTemplate(playerClass) != null))
 			{
 				baseClasses.add(playerClass);
 			}
@@ -468,7 +509,7 @@ public class RLAgentManager
 		double lowest = Double.MAX_VALUE;
 		for (PlayerClass playerClass : PlayerClass.values())
 		{
-			if ((playerClass.level() >= PROFESSION_LEVELS.length) || !baseClasses.contains(playerClass.getRootClass()) || !professionReachable(playerClass.level()))
+			if ((playerClass.level() >= PROFESSION_LEVELS.length) || !baseClasses.contains(playerClass.getRootClass()) || RLAgentEnvironmentConfig.RL_EXCLUDED_CLASSES.contains(playerClass.getId()) || !professionReachable(playerClass.level()))
 			{
 				continue;
 			}
@@ -658,7 +699,7 @@ public class RLAgentManager
 		{
 			final CrystalType grade = gradeForLevel(player.getLevel());
 			final String archetype = archetypeFor(player).name() + GEAR_VERSION;
-			if (forceEquip || !grade.name().equals(player.getVariables().getString(VAR_GEAR_GRADE, "")) || !archetype.equals(player.getVariables().getString(VAR_GEAR_ARCHETYPE, "")))
+			if (forceEquip || !grade.name().equals(player.getVariables().getString(VAR_GEAR_GRADE, "")) || !archetype.equals(player.getVariables().getString(VAR_GEAR_ARCHETYPE, "")) || (gearBand(player.getLevel()) != player.getVariables().getInt(VAR_GEAR_BAND, -1)))
 			{
 				equip(player, grade);
 			}
@@ -724,6 +765,11 @@ public class RLAgentManager
 			if (options.isEmpty())
 			{
 				break;
+			}
+			// Not into an excluded class (RLExcludedClasses) while the class has another way.
+			if (options.stream().anyMatch(option -> !RLAgentEnvironmentConfig.RL_EXCLUDED_CLASSES.contains(option.getId())))
+			{
+				options.removeIf(option -> RLAgentEnvironmentConfig.RL_EXCLUDED_CLASSES.contains(option.getId()));
 			}
 			
 			// An agent created for a class (RLClassBalance) goes the way to it; any other one takes a random branch.
@@ -970,27 +1016,30 @@ public class RLAgentManager
 			}
 		}
 		
-		final Item weapon = equipFirstFitting(player, pool.weapons());
+		// Within the grade the gear follows the level: the weakest pieces at its first levels, the best at its last.
+		final double position = gradePosition(player.getLevel());
+		final Item weapon = equipFirstFitting(player, forLevel(pool.weapons(), position));
 		if ((weapon == null) || (weapon.getTemplate().getBodyPart() != BodyPart.LR_HAND))
 		{
-			equipFirstFitting(player, pool.shields());
+			equipFirstFitting(player, forLevel(pool.shields(), position));
 		}
-		equipFirstFitting(player, pool.helmets());
-		equipFirstFitting(player, pool.gloves());
-		equipFirstFitting(player, pool.boots());
-		final Item body = equipFirstFitting(player, pool.bodies());
+		equipFirstFitting(player, forLevel(pool.helmets(), position));
+		equipFirstFitting(player, forLevel(pool.gloves(), position));
+		equipFirstFitting(player, forLevel(pool.boots(), position));
+		final Item body = equipFirstFitting(player, forLevel(pool.bodies(), position));
 		if ((body == null) || (body.getTemplate().getBodyPart() != BodyPart.FULL_ARMOR))
 		{
-			equipFirstFitting(player, pool.legs());
+			equipFirstFitting(player, forLevel(pool.legs(), position));
 		}
 		// Jewelry: a necklace, two earrings and two rings (the second of a pair goes to the free slot).
-		equipFirstFitting(player, pool.necklaces());
-		equipFirstFitting(player, pool.earrings());
-		equipFirstFitting(player, pool.earrings());
-		equipFirstFitting(player, pool.rings());
-		equipFirstFitting(player, pool.rings());
+		equipFirstFitting(player, forLevel(pool.necklaces(), position));
+		equipFirstFitting(player, forLevel(pool.earrings(), position));
+		equipFirstFitting(player, forLevel(pool.earrings(), position));
+		equipFirstFitting(player, forLevel(pool.rings(), position));
+		equipFirstFitting(player, forLevel(pool.rings(), position));
 		
 		player.getVariables().set(VAR_GEAR_GRADE, grade.name());
+		player.getVariables().set(VAR_GEAR_BAND, gearBand(player.getLevel()));
 		player.getVariables().set(VAR_GEAR_ARCHETYPE, archetypeFor(player).name() + GEAR_VERSION);
 		player.sendItemList(false);
 		player.broadcastUserInfo();
@@ -1019,17 +1068,69 @@ public class RLAgentManager
 	}
 	
 	/**
-	 * Equips a random candidate the player can actually wear: items with an equip condition the agent does not meet (e.g. clan-rank Apella armor) are skipped, and an item the inventory refuses to equip is destroyed and the next one is tried.
+	 * @param level a character level
+	 * @return where the level lies in its grade's level range, from 0 (the grade's first level) to 1 (the next grade's)
+	 */
+	private static double gradePosition(int level)
+	{
+		int start = 1;
+		int end = RLAgentEnvironmentConfig.RL_MAX_LEVEL + 1;
+		for (int from : RLAgentEnvironmentConfig.RL_GRADE_LEVELS.keySet())
+		{
+			if (from <= level)
+			{
+				start = Math.max(start, from);
+			}
+			else
+			{
+				end = Math.min(end, from);
+			}
+		}
+		return end > start ? Math.min(1, Math.max(0, (level - start) / (double) (end - start))) : 0;
+	}
+	
+	/**
+	 * @param level a character level
+	 * @return the third of the grade's level range the level lies in: the gear is picked anew when it changes
+	 */
+	private static int gearBand(int level)
+	{
+		return Math.min(2, (int) (gradePosition(level) * 3));
+	}
+	
+	/**
+	 * The candidates that suit a position in the grade's level range, the rest after them: the pool sorted by price (the stronger, the dearer within a grade), a window of 30 % of it that moves from the
+	 * cheapest pieces at position 0 to the dearest ones at position 1.
+	 * @param candidates the slot's candidates of the grade
+	 * @param position the level's position in the grade, 0 to 1
+	 * @return the window's candidates shuffled, then the others shuffled (tried when none of the window fits)
+	 */
+	private static List<ItemTemplate> forLevel(List<ItemTemplate> candidates, double position)
+	{
+		final List<ItemTemplate> sorted = new ArrayList<>(candidates);
+		sorted.sort((a, b) -> Long.compare(a.getReferencePrice(), b.getReferencePrice()));
+		final int size = sorted.size();
+		final int width = Math.min(size, Math.max(3, (int) Math.ceil(size * 0.3)));
+		final int from = (int) Math.round((size - width) * position);
+		final List<ItemTemplate> window = new ArrayList<>(sorted.subList(from, from + width));
+		final List<ItemTemplate> rest = new ArrayList<>(sorted);
+		rest.removeAll(window);
+		Collections.shuffle(window);
+		Collections.shuffle(rest);
+		window.addAll(rest);
+		return window;
+	}
+	
+	/**
+	 * Equips the first candidate the player can actually wear: items with an equip condition the agent does not meet (e.g. clan-rank Apella armor) are skipped, and an item the inventory refuses to equip is destroyed and the next one is tried.
 	 * @param player the agent
-	 * @param candidates the slot's candidates
+	 * @param candidates the slot's candidates in the order to try them (see {@link #forLevel})
 	 * @return the equipped item, or {@code null} if the slot stays empty
 	 */
 	private static Item equipFirstFitting(Player player, List<ItemTemplate> candidates)
 	{
-		final List<ItemTemplate> shuffled = new ArrayList<>(candidates);
-		Collections.shuffle(shuffled);
 		int attempts = 0;
-		for (ItemTemplate template : shuffled)
+		for (ItemTemplate template : candidates)
 		{
 			if (attempts >= MAX_EQUIP_ATTEMPTS)
 			{
