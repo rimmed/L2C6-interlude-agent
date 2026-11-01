@@ -194,6 +194,8 @@ class CombatPolicy:
         max_target_dz: float | None = MAX_TARGET_DZ,
         metadata_path: str | Path | None = None,
         excluded_skills: frozenset[int] = frozenset(),
+        class_excluded_skills: dict[int, frozenset[int]] | None = None,
+        caster_classes: frozenset[int] = frozenset(),
         threads: int | None = None,
     ):
         """
@@ -206,10 +208,17 @@ class CombatPolicy:
         :param metadata_path: feature-layout ``.json``; defaults to the one next to ``model_path``
         :param excluded_skills: skill ids never offered for casting (e.g. crafting or Relax, which
             the panel of a training character may contain but which are useless in a fight)
+        :param class_excluded_skills: class id -> skill ids never offered to that class, on top of
+            ``excluded_skills``
+        :param caster_classes: classes that do not hit with their weapon and keep their live target while an
+            attack spell is usable (a monster hitting them can still be picked)
         :param threads: onnxruntime intra-op threads (``None`` = its default, one per core); many
             actors in one process need 1, or every session starts a pool of all cores
         """
         self.excluded_skills = frozenset(excluded_skills)
+        self.class_excluded_skills = dict(class_excluded_skills or {})
+        self._class_excluded: frozenset[int] = frozenset()
+        self.caster_classes = frozenset(caster_classes)
         if model_path is None and metadata_path is None:
             raise ValueError("either model_path or metadata_path is required")
         meta_path = Path(metadata_path) if metadata_path is not None else Path(model_path).with_suffix(".json")
@@ -339,6 +348,7 @@ class CombatPolicy:
         known = {s["id"]: s.get("level", 1) for s in char.skills if not s.get("passive")}
         self._equipment = self._equipment_of(char)
         class_id = getattr(char, "class_id", None)
+        self._class_excluded = frozenset(self.class_excluded_skills.get(class_id, ()))
         if skill_data.LEGACY_PANELS:  # A/B: the per-character panel of 2026-10-22
             self._bound_level = getattr(char, "level", 1)
             self._own_slots = dict(enumerate(skill_data.combat_panel(known.items(), self.max_skills, equipment=self._equipment)))
@@ -542,6 +552,9 @@ class CombatPolicy:
             and (pet is not None or not skill_data.needs_summon(info.skill_id))
             and (pet is None or not skill_data.summons_servitor(info.skill_id))
         )
+        # a caster hits with its staff only when it has no attack spell to cast (no MP, cooldowns)
+        caster_with_spell = (getattr(char, "class_id", None) in self.caster_classes
+                             and any(self._own_slots[i].category == "attack" for i in usable_slots))
         pet_skills = {slot: pet_skill for slot, (pet_skill, _) in self._pet_slots.items()}
         pet_slots = tuple(
             slot for slot, (pet_skill, info) in self._pet_slots.items()
@@ -550,8 +563,9 @@ class CombatPolicy:
         )
         valid = {
             "moved": True,
-            "selected_target": has_mobs,
-            "attacked": (target_alive or has_mobs) and on_attacker,
+            # a caster keeps nuking its target instead of switching (each cast is one decision, at x5 a lost one)
+            "selected_target": has_mobs and not (caster_with_spell and target_alive and not attackers),
+            "attacked": (target_alive or has_mobs) and on_attacker and not caster_with_spell,
             "used_skill": bool(usable_slots) and (target_alive or has_mobs),
             "picked_up": has_loot,
             # a healing potion only once its shared reuse has passed (a drink before is a wasted decision)
@@ -695,6 +709,7 @@ class CombatPolicy:
 
     def _skill_usable(self, skill_id: int, now: float) -> bool:
         return (skill_id in self._known_skills and skill_id not in self.excluded_skills
+                and skill_id not in self._class_excluded
                 and self._cooldown_until.get(skill_id, 0.0) <= now)
 
     def _snapshot(self, char, current_target_id: int, pos: tuple[int, int], now: float) -> _Frame:

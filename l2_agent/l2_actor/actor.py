@@ -67,6 +67,15 @@ log = logging.getLogger("l2_actor")
 AGENT_ROOT = Path(__file__).resolve().parents[1]
 DATAPACK = AGENT_ROOT.parent / "L2J_Mobius" / "L2J_Mobius_CT_0_Interlude" / "dist" / "game" / "data" / "stats"
 
+#: Human, Elven and Dark Mystic (levels 1-19), the weak bracket of K/D: lives in which a base mystic cast only
+#: heals, cures and debuffs ended in a death 78% of the time (4% with only nukes), and early in a run it hits with
+#: its staff a quarter of the time - the support players of the BC data play so. Heal, Cure Poison, Group Heal,
+#: Might, Curse: Weakness, Curse: Poison and Wind Shackle are left off its panel, and it does not hit with its
+#: weapon nor switch from a live target while it can cast an attack spell.
+BASE_MYSTICS = frozenset((10, 25, 38))
+_BASE_MYSTIC_SUPPORT = frozenset((1011, 1012, 1027, 1068, 1164, 1168, 1206))
+BASE_MYSTIC_EXCLUDED_SKILLS = dict.fromkeys(BASE_MYSTICS, _BASE_MYSTIC_SUPPORT)
+
 
 @dataclass
 class ActorConfig:
@@ -102,6 +111,8 @@ class ActorConfig:
     buff_potions: bool = True
     #: sit down to regenerate when low on MP / HP out of combat (ExecutorConfig.rest_*)
     rest: bool = True
+    #: base mystics cast no heals / cures / debuffs (BASE_MYSTIC_EXCLUDED_SKILLS) and nuke instead of meleeing
+    nuke_only_base_mystics: bool = False
     #: onnxruntime threads of the model (``None`` = all cores; ``l2_actor.fleet`` uses 1)
     threads: int | None = None
 
@@ -174,7 +185,9 @@ class Actor:
 
         # The model decides; its .json (feature layout, skill panels) must sit next to the .onnx.
         model_path = self._download_model() if cfg.model == "redis" else cfg.model
-        self.encoder = CombatPolicy(model_path, server_speed=cfg.server_speed, device=cfg.device, threads=cfg.threads)
+        self.encoder = CombatPolicy(model_path, server_speed=cfg.server_speed, device=cfg.device, threads=cfg.threads,
+                                    class_excluded_skills=BASE_MYSTIC_EXCLUDED_SKILLS if cfg.nuke_only_base_mystics else None,
+                                    caster_classes=BASE_MYSTICS if cfg.nuke_only_base_mystics else frozenset())
         log.info("Model: %s (version %s) on %s, %s actions", model_path, self.model_version, self.encoder.device,
                  "sampled" if self.sample else "greedy")
         if self.buffer is None:
