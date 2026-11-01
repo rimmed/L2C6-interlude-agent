@@ -679,6 +679,7 @@ public class RLAgentManager
 		clearDeathPenalty(player);
 		restoreVitals(player);
 		teleportToFarmZone(player);
+		ensureWeapon(player);
 		supply(player);
 		_buffs.assign(player); // a new life, a new buff set
 		ensureSummon(player);
@@ -996,6 +997,28 @@ public class RLAgentManager
 	}
 	
 	/**
+	 * Gives an agent that lost its weapon (seen on ~5% of the fleet, cause unknown: the weapon lies unequipped in the inventory) a new gear set, and logs what it had to find the cause.
+	 * @param player the agent
+	 */
+	private void ensureWeapon(Player player)
+	{
+		if (!RLAgentEnvironmentConfig.RL_AUTO_EQUIP || player.isDead() || (player.getInventory().getPaperdollItem(Inventory.PAPERDOLL_RHAND) != null))
+		{
+			return;
+		}
+		final StringBuilder loose = new StringBuilder();
+		for (Item item : player.getInventory().getItems())
+		{
+			if (item.isWeapon() && !item.isEquipped())
+			{
+				loose.append(loose.isEmpty() ? "" : ",").append(item.getId());
+			}
+		}
+		LOGGER.info(getClass().getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ", gear " + player.getVariables().getString(VAR_GEAR_GRADE, "-") + " " + player.getVariables().getString(VAR_GEAR_ARCHETYPE, "-") + ") has no weapon, unequipped weapons [" + loose + "]: new gear set.");
+		equip(player, gradeForLevel(player.getLevel()));
+	}
+	
+	/**
 	 * Equips a random candidate the player can actually wear: items with an equip condition the agent does not meet (e.g. clan-rank Apella armor) are skipped, and an item the inventory refuses to equip is destroyed and the next one is tried.
 	 * @param player the agent
 	 * @param candidates the slot's candidates
@@ -1140,6 +1163,7 @@ public class RLAgentManager
 			}
 			runSafely(player, "stuck check", () ->
 			{
+				ensureWeapon(player);
 				final long[] last = _progress.get(player.getObjectId());
 				if ((last == null) || player.isDead() || (Math.hypot(player.getX() - last[0], player.getY() - last[1]) > STUCK_MOVE_DISTANCE) || (player.getExp() != last[2]))
 				{
