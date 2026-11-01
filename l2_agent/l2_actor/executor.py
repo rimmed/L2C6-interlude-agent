@@ -8,7 +8,9 @@ The executor carries the lessons of the live tests with ``client_demo.py``:
 * ``AttackRequest`` is not re-sent on every step for the same target (auto-attack keeps going);
 * while our own cast runs (``MagicSkillUse``) and while the character walks to a picked item, no new
   decision is taken - a new command would cancel the cast / the walk;
-* a target that took no hit for a while is unreachable (terrain, no pathfinding) and gets ignored.
+* a target that took no hit for a while is unreachable (terrain, no pathfinding) and gets ignored;
+* low on MP or HP and out of combat, the character sits down until it is nearly full (the model has
+  no rest action; a mystic without MP only meleed with its staff and died).
 """
 
 from __future__ import annotations
@@ -54,6 +56,14 @@ class ExecutorConfig:
     roam_radius: int = 1200
     #: RequestSkillCoolTime at most this often while a skill cools down
     cooldown_sync_s: float = 1.0
+    #: sit down out of combat below this share of MP ...
+    rest_mp: float = 0.3
+    #: ... or of HP ...
+    rest_hp: float = 0.4
+    #: ... and stand up when both are back at this share (or when attacked)
+    rest_until: float = 0.95
+    #: re-send the sit / stand toggle when ChangeWaitType did not come in this time
+    rest_retry_s: float = 2.0
 
 
 #: Shop buff potions (RLBuffPotions on the server) -> the skill of their effect; Greater ones first.
@@ -90,6 +100,10 @@ class ActionExecutor:
         self._engaged_at = 0.0
         self._last_cooldown_sync = 0.0
         self._potion_tried: dict[str, float] = {}
+        self._toggle_at = 0.0
+        #: real time spent resting in the current fight (episode statistics)
+        self.rest_s = 0.0
+        self._rest_tick = 0.0
 
     # ------------------------------------------------------------------
     # Gating
@@ -102,6 +116,33 @@ class ActionExecutor:
         if now < self._pickup_until and any(item["object_id"] == self._loot_id for item in self.world.pending_loot):
             return True
         return False
+
+    def rest(self, now: float) -> bool:
+        """
+        Sit down to regenerate when MP or HP is low out of combat; stand up when both are nearly full or a
+        monster attacks. Scripted like the buff potions. ``True`` while the character rests: no decision then.
+        """
+        world, char, cfg = self.world, self.world.char, self.cfg
+        attacked = any(mob.get("attacking_me_until", 0.0) > now for mob in char.radar.entries.values())
+        mp = char.cur_mp / char.max_mp if char.max_mp else 1.0
+        hp = char.cur_hp / char.max_hp if char.max_hp else 1.0
+        if world.sitting:
+            self.rest_s += now - self._rest_tick if self._rest_tick else 0.0
+            self._rest_tick = now
+            if not attacked and (mp < cfg.rest_until or hp < cfg.rest_until):
+                return True
+            if now - self._toggle_at >= cfg.rest_retry_s:
+                self._send(packets.build_request_action_use(0))  # 0 = sit / stand
+                self._toggle_at = now
+            return True  # until ChangeWaitType says it stands
+        self._rest_tick = 0.0
+        if now - self._toggle_at < cfg.rest_retry_s:
+            return now - self._toggle_at < 1.0 and (mp < cfg.rest_mp or hp < cfg.rest_hp)  # a sit on its way
+        if attacked or world.target_alive or self.busy(now) or (mp >= cfg.rest_mp and hp >= cfg.rest_hp):
+            return False
+        self._send(packets.build_request_action_use(0))
+        self._toggle_at = now
+        return True
 
     def drop_stuck_target(self, now: float) -> bool:
         """Ignore the current target when it took no hit for ``stuck_target_s`` (it is unreachable)."""

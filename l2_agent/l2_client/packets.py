@@ -87,6 +87,7 @@ class GameServerPacket(IntEnum):
     SERVER_CLOSE = 0x26
     INVENTORY_UPDATE = 0x27
     TELEPORT_TO_LOCATION = 0x28
+    CHANGE_WAIT_TYPE = 0x2F
     MAGIC_SKILL_USE = 0x48
     CREATURE_SAY = 0x4A
     SKILL_LIST = 0x58
@@ -567,6 +568,14 @@ def parse_inventory_update(body: bytes) -> list[dict]:
         item['change'] = change
         items.append(item)
     return items
+
+
+def parse_change_wait_type(body: bytes) -> dict:
+    """Parse ChangeWaitType (0x2F): ``wait_type`` 0 = sitting, 1 = standing, 2 / 3 = fake death start / stop."""
+    if len(body) < 9:
+        return {}
+    object_id, wait_type = struct.unpack_from("<ii", body, 1)
+    return {"object_id": object_id, "wait_type": wait_type}
 
 
 def parse_skill_list(body: bytes) -> dict:

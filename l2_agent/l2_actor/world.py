@@ -86,6 +86,8 @@ class WorldState:
 
         self.dead = False
         self.dead_since = 0.0
+        #: the character sits (ChangeWaitType); it regenerates faster and cannot act until it stands up
+        self.sitting = False
         #: real time until which our own cast is still running
         self.cast_until = 0.0
         #: real time of the last damage we dealt (stuck-target detection)
@@ -193,6 +195,7 @@ class WorldState:
                 char.radar.entries.clear()
                 self.pending_loot.clear()
                 self.target_id = 0
+                self.sitting = False
                 self.teleports += 1
                 return ["teleport"]
 
@@ -211,6 +214,11 @@ class WorldState:
         elif pid == GameServerPacket.ITEM_LIST:
             char.apply_item_list(packets.parse_item_list(body))
             self.has_items = True
+
+        elif pid == GameServerPacket.CHANGE_WAIT_TYPE:
+            wait = packets.parse_change_wait_type(body)
+            if wait and wait["object_id"] == char.object_id and wait["wait_type"] in (0, 1):
+                self.sitting = wait["wait_type"] == 0
 
         elif pid == GameServerPacket.INVENTORY_UPDATE:
             char.apply_inventory_update(packets.parse_inventory_update(body))
@@ -300,6 +308,7 @@ class WorldState:
             return ["kill"]
         if oid == char.object_id:
             self.dead = True
+            self.sitting = False
             self.dead_since = now
             self.target_id = 0
             self.pending_loot.clear()

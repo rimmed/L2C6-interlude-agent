@@ -100,6 +100,8 @@ class ActorConfig:
     seed: int | None = None
     #: drink shop buff potions (run / attack / casting speed) when no such buff is on the character
     buff_potions: bool = True
+    #: sit down to regenerate when low on MP / HP out of combat (ExecutorConfig.rest_*)
+    rest: bool = True
     #: onnxruntime threads of the model (``None`` = all cores; ``l2_actor.fleet`` uses 1)
     threads: int | None = None
 
@@ -298,6 +300,8 @@ class Actor:
         if self.cfg.buff_potions:
             self.executor.drink_buff_potions(now)
         self.executor.drop_stuck_target(now)
+        if self.cfg.rest and self.executor.rest(now):
+            return
         if now - self._last_decision >= self.cfg.decision_interval and not self.executor.busy(now):
             self._poll_model(now)
             self._step(now)
@@ -403,6 +407,8 @@ class Actor:
                 "target_ranks": self.episode_target_ranks, "panel": self.encoder.panel_summary(),
                 "pet_share": round(self.episode_pet_steps / self.episode_step, 3),
                 "duration_s": round(time.time() - self.episode_started, 2),
+                "rest_s": round(self.executor.rest_s, 1),
+                "mp_end": round(char.cur_mp / char.max_mp, 3) if char.max_mp else None,
                 "character": self.conn.character_name, "level": char.level, "class_id": char.class_id,
                 "t": round(time.time(), 1),
             }
@@ -421,6 +427,7 @@ class Actor:
         self.episode_target_ranks = {}
         self.episode_pet_steps = 0
         self.episode_started = time.time()
+        self.executor.rest_s = 0.0
         self.encoder.reset_session()
 
     def stop(self) -> None:
