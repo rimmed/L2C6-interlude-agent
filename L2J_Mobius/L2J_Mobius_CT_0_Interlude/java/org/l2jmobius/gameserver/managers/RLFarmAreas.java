@@ -178,6 +178,7 @@ final class RLFarmAreas
 		}
 		// Recorded for undead hunters too: the crowd of an area counts every agent sent there.
 		_assignments.put(player.getObjectId(), area.key());
+		logAssignment(player, area, current);
 		return spotIn(area, level);
 	}
 	
@@ -214,7 +215,17 @@ final class RLFarmAreas
 			return null;
 		}
 		_assignments.put(player.getObjectId(), area.key());
+		logAssignment(player, area, current);
 		return spotIn(area, level);
+	}
+	
+	/** Logs an agent's move to another area (the K/D per area is read from these lines and the agents' episodes). */
+	private static void logAssignment(Player player, Area area, String previous)
+	{
+		if (!area.key().equals(previous))
+		{
+			LOGGER.info(RLFarmAreas.class.getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ") assigned to " + area.key() + ".");
+		}
 	}
 	
 	void release(Player player)
