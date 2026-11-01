@@ -276,8 +276,8 @@ class Dashboard:
                 recent_class[class_id][0 if kill else 1] += 1
                 recent_level[level_range(level)][0 if kill else 1] += 1
 
-        def kd(kills: int, deaths: int) -> float | None:
-            return kills / deaths if deaths else None
+        def kd(kills: int, deaths: int) -> float:
+            return kills / max(deaths, 1)  # without a death: the kills
 
         def members(names: set, stats: dict[str, list] = e.by_char) -> list[dict]:
             out = []
@@ -285,7 +285,7 @@ class Dashboard:
                 k, d, c, lv = stats[name]
                 out.append({"name": name, "class": self.names.get(c, f"class {c}"), "level": lv, "kills": k, "deaths": d,
                             "kd": kd(k, d)})
-            return sorted(out, key=lambda m: (m["kd"] is None, -(m["kd"] or 0)))
+            return sorted(out, key=lambda m: -m["kd"])
 
         classes = [{"tier": self.tiers.get(c), "name": self.names.get(c, f"class {c}"), "chars": len(r[2]), "kills": r[0], "deaths": r[1],
                     "kd": kd(r[0], r[1]), "recent_kd": kd(*recent_class[c]) if c in recent_class else None,
