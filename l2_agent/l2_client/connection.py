@@ -107,9 +107,12 @@ def _parse_server_list(body: bytes) -> list[dict]:
 class GameConnection:
     """A game-server session of one character."""
 
-    def __init__(self, ticket: LoginTicket, *, char_slot: int = 0, timeout: float = 30.0):
+    def __init__(self, ticket: LoginTicket, *, char_slot: int = 0, timeout: float = 30.0,
+                 create: dict | None = None):
+        """``create``: arguments of :func:`packets.build_character_create` for a character made when the slot is empty."""
         self.ticket = ticket
         self.char_slot = char_slot
+        self.create = create
         self.character_name: str | None = None
         self._sock = socket.create_connection((ticket.game_ip, ticket.game_port), timeout=timeout)
         self._sock.settimeout(timeout)
@@ -134,6 +137,9 @@ class GameConnection:
         if info[0] != GameServerPacket.CHAR_SELECT_INFO:
             raise ConnectionFailed(f"unexpected packet 0x{info[0]:02X} instead of CharSelectInfo")
         count = struct.unpack_from("<I", info, 1)[0]
+        if count <= self.char_slot and self.create:
+            info = self._create_character(sock)
+            count = struct.unpack_from("<I", info, 1)[0]
         if count <= self.char_slot:
             raise ConnectionFailed(f"account '{t.account}' has {count} character(s), slot {self.char_slot} is empty "
                                    "(an RL-environment server creates one for agent accounts)")
@@ -153,6 +159,19 @@ class GameConnection:
         crypto.send_raw(sock, packets.build_enter_world())
         self._last_ping = time.time()
         log.info("Entered the world as '%s' (slot %d)", self.character_name, self.char_slot)
+
+    def _create_character(self, sock) -> bytes:
+        """Create the character of ``self.create`` and return the new CharSelectInfo."""
+        crypto.send_raw(sock, packets.build_new_character())
+        crypto.send_raw(sock, packets.build_character_create(**self.create))
+        for _ in range(50):
+            body = crypto.recv_packet(sock)
+            if body[0] == GameServerPacket.CHAR_CREATE_FAIL:
+                raise ConnectionFailed(f"character creation refused: {packets.parse_char_create_fail(body)}")
+            if body[0] == GameServerPacket.CHAR_SELECT_INFO:
+                log.info("Created the character '%s'", self.create["name"])
+                return body
+        raise ConnectionFailed("no CharSelectInfo after the character creation")
 
     @staticmethod
     def _slot_name(info: bytes, slot: int) -> str:

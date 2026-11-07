@@ -76,11 +76,17 @@ class GameServerPacket(IntEnum):
     DROP_ITEM = 0x0C
     GET_ITEM = 0x0D
     STATUS_UPDATE = 0x0E
+    NPC_HTML_MESSAGE = 0x0F
+    SELL_LIST = 0x10
+    BUY_LIST = 0x11
     DELETE_OBJECT = 0x12
     CHAR_SELECT_INFO = 0x13
     LOGIN_FAIL = 0x14
     CHAR_SELECTED = 0x15
     NPC_INFO = 0x16
+    CHAR_TEMPLATES = 0x17
+    CHAR_CREATE_OK = 0x19
+    CHAR_CREATE_FAIL = 0x1A
     ITEM_LIST = 0x1B
     SUNRISE = 0x1C
     SUNSET = 0x1D
@@ -94,6 +100,10 @@ class GameServerPacket(IntEnum):
     SYSTEM_MESSAGE = 0x64
     ABNORMAL_STATUS_UPDATE = 0x7F
     QUEST_LIST = 0x80
+    TUTORIAL_SHOW_HTML = 0xA0
+    TUTORIAL_SHOW_QUESTION_MARK = 0xA1
+    TUTORIAL_ENABLE_CLIENT_EVENT = 0xA2
+    TUTORIAL_CLOSE_HTML = 0xA3
     ASK_JOIN_ALLIANCE = 0xA8
     PET_INFO = 0xB1
     PET_STATUS_UPDATE = 0xB5
@@ -115,13 +125,25 @@ class GameClientPacket(IntEnum):
     ACTION = 0x04
     AUTH_LOGIN = 0x08
     ATTACK_REQUEST = 0x0A
+    CHARACTER_CREATE = 0x0B
     CHARACTER_SELECT = 0x0D
+    NEW_CHARACTER = 0x0E
     USE_ITEM = 0x14
+    REQUEST_SELL_ITEM = 0x1E
+    REQUEST_BUY_ITEM = 0x1F
+    REQUEST_LINK_HTML = 0x20
+    REQUEST_BYPASS_TO_SERVER = 0x21
+    SEND_BYPASS_BUILD_CMD = 0x5B
     REQUEST_MAGIC_SKILL_USE = 0x2F
     REQUEST_ACTION_USE = 0x45
     APPEARING = 0x30
     SAY2 = 0x38
+    REQUEST_QUEST_LIST = 0x63
     REQUEST_RESTART_POINT = 0x6D
+    REQUEST_TUTORIAL_LINK_HTML = 0x7B
+    REQUEST_TUTORIAL_PASS_CMD_TO_SERVER = 0x7C
+    REQUEST_TUTORIAL_QUESTION_MARK = 0x7D
+    REQUEST_TUTORIAL_CLIENT_EVENT = 0x7E
     REQUEST_SKILL_COOL_TIME = 0x9D
     REQUEST_ITEM_LIST = 0x0F
     NET_PING = 0xA8
@@ -354,6 +376,93 @@ def build_dlg_answer(message_id: int, answer: int, requester_id: int = 0) -> byt
     p = bytearray([GameClientPacket.DLG_ANSWER])
     p += struct.pack("<iii", message_id, answer, requester_id)
     return pack(p)
+
+
+def _utf16(text: str) -> bytes:
+    return text.encode("utf-16-le") + b"\x00\x00"
+
+
+def build_new_character() -> bytes:
+    """NewCharacter (0x0E): open the character creation; the server answers with CharTemplates (0x17)."""
+    return pack(bytearray([GameClientPacket.NEW_CHARACTER]))
+
+
+def build_character_create(name: str, race: int, female: bool, class_id: int,
+                           hair_style: int = 0, hair_color: int = 0, face: int = 0) -> bytes:
+    """
+    CharacterCreate (0x0B): a new character on the account. The server takes the base stats from the class
+    template and ignores the six it reads here. Answer: CharCreateOk (0x19) + CharSelectInfo, or CharCreateFail.
+
+    Format: c S d d d dddddd d d d
+    """
+    p = bytearray([GameClientPacket.CHARACTER_CREATE]) + _utf16(name)
+    p += struct.pack("<iii", race, 1 if female else 0, class_id) + b"\x00" * 24
+    p += struct.pack("<iii", hair_style, hair_color, face)
+    return pack(p)
+
+
+def build_bypass_to_server(command: str) -> bytes:
+    """RequestBypassToServer (0x21): an ``<a action="bypass -h ...">`` link of a dialog (without ``bypass -h``)."""
+    return pack(bytearray([GameClientPacket.REQUEST_BYPASS_TO_SERVER]) + _utf16(command))
+
+
+def build_bypass_build_cmd(command: str) -> bytes:
+    """SendBypassBuildCmd (0x5B): a ``//command`` of the chat line, run as ``admin_<command>`` (needs GM access)."""
+    return pack(bytearray([GameClientPacket.SEND_BYPASS_BUILD_CMD]) + _utf16(command))
+
+
+def build_link_html(link: str) -> bytes:
+    """RequestLinkHtml (0x20): an ``<a action="link ...">`` link of a dialog (an .htm file under data/html)."""
+    return pack(bytearray([GameClientPacket.REQUEST_LINK_HTML]) + _utf16(link))
+
+
+def build_request_buy_item(list_id: int, items: list[tuple[int, int]]) -> bytes:
+    """
+    RequestBuyItem (0x1F): buy (item id, count) pairs from the targeted merchant's list ``list_id``.
+
+    Format: c d d (d d)*
+    """
+    p = bytearray([GameClientPacket.REQUEST_BUY_ITEM]) + struct.pack("<ii", list_id, len(items))
+    for item_id, count in items:
+        p += struct.pack("<ii", item_id, count)
+    return pack(p)
+
+
+def build_request_sell_item(items: list[tuple[int, int, int]]) -> bytes:
+    """
+    RequestSellItem (0x1E): sell (object id, item id, count) to the targeted merchant (list id 0 = a sale).
+
+    Format: c d d (d d d)*
+    """
+    p = bytearray([GameClientPacket.REQUEST_SELL_ITEM]) + struct.pack("<ii", 0, len(items))
+    for object_id, item_id, count in items:
+        p += struct.pack("<iii", object_id, item_id, count)
+    return pack(p)
+
+
+def build_request_quest_list() -> bytes:
+    """RequestQuestList (0x63): the server answers with QuestList (0x80)."""
+    return pack(bytearray([GameClientPacket.REQUEST_QUEST_LIST]))
+
+
+def build_tutorial_link_html(bypass: str) -> bytes:
+    """RequestTutorialLinkHtml (0x7B): a ``link`` of a tutorial window."""
+    return pack(bytearray([GameClientPacket.REQUEST_TUTORIAL_LINK_HTML]) + _utf16(bypass))
+
+
+def build_tutorial_pass_cmd(bypass: str) -> bytes:
+    """RequestTutorialPassCmdToServer (0x7C): a ``bypass`` of a tutorial window (e.g. ``close``)."""
+    return pack(bytearray([GameClientPacket.REQUEST_TUTORIAL_PASS_CMD_TO_SERVER]) + _utf16(bypass))
+
+
+def build_tutorial_question_mark(number: int) -> bytes:
+    """RequestTutorialQuestionMark (0x7D): a click on the tutorial question mark ``number``."""
+    return pack(bytearray([GameClientPacket.REQUEST_TUTORIAL_QUESTION_MARK]) + struct.pack("<i", number))
+
+
+def build_tutorial_client_event(event_id: int) -> bytes:
+    """RequestTutorialClientEvent (0x7E): a client event the tutorial asked for (TutorialEnableClientEvent)."""
+    return pack(bytearray([GameClientPacket.REQUEST_TUTORIAL_CLIENT_EVENT]) + struct.pack("<i", event_id))
 
 
 def build_auto_soulshot(item_id: int, enable: bool = True) -> bytes:
@@ -921,3 +1030,75 @@ def parse_abnormal_status_update(body: bytes) -> dict:
             "duration": duration,
         })
     return {"buffs": buffs}
+
+
+def parse_npc_html_message(body: bytes) -> dict:
+    """NpcHtmlMessage (0x0F): ``npc_object_id`` (0 = no NPC), ``html``, ``item_id`` (a book / item dialog)."""
+    if len(body) < 5:
+        return {}
+    npc_object_id = struct.unpack_from("<i", body, 1)[0]
+    html, pos = _read_utf16le_string(body, 5)
+    item_id = struct.unpack_from("<i", body, pos)[0] if pos + 4 <= len(body) else 0
+    return {"npc_object_id": npc_object_id, "html": html, "item_id": item_id}
+
+
+def parse_tutorial_show_html(body: bytes) -> dict:
+    """TutorialShowHtml (0xA0): ``html`` of a tutorial window."""
+    return {"html": _read_utf16le_string(body, 1)[0]}
+
+
+def parse_tutorial_int(body: bytes) -> dict:
+    """TutorialShowQuestionMark (0xA1) / TutorialEnableClientEvent (0xA2): the mark or event id."""
+    return {"id": struct.unpack_from("<i", body, 1)[0]} if len(body) >= 5 else {}
+
+
+_TRADE_ITEM = struct.Struct("<HiiiHHiHHHi")  # type1, object id, item id, count, type2, -, body part, enchant, -, -, price
+
+
+def _parse_trade_items(body: bytes, pos: int) -> list[dict]:
+    items = []
+    while pos + _TRADE_ITEM.size <= len(body):
+        type1, object_id, item_id, count, type2, _, body_part, enchant, _, _, price = _TRADE_ITEM.unpack_from(body, pos)
+        pos += _TRADE_ITEM.size
+        items.append({"object_id": object_id, "item_id": item_id, "count": count, "type1": type1, "type2": type2,
+                      "body_part": body_part, "enchant": enchant, "price": price})
+    return items
+
+
+def parse_buy_list(body: bytes) -> dict:
+    """
+    BuyList (0x11): ``adena``, ``list_id`` and the ``items`` on sale with their ``price`` (tax included); ``count``
+    0 = unlimited. The written item count also counts sold-out items that are left out, so read until the end.
+    """
+    if len(body) < 11:
+        return {}
+    adena, list_id = struct.unpack_from("<ii", body, 1)
+    return {"adena": adena, "list_id": list_id, "items": _parse_trade_items(body, 11)}
+
+
+def parse_sell_list(body: bytes) -> dict:
+    """SellList (0x10): ``adena`` and the inventory ``items`` the merchant buys, ``price`` = what it pays per piece."""
+    if len(body) < 11:
+        return {}
+    adena = struct.unpack_from("<i", body, 1)[0]
+    return {"adena": adena, "items": _parse_trade_items(body, 11)}
+
+
+def parse_quest_list(body: bytes) -> dict:
+    """QuestList (0x80): ``quests`` = {quest id: cond} of the started quests (cond 0 = no state yet)."""
+    if len(body) < 3:
+        return {"quests": {}}
+    count = struct.unpack_from("<H", body, 1)[0]
+    quests, pos = {}, 3
+    for _ in range(count):
+        if pos + 8 > len(body):
+            break
+        quest_id, cond = struct.unpack_from("<ii", body, pos)
+        pos += 8
+        quests[quest_id] = cond
+    return {"quests": quests}
+
+
+def parse_char_create_fail(body: bytes) -> dict:
+    """CharCreateFail (0x1A): ``reason`` (0 failed, 1 too many characters, 2 name exists, 3 16 chars, 4 bad name)."""
+    return {"reason": struct.unpack_from("<i", body, 1)[0] if len(body) >= 5 else -1}
