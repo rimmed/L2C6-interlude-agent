@@ -64,6 +64,7 @@ class ExecutorConfig:
     #: ... or of HP ...
     rest_hp: float = 0.4
     #: ... ask for a full restore (.heal) once seated, again after this time when it did not come ...
+    rest_heal: bool = True
     rest_heal_retry_s: float = 2.0
     #: ... and stand up when both are back at this share (or when attacked)
     rest_until: float = 0.95
@@ -139,7 +140,7 @@ class ActionExecutor:
             self.rest_s += now - self._rest_tick if self._rest_tick else 0.0
             self._rest_tick = now
             if not attacked and (mp < cfg.rest_until or hp < cfg.rest_until):
-                if now - self._heal_at >= cfg.rest_heal_retry_s:
+                if cfg.rest_heal and now - self._heal_at >= cfg.rest_heal_retry_s:
                     self._send(packets.build_say2(".heal"))
                     self._heal_at = now
                     self.heals += 1
