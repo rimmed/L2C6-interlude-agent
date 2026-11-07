@@ -16,6 +16,7 @@ dependencies = [
     "onnxscript>=0.7.2",
     "onnxruntime-gpu>=1.31.0",
     "redis>=8.1.0",
+    "scipy>=1.18.1",
 ]
 
 [dependency-groups]
