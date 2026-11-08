@@ -167,8 +167,10 @@ class ActionExecutor:
             return False
         if now - max(self._engaged_at, world.last_hit_at) <= self.cfg.stuck_target_s:
             return False
-        log.info("No hit on %d for %.0fs -- ignoring it for %.0fs", world.target_id, self.cfg.stuck_target_s,
-                 self.cfg.ignore_target_s)
+        mob = world.char.radar.entries.get(world.target_id, {})
+        log.info("No hit on %d for %.0fs -- ignoring it for %.0fs (me at %s, it at %s)", world.target_id,
+                 self.cfg.stuck_target_s, self.cfg.ignore_target_s, world.pos,
+                 (mob.get("x"), mob.get("y"), mob.get("z")))
         world.ignore_target(world.target_id, self.cfg.ignore_target_s, now)
         self.encoder.reset_session()
         return True

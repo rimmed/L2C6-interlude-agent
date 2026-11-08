@@ -35,6 +35,8 @@ CAST_MARGIN_S = 0.15
 OTHER_ATTACKER_MEMORY_S = 10.0
 #: A monster that hit the character counts as attacking it this long (game seconds): the ``attacking_me`` feature.
 ATTACKER_MEMORY_S = 5.0
+#: system messages "You have failed to pick up $s1 adena / $s1 / $s2 $s1(s)"
+PICKUP_FAILED = (55, 56, 57)
 #: An attack of the summon counts as "attacking" this long (game seconds): the logs' ``atk`` flag.
 PET_ATTACK_MEMORY_S = 2.0
 
@@ -94,7 +96,10 @@ class WorldState:
         self.last_hit_at = 0.0
         #: object id -> real time until which the monster is ignored (unreachable)
         self.ignored: dict[int, float] = {}
+        self._ignored_entries: dict[int, dict] = {}
         self.teleports = 0
+        #: real time of the last "You have failed to pick up ..." (the drop belongs to another player)
+        self.pickup_failed_at = 0.0
         #: where the server put the character (its farm zone); roaming stays around it
         self.home: tuple[int, int, int] | None = None
 
@@ -127,6 +132,9 @@ class WorldState:
         """Drop a monster from the radar and keep it off for ``seconds``."""
         now = time.time() if now is None else now
         self.ignored[object_id] = now + seconds
+        entry = self.char.radar.entries.get(object_id)
+        if entry is not None:
+            self._ignored_entries[object_id] = entry  # back on the radar if it attacks the character
         self.char.radar.remove(object_id)
         if self.target_id == object_id:
             self.target_id = 0
@@ -172,6 +180,7 @@ class WorldState:
             if obj:
                 oid = obj["object_id"]
                 char.radar.remove(oid)
+                self._ignored_entries.pop(oid, None)
                 self.pending_loot = [item for item in self.pending_loot if item["object_id"] != oid]
                 if oid == self.target_id:
                     self.target_id = 0
@@ -202,6 +211,9 @@ class WorldState:
         elif pid in (GameServerPacket.SPAWN_ITEM, GameServerPacket.DROP_ITEM):
             item = (packets.parse_spawn_item if pid == GameServerPacket.SPAWN_ITEM else packets.parse_drop_item)(body)
             if item:
+                # the server sends the drop before the Die of the monster: it is ours while that is our target
+                pet_target = char.pet.get("target_id") if char.pet else None
+                item["mine"] = bool(item.get("dropper_id")) and item["dropper_id"] in (self.target_id, pet_target)
                 self.pending_loot.append(item)
 
         elif pid == GameServerPacket.GET_ITEM:
@@ -327,6 +339,11 @@ class WorldState:
     def _note_attack_on_me(self, attacker_id: int, target_ids: list[int], now: float) -> None:
         """A monster on the radar attacked the character: it counts as attacking it for a while."""
         mob = self.char.radar.entries.get(attacker_id)
+        if mob is None and self.char.object_id in target_ids and attacker_id in self._ignored_entries:
+            # an ignored monster attacks: it is a fight again, whatever made it ignored
+            self.ignored.pop(attacker_id, None)
+            mob = self._ignored_entries.pop(attacker_id)
+            self.char.radar.entries[attacker_id] = mob
         if mob is not None and self.char.object_id in target_ids:
             mob["attacking_me_until"] = now + ATTACKER_MEMORY_S / self.server_speed
 
@@ -375,6 +392,9 @@ class WorldState:
             if max_hp > 0:
                 self.events.damage_dealt_share += min(1.0, damage / max_hp)
             self.last_hit_at = now
+        elif msg["msg_id"] in PICKUP_FAILED:
+            self.pickup_failed_at = now  # the item is someone else's (drop protection)
+            return
         elif msg["msg_id"] in (SystemMessageId.DAMAGE_TAKEN, SystemMessageId.DAMAGE_TAKEN_2) and len(params) > 1 \
                 and isinstance(params[1], int):
             self.events.damage_taken += params[1]
