@@ -147,6 +147,11 @@ public class RLAgentEnvironmentConfig
 	public static int RL_FARM_BASE_MYSTIC_MAX_AGGRESSIVE;
 	public static List<String> RL_FARM_EXCLUDED_SPAWN_FOLDERS;
 	public static Set<Integer> RL_FARM_EXCLUDED_MONSTERS;
+	public static Set<String> RL_FARM_EXCLUDED_AREAS;
+	public static int RL_FARM_BAD_AREA_DEATHS;
+	public static double RL_FARM_BAD_AREA_KD;
+	public static long RL_AUTO_SUMMON_INTERVAL;
+	public static int RL_LOOT_CLEAR_FREE_SLOTS;
 	/** Buff set name -> weight, in the configured order. */
 	public static Map<String, Integer> RL_BUFF_SET_WEIGHTS;
 	public static Map<Integer, String> RL_BUFF_CLASS_SETS;
@@ -284,6 +289,18 @@ public class RLAgentEnvironmentConfig
 				RL_FARM_EXCLUDED_MONSTERS.add(Integer.parseInt(id.trim()));
 			}
 		}
+		RL_FARM_EXCLUDED_AREAS = new HashSet<>();
+		for (String key : config.getString("RLFarmExcludedAreas", "").split(";"))
+		{
+			if (!key.isBlank())
+			{
+				RL_FARM_EXCLUDED_AREAS.add(key.trim());
+			}
+		}
+		RL_FARM_BAD_AREA_DEATHS = config.getInt("RLFarmBadAreaDeaths", 0);
+		RL_FARM_BAD_AREA_KD = config.getDouble("RLFarmBadAreaKD", 3.0);
+		RL_AUTO_SUMMON_INTERVAL = config.getLong("RLAutoSummonInterval", 30000);
+		RL_LOOT_CLEAR_FREE_SLOTS = config.getInt("RLLootClearFreeSlots", 0);
 		RL_BUFF_SET_WEIGHTS = parseWeights(config.getString("RLBuffSetWeights", "none:15;newbie:20;support:30;dances_songs:15;full:20"));
 		RL_BUFF_CLASS_SETS = new HashMap<>();
 		for (String entry : config.getString("RLBuffClassSets", "").split(";"))

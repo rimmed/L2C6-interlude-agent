@@ -58,6 +58,7 @@ import org.l2jmobius.gameserver.model.skill.Skill;
 import org.l2jmobius.gameserver.model.Location;
 import org.l2jmobius.gameserver.model.World;
 import org.l2jmobius.gameserver.model.actor.Player;
+import org.l2jmobius.gameserver.model.actor.Summon;
 import org.l2jmobius.gameserver.model.actor.appearance.PlayerAppearance;
 import org.l2jmobius.gameserver.model.actor.enums.player.PlayerClass;
 import org.l2jmobius.gameserver.model.actor.templates.PlayerTemplate;
@@ -126,8 +127,6 @@ public class RLAgentManager
 	private static final long STUCK_CHECK_INTERVAL = 30000;
 	/** A move shorter than this does not count as progress of a stuck check. */
 	private static final int STUCK_MOVE_DISTANCE = 100;
-	/** How often a summoner agent without a servitor gets one (RLAutoSummon), in ms. */
-	private static final long AUTO_SUMMON_INTERVAL = 30000;
 	/** Level range of each profession (0 = starting class .. 3 = third profession) for RLClassBalance. */
 	private static final int[][] PROFESSION_LEVELS = { { 1, 19 }, { 20, 39 }, { 40, 75 }, { 76, 80 } };
 	
@@ -339,7 +338,7 @@ public class RLAgentManager
 		}
 		if (RLAgentEnvironmentConfig.RL_AUTO_SUMMON)
 		{
-			ThreadPool.scheduleAtFixedRate(this::ensureSummons, AUTO_SUMMON_INTERVAL, AUTO_SUMMON_INTERVAL);
+			ThreadPool.scheduleAtFixedRate(this::ensureSummons, RLAgentEnvironmentConfig.RL_AUTO_SUMMON_INTERVAL, RLAgentEnvironmentConfig.RL_AUTO_SUMMON_INTERVAL);
 		}
 		if (RLAgentEnvironmentConfig.RL_STUCK_SECONDS > 0)
 		{
@@ -1401,9 +1400,20 @@ public class RLAgentManager
 	 */
 	private static void ensureSummon(Player player)
 	{
-		if (!RLAgentEnvironmentConfig.RL_AUTO_SUMMON || !player.isOnline() || player.isDead() || player.hasSummon())
+		if (!RLAgentEnvironmentConfig.RL_AUTO_SUMMON || !player.isOnline() || player.isDead())
 		{
 			return;
+		}
+		final Summon current = player.getSummon();
+		if (current != null)
+		{
+			if (!current.isDead() || !current.isServitor())
+			{
+				return;
+			}
+			// A dead servitor stays summoned until its body decays (several seconds): the owner fought on without one.
+			current.stopDecay();
+			current.onDecay();
 		}
 		final List<Skill> summons = new ArrayList<>();
 		for (Skill skill : player.getAllSkills())
@@ -1438,6 +1448,8 @@ public class RLAgentManager
 			return;
 		}
 		skill.applyEffects(player, player);
+		// the servitor gets its owner's buff set at once, not at the next buff refresh
+		getInstance()._buffs.buffSummon(player);
 	}
 	
 	private static boolean summonsServitor(Skill skill)
@@ -1509,8 +1521,58 @@ public class RLAgentManager
 	// Supplies
 	// --------------------------------------------------------------------------------
 	
+	/**
+	 * Destroys the loot an agent piled up once its inventory nears the slot limit (RLLootClearFreeSlots), as a player sells it: with a full inventory the server gives it no shots, potions or summoning crystals any more, nor lets it pick anything up. Kept: what it wears, adena, quest items, its shots and arrows, the consumables and buff potions of the environment and what its skills consume.
+	 * @param player the agent
+	 */
+	private static void clearLoot(Player player)
+	{
+		if ((RLAgentEnvironmentConfig.RL_LOOT_CLEAR_FREE_SLOTS <= 0) || ((player.getInventoryLimit() - player.getInventory().getSize()) > RLAgentEnvironmentConfig.RL_LOOT_CLEAR_FREE_SLOTS))
+		{
+			return;
+		}
+		final Set<Integer> keep = new HashSet<>();
+		keep.add(Inventory.ADENA_ID);
+		for (int[] shots : new int[][] { SOULSHOTS, SPIRITSHOTS, BLESSED_SPIRITSHOTS, ARROWS })
+		{
+			for (int id : shots)
+			{
+				keep.add(id);
+			}
+		}
+		keep.addAll(ALL_BEAST_SHOTS);
+		for (ItemHolder consumable : RLAgentEnvironmentConfig.RL_CONSUMABLES)
+		{
+			keep.add(consumable.getId());
+		}
+		for (PotionEntry potion : RLAgentEnvironmentConfig.RL_BUFF_POTIONS)
+		{
+			keep.add(potion.itemId());
+		}
+		for (Skill skill : player.getAllSkills())
+		{
+			if (skill.getItemConsumeId() > 0)
+			{
+				keep.add(skill.getItemConsumeId());
+			}
+		}
+		int cleared = 0;
+		for (Item item : new ArrayList<>(player.getInventory().getItems()))
+		{
+			if (!item.isEquipped() && !item.isQuestItem() && !keep.contains(item.getId()) && player.destroyItem(ItemProcessType.NONE, item, null, false))
+			{
+				cleared++;
+			}
+		}
+		if (cleared > 0)
+		{
+			LOGGER.info("RLAgentManager: " + player.getName() + " had a full inventory: " + cleared + " stacks of loot cleared.");
+		}
+	}
+	
 	private void supply(Player player)
 	{
+		clearLoot(player);
 		final Weapon weapon = player.getActiveWeaponItem();
 		final int gradeIndex = (weapon == null) ? 0 : Math.min(weapon.getCrystalType().ordinal(), SOULSHOTS.length - 1);
 		final int shotId;

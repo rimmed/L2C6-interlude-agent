@@ -145,6 +145,27 @@ final class RLBuffs
 		}
 	}
 	
+	/**
+	 * Gives a just summoned servitor its owner's buff set at once, as a buffer would rebuff the party (RLAutoSummon).
+	 * @param player the summoner agent
+	 */
+	void buffSummon(Player player)
+	{
+		final List<Skill> buffs = _assigned.get(player.getObjectId());
+		final Summon summon = player.getSummon();
+		if ((buffs == null) || (summon == null) || summon.isDead())
+		{
+			return;
+		}
+		for (Skill skill : buffs)
+		{
+			if (!summon.isAffectedBySkill(skill.getId()))
+			{
+				skill.applyEffects(player, summon);
+			}
+		}
+	}
+	
 	private static void refresh(Player player, List<Skill> buffs)
 	{
 		if (!player.isOnline() || player.isDead())

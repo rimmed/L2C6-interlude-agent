@@ -146,6 +146,10 @@ final class RLFarmAreas
 	/** Per agent: kills and deaths in its current area (RLPoorAreaDeaths). */
 	private final Map<Integer, Integer> _areaKills = new ConcurrentHashMap<>();
 	private final Map<Integer, Integer> _areaDeaths = new ConcurrentHashMap<>();
+	/** Area key -> {kills, deaths} of all agents there (RLFarmBadAreaDeaths, RLFarmBadAreaKD). */
+	private final Map<String, int[]> _areaTotals = new ConcurrentHashMap<>();
+	/** Areas found bad during the run (logged once). */
+	private final Set<String> _badAreas = ConcurrentHashMap.newKeySet();
 	
 	/**
 	 * Picks the farm spot of an agent: its current area while that still suits its level, otherwise the least crowded suitable area.
@@ -162,7 +166,7 @@ final class RLFarmAreas
 		if (current != null)
 		{
 			final Area assigned = _byKey.get(current);
-			if ((assigned != null) && (assigned.aggressiveShare() <= maxAggressive(player)) && ((undead && (assigned.fittingUndead(level) > 0)) || (!undead && (assigned.fittingMonsters(level) > 0))))
+			if ((assigned != null) && !isBad(current) && (assigned.aggressiveShare() <= maxAggressive(player)) && ((undead && (assigned.fittingUndead(level) > 0)) || (!undead && (assigned.fittingMonsters(level) > 0))))
 			{
 				area = assigned;
 			}
@@ -237,11 +241,41 @@ final class RLFarmAreas
 	void recordKill(Player player)
 	{
 		_areaKills.merge(player.getObjectId(), 1, Integer::sum);
+		final String key = _assignments.get(player.getObjectId());
+		if (key != null)
+		{
+			_areaTotals.computeIfAbsent(key, k -> new int[2])[0]++;
+		}
 	}
 	
 	void recordDeath(Player player)
 	{
 		_areaDeaths.merge(player.getObjectId(), 1, Integer::sum);
+		final String key = _assignments.get(player.getObjectId());
+		if (key != null)
+		{
+			final int[] totals = _areaTotals.computeIfAbsent(key, k -> new int[2]);
+			totals[1]++;
+			if (isBad(key) && _badAreas.add(key))
+			{
+				LOGGER.info("RLFarmAreas: " + key + " has kills/deaths " + totals[0] + "/" + totals[1] + " for all agents: no more agents go there.");
+			}
+		}
+	}
+	
+	/**
+	 * An area agents are not sent to: configured (RLFarmExcludedAreas), or one where all agents together die too often (RLFarmBadAreaDeaths, RLFarmBadAreaKD), e.g. a monster that calls its whole group into every fight.
+	 * @param key the area's key
+	 * @return {@code true} when no agent should farm there
+	 */
+	private boolean isBad(String key)
+	{
+		if (RLAgentEnvironmentConfig.RL_FARM_EXCLUDED_AREAS.contains(key))
+		{
+			return true;
+		}
+		final int[] totals = _areaTotals.get(key);
+		return (RLAgentEnvironmentConfig.RL_FARM_BAD_AREA_DEATHS > 0) && (totals != null) && (totals[1] >= RLAgentEnvironmentConfig.RL_FARM_BAD_AREA_DEATHS) && (totals[0] < (totals[1] * RLAgentEnvironmentConfig.RL_FARM_BAD_AREA_KD));
 	}
 	
 	/**
@@ -301,7 +335,7 @@ final class RLFarmAreas
 		int totalWeight = 0;
 		for (Area area : areas())
 		{
-			if ((area.fitting(level, undead) == 0) || area.key().equals(excluded) || (area.aggressiveShare() > maxAggressive))
+			if ((area.fitting(level, undead) == 0) || area.key().equals(excluded) || (area.aggressiveShare() > maxAggressive) || isBad(area.key()))
 			{
 				continue;
 			}
