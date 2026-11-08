@@ -80,6 +80,11 @@ class GameServerPacket(IntEnum):
     SELL_LIST = 0x10
     BUY_LIST = 0x11
     DELETE_OBJECT = 0x12
+    WAREHOUSE_DEPOSIT_LIST = 0x41
+    WAREHOUSE_WITHDRAW_LIST = 0x42
+    ACQUIRE_SKILL_LIST = 0x8A
+    ACQUIRE_SKILL_INFO = 0x8B
+    ACQUIRE_SKILL_DONE = 0x8E
     CHAR_SELECT_INFO = 0x13
     LOGIN_FAIL = 0x14
     CHAR_SELECTED = 0x15
@@ -129,6 +134,8 @@ class GameClientPacket(IntEnum):
     CHARACTER_SELECT = 0x0D
     NEW_CHARACTER = 0x0E
     USE_ITEM = 0x14
+    SEND_WARE_HOUSE_DEPOSIT_LIST = 0x31
+    SEND_WARE_HOUSE_WITH_DRAW_LIST = 0x32
     REQUEST_SELL_ITEM = 0x1E
     REQUEST_BUY_ITEM = 0x1F
     REQUEST_LINK_HTML = 0x20
@@ -139,6 +146,8 @@ class GameClientPacket(IntEnum):
     APPEARING = 0x30
     SAY2 = 0x38
     REQUEST_QUEST_LIST = 0x63
+    REQUEST_ACQUIRE_SKILL_INFO = 0x6B
+    REQUEST_ACQUIRE_SKILL = 0x6C
     REQUEST_RESTART_POINT = 0x6D
     REQUEST_TUTORIAL_LINK_HTML = 0x7B
     REQUEST_TUTORIAL_PASS_CMD_TO_SERVER = 0x7C
@@ -437,6 +446,32 @@ def build_request_sell_item(items: list[tuple[int, int, int]]) -> bytes:
     p = bytearray([GameClientPacket.REQUEST_SELL_ITEM]) + struct.pack("<ii", 0, len(items))
     for object_id, item_id, count in items:
         p += struct.pack("<iii", object_id, item_id, count)
+    return pack(p)
+
+
+def build_request_acquire_skill_info(skill_id: int, level: int, skill_type: int = 0) -> bytes:
+    """RequestAcquireSkillInfo (0x6B): the cost of a skill of the trainer's list (type 0 = class skill)."""
+    return pack(bytearray([GameClientPacket.REQUEST_ACQUIRE_SKILL_INFO]) + struct.pack("<iii", skill_id, level, skill_type))
+
+
+def build_request_acquire_skill(skill_id: int, level: int, skill_type: int = 0) -> bytes:
+    """RequestAcquireSkill (0x6C): learn a skill of the trainer's AcquireSkillList (type 0 = class skill)."""
+    return pack(bytearray([GameClientPacket.REQUEST_ACQUIRE_SKILL]) + struct.pack("<iii", skill_id, level, skill_type))
+
+
+def build_warehouse_deposit(items: list[tuple[int, int]]) -> bytes:
+    """SendWareHouseDepositList (0x31): deposit (object id, count) pairs into the open warehouse."""
+    p = bytearray([GameClientPacket.SEND_WARE_HOUSE_DEPOSIT_LIST]) + struct.pack("<i", len(items))
+    for object_id, count in items:
+        p += struct.pack("<ii", object_id, count)
+    return pack(p)
+
+
+def build_warehouse_withdraw(items: list[tuple[int, int]]) -> bytes:
+    """SendWareHouseWithDrawList (0x32): take (object id, count) pairs out of the open warehouse."""
+    p = bytearray([GameClientPacket.SEND_WARE_HOUSE_WITH_DRAW_LIST]) + struct.pack("<i", len(items))
+    for object_id, count in items:
+        p += struct.pack("<ii", object_id, count)
     return pack(p)
 
 
@@ -1102,3 +1137,37 @@ def parse_quest_list(body: bytes) -> dict:
 def parse_char_create_fail(body: bytes) -> dict:
     """CharCreateFail (0x1A): ``reason`` (0 failed, 1 too many characters, 2 name exists, 3 16 chars, 4 bad name)."""
     return {"reason": struct.unpack_from("<i", body, 1)[0] if len(body) >= 5 else -1}
+
+
+def parse_acquire_skill_list(body: bytes) -> dict:
+    """AcquireSkillList (0x8A): ``skill_type`` and the learnable ``skills`` ({id, level, max_level, sp, requirements})."""
+    if len(body) < 9:
+        return {"skill_type": 0, "skills": []}
+    skill_type, count = struct.unpack_from("<ii", body, 1)
+    skills, pos = [], 9
+    for _ in range(count):
+        if pos + 20 > len(body):
+            break
+        skill_id, level, max_level, sp, requirements = struct.unpack_from("<iiiii", body, pos)
+        pos += 20
+        skills.append({"id": skill_id, "level": level, "max_level": max_level, "sp": sp, "requirements": requirements})
+    return {"skill_type": skill_type, "skills": skills}
+
+
+_WAREHOUSE_ITEM = struct.Struct("<HiiiHHiHHHiq")  # type1, object id, item id, count, type2, -, body part, enchant, -, -, object id, augment
+
+
+def parse_warehouse_list(body: bytes) -> dict:
+    """WareHouseDepositList (0x41) / WareHouseWithdrawalList (0x42): ``warehouse_type``, ``adena`` and the ``items``."""
+    if len(body) < 9:
+        return {}
+    warehouse_type, adena, count = struct.unpack_from("<HiH", body, 1)
+    items, pos = [], 9
+    for _ in range(count):
+        if pos + _WAREHOUSE_ITEM.size > len(body):
+            break
+        type1, object_id, item_id, item_count, type2, _, body_part, enchant, _, _, _, _ = _WAREHOUSE_ITEM.unpack_from(body, pos)
+        pos += _WAREHOUSE_ITEM.size
+        items.append({"object_id": object_id, "item_id": item_id, "count": item_count, "type1": type1, "type2": type2,
+                      "body_part": body_part, "enchant": enchant})
+    return {"warehouse_type": warehouse_type, "adena": adena, "items": items}
