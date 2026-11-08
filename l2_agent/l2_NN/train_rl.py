@@ -85,6 +85,10 @@ IMPOSSIBLE: Final[float] = -1e9
 # --------------------------------------------------------------------------------------
 
 
+
+#: A pause of the actors' data longer than this is a fleet restart (the fleet's own restarts of single actors are shorter).
+FLEET_GAP_S = 120.0
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="V-trace RL trainer fed by actors through Redis.",
                                 formatter_class=argparse.ArgumentDefaultsHelpFormatter)
@@ -140,6 +144,10 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     g.add_argument("--return-window", type=int, default=100, help="Lives in the mean return per life (logged)")
     g.add_argument("--kd-window", type=int, default=20000,
                    help="Latest segments in the K/D that picks best_kd.pth (800 actors send ~2000 a minute)")
+    g.add_argument("--fleet-warmup-s", type=float, default=600.0,
+                   help="After the trainer starts or the actors pause (FLEET_GAP_S), this many seconds of their data train "
+                        "the model but stay out of the return / K/D metrics: while a fleet logs in and spreads over its "
+                        "areas, and the first lives to end are the short ones, those metrics dip though the policy did not")
     return p.parse_args(argv)
 
 
@@ -474,6 +482,13 @@ class Trainer:
         self._episode_returns: dict[tuple[str, int], float] = {}
         #: (reward sum, steps) of the latest segments: reward per step does not depend on how long lives are
         self._reward_window: deque[tuple[float, int]] = deque(maxlen=2000)
+        #: when the actors' data last arrived, and since when they send again after a pause (fleet warm-up)
+        self._last_segment_at: float | None = None
+        self._fleet_since = 0.0
+        if args.resume:  # the metric windows go on where they were (checkpoints of older runs lack them)
+            rl = checkpoint["rl_state"]
+            self._kd_window.extend(tuple(x) for x in rl.get("kd_window", []))
+            self._reward_window.extend(tuple(x) for x in rl.get("reward_window", []))
         self._publisher: subprocess.Popen | None = None
         self.demos = demo_batches(args, self.init_args, self.action_to_id)
         # Demonstrations come in today's feature layouts; an older model may know fewer features.
@@ -500,6 +515,12 @@ class Trainer:
                 segment = self.incoming.get_nowait()
             except queue.Empty:
                 return
+            now = time.time()
+            if self._last_segment_at is None or now - self._last_segment_at > FLEET_GAP_S:
+                # the trainer started or the fleet (re)started: lives from before the pause are cut off
+                self._fleet_since = now
+                self._episode_returns.clear()
+            self._last_segment_at = now
             self.buffer.add(segment)
             self.totals["segments"] += 1
             self.totals["steps"] += segment.steps
@@ -509,19 +530,27 @@ class Trainer:
         """An episode is one life of a character (kills are rewards inside it, a death ends it)."""
         h = segment.header
         rewards = segment.arrays["reward"]
-        self._reward_window.append((float(rewards.sum()), int(rewards.shape[0])))
+        warm = self.fleet_warmup()
+        if not warm:
+            self._reward_window.append((float(rewards.sum()), int(rewards.shape[0])))
         self.totals["kills"] += int(h.get("kills", 0))
         key = (str(h.get("actor_id")), int(h.get("episode_id", -1)))
         total = self._episode_returns.pop(key, 0.0) + float(rewards.sum())
         reason = h.get("done_reason")
-        self._kd_window.append((int(h.get("kills", 0)), int(reason == "death")))
+        if not warm:
+            self._kd_window.append((int(h.get("kills", 0)), int(reason == "death")))
         if reason is None:
             self._episode_returns[key] = total
             return
         self.totals["episodes"] += 1
         if reason == "death":
             self.totals["deaths"] += 1
-        self.returns.append(total)
+        if not warm:
+            self.returns.append(total)
+
+    def fleet_warmup(self) -> bool:
+        """The actors started sending less than ``--fleet-warmup-s`` ago (see ``drain``)."""
+        return time.time() - self._fleet_since < self.args.fleet_warmup_s
 
     def reward_per_100_steps(self) -> float:
         reward = sum(r for r, _ in self._reward_window)
@@ -588,7 +617,8 @@ class Trainer:
             "split": None,
             "rl_args": {k: str(v) if isinstance(v, Path) else v for k, v in vars(self.args).items()},
             "rl_state": {"update": self.update, "best_return": self.best_return, "best_kd": self.best_kd,
-                         "returns": list(self.returns),
+                         "returns": list(self.returns), "kd_window": list(self._kd_window),
+                         "reward_window": list(self._reward_window),
                          "totals": dict(self.totals), "model_version": self.version},
         }
 
@@ -684,6 +714,7 @@ class Trainer:
         avg = {k: float(np.mean([s[k] for s in window if k in s])) for k in keys}
         record = {
             "time": time.time(), "update": self.update, "version": self.version, "warmup": window[-1]["warmup"],
+            "fleet_warmup": self.fleet_warmup(),
             "updates_per_s": len(window) / max(seconds, 1e-9), "buffer_steps": self.buffer.steps,
             "queue": self.incoming.qsize(), "replay_ratio": self.totals["trained_steps"] / max(1, self.totals["steps"]),
             "mean_return": self.mean_return(), "reward_per_100_steps": self.reward_per_100_steps(),

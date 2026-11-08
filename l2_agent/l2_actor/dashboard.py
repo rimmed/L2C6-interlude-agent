@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import re
 import threading
 import time
@@ -47,6 +48,8 @@ FLEET_LINE = re.compile(
 TRAINER_STALE_S = 180
 #: A pause in the trainer's metrics longer than this starts a new training session (the elapsed-time tile).
 SESSION_GAP_S = 15 * 60
+#: A fleet run's intervals this long after all its actors came online still count as its warm-up (left out).
+FLEET_WARMUP_S = 5 * 60
 FLEET_STALE_S = 300
 #: K/D of the recent fights: the last this many seconds of the fight records.
 RECENT_S = 900
@@ -183,15 +186,20 @@ class Dashboard:
         with open(run / "metrics.jsonl", encoding="utf-8") as fh:
             for line in fh:
                 try:
-                    rows.append(json.loads(line))
+                    row = json.loads(line)
                 except json.JSONDecodeError:
                     continue
+                # NaN (an empty metric window, e.g. during a fleet warm-up) is no JSON for the browser
+                rows.append({k: None if isinstance(v, float) and not math.isfinite(v) else v for k, v in row.items()})
         keys = ("update", "version", "reward_per_100_steps", "mean_return", "value_loss", "pg_loss", "bc_loss",
                 "bc_weight", "entropy", "rho_far", "kl_approx", "updates_per_s", "replay_ratio", "lr")
-        step = max(1, len(rows) // 400)  # at most ~400 points per chart
-        series = [{"t": r["time"], **{k: r.get(k) for k in keys}} for r in rows[::step]]
-        if rows and series[-1]["t"] != rows[-1]["time"]:
-            series.append({"t": rows[-1]["time"], **{k: rows[-1].get(k) for k in keys}})
+        # A fleet's warm-up after a (re)start (``fleet_warmup``, see train_rl.py) is left out of the charts: its
+        # return and K/D dip while the actors log in and the short lives end first, though the policy did not change.
+        shown = [r for r in rows if not r.get("fleet_warmup")] or rows
+        step = max(1, len(shown) // 400)  # at most ~400 points per chart
+        series = [{"t": r["time"], **{k: r.get(k) for k in keys}} for r in shown[::step]]
+        if shown and series[-1]["t"] != shown[-1]["time"]:
+            series.append({"t": shown[-1]["time"], **{k: shown[-1].get(k) for k in keys}})
         latest = rows[-1] if rows else {}
         # the current training session: from the first metrics after the last pause (a run continued
         # later - an overnight stop, a resume - starts a new session; the hourly server restarts do not)
@@ -210,13 +218,18 @@ class Dashboard:
         logs = sorted(run.glob("fleet*.log"), key=lambda p: p.stat().st_mtime)
         for log in logs:
             previous = None
+            full_at = None  # when this fleet run first had all its actors online
             for line in open(log, encoding="utf-8", errors="replace"):
                 m = FLEET_LINE.match(line)
                 if not m:
                     continue
                 t = datetime.strptime(m.group("ts"), "%Y-%m-%d %H:%M:%S").timestamp()
                 cur = {k: int(m.group(k)) for k in ("online", "total", "kills", "deaths", "steps", "restarts")}
-                if previous and t > previous[0]:
+                if full_at is None and cur["total"] and cur["online"] >= cur["total"]:
+                    full_at = t
+                # the ramp-up (logging in, spreading over the areas) and FLEET_WARMUP_S after it stay off the charts
+                warm = full_at is None or t - full_at < FLEET_WARMUP_S
+                if previous and t > previous[0] and not warm:
                     dt = t - previous[0]
                     kills, deaths = cur["kills"] - previous[1]["kills"], cur["deaths"] - previous[1]["deaths"]
                     if kills >= 0 and deaths >= 0:  # a new fleet run starts its counters at 0
