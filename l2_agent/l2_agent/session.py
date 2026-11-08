@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from l2_actor.actor import BASE_MYSTIC_EXCLUDED_SKILLS, BASE_MYSTICS
 from l2_actor.executor import ActionExecutor, ExecutorConfig
 from l2_actor.world import WorldState
 from l2_client import packets
@@ -124,6 +125,9 @@ class Session:
         self.buy_list: dict | None = None
         self.sell_list: dict | None = None
         self.quests: dict[int, int] = {}
+        #: the last AcquireSkillList of a trainer and the last warehouse list, with their "received" time
+        self.skill_list: dict | None = None
+        self.warehouse: dict | None = None
         self.quests_at = 0.0
         self.system_messages: list[tuple[float, int]] = []
         #: callbacks (packet body, now) run for every packet, e.g. the tutorial handler
@@ -138,13 +142,15 @@ class Session:
         npc_data.load_npc_names(str(DATAPACK / "npcs"))
         item_data.load_item_data(str(DATAPACK / "items"))
         skill_data.load_skill_data(str(DATAPACK / "skills"))
-        self.encoder = CombatPolicy(cfg.model, server_speed=cfg.server_speed, device=cfg.device, threads=cfg.threads)
+        # The same rules for base mystics as in the RL fleet: nukes, no support spells, no staff melee.
+        self.encoder = CombatPolicy(cfg.model, server_speed=cfg.server_speed, device=cfg.device, threads=cfg.threads,
+                                    class_excluded_skills=BASE_MYSTIC_EXCLUDED_SKILLS, caster_classes=BASE_MYSTICS)
         ticket = login(cfg.server_ip, cfg.account, cfg.password, port=cfg.login_port)
         self.conn = GameConnection(ticket, char_slot=cfg.char_slot, create=cfg.create)
         self.conn.enter_world()
         self.world = WorldState(self.encoder, self.conn.send, cfg.server_speed)
         # No .heal: the agent plays by the rules and regenerates sitting.
-        self.executor = ActionExecutor(self.conn.send, self.world, self.encoder, ExecutorConfig(rest_heal=False))
+        self.executor = ActionExecutor(self.conn.send, self.world, self.encoder, ExecutorConfig(rest_heal=False, caster_classes=BASE_MYSTICS))
         if not self.wait_until(lambda: self.world.ready, ready_timeout):
             raise TimeoutError("no UserInfo / SkillList from the server")
         self.encoder.bind_character(self.world.char)
@@ -234,6 +240,11 @@ class Session:
             self.buy_list = {**packets.parse_buy_list(body), "received": now}
         elif pid == G.SELL_LIST:
             self.sell_list = {**packets.parse_sell_list(body), "received": now}
+        elif pid == G.ACQUIRE_SKILL_LIST:
+            self.skill_list = {**packets.parse_acquire_skill_list(body), "received": now}
+        elif pid in (G.WAREHOUSE_DEPOSIT_LIST, G.WAREHOUSE_WITHDRAW_LIST):
+            kind = "deposit" if pid == G.WAREHOUSE_DEPOSIT_LIST else "withdraw"
+            self.warehouse = {**packets.parse_warehouse_list(body), "kind": kind, "received": now}
         elif pid == G.QUEST_LIST:
             self.quests = packets.parse_quest_list(body)["quests"]
             self.quests_at = now

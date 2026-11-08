@@ -84,6 +84,18 @@ class Knowledge:
         return self._read("teleports")
 
     @cached_property
+    def skill_trees(self) -> pd.DataFrame:
+        return self._read("skill_trees")
+
+    @cached_property
+    def trainers(self) -> pd.DataFrame:
+        return self._read("trainers")
+
+    @cached_property
+    def zones(self) -> pd.DataFrame:
+        return self._read("zones")
+
+    @cached_property
     def quests(self) -> pd.DataFrame:
         return self._read("quests").set_index("id", drop=False)
 

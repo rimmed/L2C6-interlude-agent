@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 
 from l2_client import packets
@@ -39,6 +40,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
     logging.basicConfig(level=logging.DEBUG if args.verbose else logging.INFO,
                         format="%(asctime)s %(levelname).1s %(name)s: %(message)s", datefmt="%H:%M:%S")
+    for name in filter(None, os.environ.get("L2_DEBUG", "").split(",")):  # e.g. L2_DEBUG=l2_agent.combat
+        logging.getLogger(name).setLevel(logging.DEBUG)
     create = None
     if args.name:
         create = dict(name=args.name, race=RACES[args.class_id], female=args.female, class_id=args.class_id,

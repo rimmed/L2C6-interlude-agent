@@ -10,6 +10,7 @@ import logging
 import math
 import random
 import time
+from typing import Callable
 from dataclasses import dataclass
 
 from l2_client import packets
@@ -56,6 +57,10 @@ class Navigator:
         self.stuck_spots: list[tuple[int, int, int]] = []
         #: spots the character walked through, newest last: known ways back out of a dead end
         self.trail: list[Point] = []
+        #: asked every tick of a walk: deals with what stops a player on the way (a monster attacking, death) and
+        #: returns ``True`` when it did something, then the walk plans again from where the character is
+        self.guard: Callable[[], bool] | None = None
+        self._teleports = session.world.teleports if session.world is not None else 0
 
     def move_to(self, target: Point, arrive: float = 120.0, timeout: float = 600.0,
                 interrupt=None) -> bool:
@@ -81,6 +86,11 @@ class Navigator:
                 return self._walk(target, arrive, deadline - time.time(), interrupt, self.cfg.detours)
             if interrupt is not None and interrupt() or s.world.dead or time.time() >= deadline:
                 return False
+        if s.distance(target.x, target.y) > arrive and not s.world.dead and time.time() < deadline:
+            route = self._route(target)  # the last try after a fight or a respawn
+            if route and all(self._walk(p, ROUTE_ARRIVE, min(deadline - time.time(), 60.0), interrupt, 2)
+                             for p in route[:-1]):
+                return self._walk(target, arrive, deadline - time.time(), interrupt, self.cfg.detours)
         return False
 
     def _route(self, target: Point) -> list[Point] | None:
@@ -105,6 +115,8 @@ class Navigator:
         while time.time() < deadline:
             s.pump(0.1)
             if interrupt is not None and interrupt():
+                return False
+            if self.guard is not None and self.guard():
                 return False
             if s.world.dead:
                 return False
@@ -150,6 +162,12 @@ class Navigator:
 
     def _send_leg(self, target: Point) -> None:
         s = self.session
+        if s.world.sitting:  # a sitting character does not walk: stand up first
+            s.send(packets.build_request_action_use(0))
+            s.wait_until(lambda: not s.world.sitting, 3.0)
+        if s.world.teleports != self._teleports:  # respawned or teleported: the old trail leads nowhere from here
+            self._teleports = s.world.teleports
+            self.trail.clear()
         x, y, z = s.position
         dx, dy = target.x - x, target.y - y
         dist = math.hypot(dx, dy)

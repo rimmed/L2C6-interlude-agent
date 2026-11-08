@@ -31,6 +31,8 @@ class Trader:
         self.session = session
         self.talker = talker
         self._transaction_at = 0.0
+        #: NPCs of the Warehouse type without a private warehouse (a freightman)
+        self.no_warehouse: set[int] = set()
 
     def _transaction(self, packet: bytes) -> None:
         wait = self._transaction_at + TRANSACTION_INTERVAL_S - time.time()
@@ -112,6 +114,56 @@ class Trader:
         log.info("Sold to %s: %s for %d adena", s.knowledge.npc_name(npc_id),
                  [s.knowledge.item_name(i) for _, i, _ in order], s.adena - before)
         return s.adena - before
+
+
+    def _warehouse(self, npc_id: int, kind: str) -> dict | None:
+        """Open the private warehouse of ``npc_id`` for ``kind`` (``deposit`` or ``withdraw``)."""
+        s, t = self.session, self.talker
+        dialog = t.talk(npc_id)
+        link = t.choose(dialog, r"_DepositP$" if kind == "deposit" else r"_WithdrawP$")
+        if link is None:
+            log.warning("%s offers no private warehouse", s.knowledge.npc_name(npc_id))
+            self.no_warehouse.add(npc_id)
+            return None
+        asked = time.time()
+        t.follow(link, expect=lambda: (s.warehouse or {}).get("received", 0) >= asked
+                 or (s.dialog is not None and s.dialog.received >= asked))
+        wh = s.warehouse
+        return wh if wh and wh["received"] >= asked and wh["kind"] == kind else None
+
+    def deposit(self, npc_id: int, item_ids: set[int]) -> list[int]:
+        """Put the carried items of ``item_ids`` (all of each stack) into the private warehouse; the ids stored."""
+        s = self.session
+        wh = self._warehouse(npc_id, "deposit")
+        if wh is None:
+            return []
+        order = [(i["object_id"], i["count"]) for i in wh["items"] if i["item_id"] in item_ids]
+        if not order:
+            return []
+        ids = [i["item_id"] for i in wh["items"] if i["item_id"] in item_ids]
+        before = {i: s.item_count(i) for i in ids}
+        self._transaction(packets.build_warehouse_deposit(order))
+        s.wait_until(lambda: any(s.item_count(i) < before[i] for i in ids), 4.0)
+        stored = [i for i in ids if s.item_count(i) < before[i]]
+        log.info("Deposited at %s: %s", s.knowledge.npc_name(npc_id), [s.knowledge.item_name(i) for i in stored])
+        return stored
+
+    def withdraw(self, npc_id: int, item_ids: set[int]) -> list[int]:
+        """Take the stored items of ``item_ids`` (whole stacks) out of the private warehouse; the ids taken."""
+        s = self.session
+        wh = self._warehouse(npc_id, "withdraw")
+        if wh is None:
+            return []
+        order = [(i["object_id"], i["count"]) for i in wh["items"] if i["item_id"] in item_ids]
+        if not order:
+            return []
+        ids = [i["item_id"] for i in wh["items"] if i["item_id"] in item_ids]
+        before = {i: s.item_count(i) for i in ids}
+        self._transaction(packets.build_warehouse_withdraw(order))
+        s.wait_until(lambda: any(s.item_count(i) > before[i] for i in ids), 4.0)
+        taken = [i for i in ids if s.item_count(i) > before[i]]
+        log.info("Withdrew at %s: %s", s.knowledge.npc_name(npc_id), [s.knowledge.item_name(i) for i in taken])
+        return taken
 
 
 def matches(text: str, *patterns: str) -> bool:

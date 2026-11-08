@@ -40,7 +40,7 @@ GROW = 3
 #: a goal cell may be wrong (a roof): the reachable cell nearest to it within this many cells will do
 GOAL_CELLS = 8
 #: regions kept in memory
-CACHE = 16
+CACHE = 6
 _MOVES = ((1, 0, EAST, WEST), (-1, 0, WEST, EAST), (0, 1, SOUTH, NORTH), (0, -1, NORTH, SOUTH))
 
 
