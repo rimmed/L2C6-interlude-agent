@@ -3,7 +3,7 @@ Skill panels per class and level: what the combat panel of an agent of a class h
 
 The panel is built the way the agents build it (``skill_data.combat_panel``): the class's learnable
 skills of the attack / debuff / heal / buff / summon categories at the highest level the character
-level allows, from the player skill trees of the datapack along the class's profession chain (the
+level allows; the passive skills of that level are listed below it, from the player skill trees of the datapack along the class's profession chain (the
 trees' parent classes - ``classList.xml`` has a few wrong ones). Every skill carries the weapon /
 armor it needs (``<using kind>``), which the agents check against their equipment.
 
@@ -74,20 +74,28 @@ class SkillPanels:
                 if learn_level <= level:
                     best[skill_id] = max(best.get(skill_id, 0), skill_level)
             panel = self.skill_data.combat_panel(best.items(), 64)
-            key = tuple((info.skill_id, info.level) for info in panel)
+            passives = [info for skill_id, skill_level in sorted(best.items())
+                        if self.is_passive(skill_id) and (info := self.skill_data.get_skill_info(skill_id, skill_level))]
+            key = (tuple((info.skill_id, info.level) for info in panel),
+                   tuple((info.skill_id, info.level) for info in passives))
             if key == previous:
                 rows[-1]["to"] = level
                 continue
-            before = {} if previous is None else dict(previous)
-            rows.append({"from": level, "to": level, "skills": [self.describe(info, before) for info in panel]})
+            before = {} if previous is None else dict(previous[0])
+            before_passive = {} if previous is None else dict(previous[1])
+            rows.append({"from": level, "to": level, "skills": [self.describe(info, before) for info in panel],
+                         "passives": [self.describe(info, before_passive, "passive") for info in passives]})
             previous = key
         return {"class": class_id, "name": self.names.get(class_id, f"class {class_id}"),
                 "chain": [self.names.get(c, str(c)) for c in reversed(self.chain(class_id))], "rows": rows}
 
-    def describe(self, info, before: dict[int, int]) -> dict:
+    def is_passive(self, skill_id: int) -> bool:
+        return self.skill_data._SKILL_RAW.get(skill_id, {}).get("operate_type") == "P"
+
+    def describe(self, info, before: dict[int, int], category: str | None = None) -> dict:
         raw = self.skill_data._SKILL_RAW.get(info.skill_id, {})
         needs = sorted({kind for kinds in raw.get("using", ()) for kind in kinds})
-        return {"id": info.skill_id, "name": info.name, "level": info.level, "category": info.category,
+        return {"id": info.skill_id, "name": info.name, "level": info.level, "category": category or info.category,
                 "needs": needs, "icon": info.skill_id in self.icons,
                 "new": info.skill_id not in before, "up": info.skill_id in before and before[info.skill_id] != info.level}
 
@@ -100,9 +108,9 @@ PAGE = r"""<!doctype html>
 <title>Skill panels</title>
 <style>
   :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2433; --muted:#6b7385; --line:#e3e6ec; --new:#1a7f4b; --up:#2f6fdb;
-          --attack:#d9534f; --debuff:#9a6dd7; --heal:#1a7f4b; --buff:#e08a1e; --summon:#2f6fdb; }
+          --attack:#d9534f; --debuff:#9a6dd7; --heal:#1a7f4b; --buff:#e08a1e; --summon:#2f6fdb; --passive:#8a93a6; }
   @media (prefers-color-scheme: dark) { :root { --bg:#12151b; --card:#1b2029; --ink:#e7eaf0; --muted:#98a0b3; --line:#2b3240;
-          --new:#3fbf7f; --up:#6ea2ff; --attack:#ff7b72; --debuff:#b892ff; --heal:#3fbf7f; --buff:#ffb44d; --summon:#6ea2ff; } }
+          --new:#3fbf7f; --up:#6ea2ff; --attack:#ff7b72; --debuff:#b892ff; --heal:#3fbf7f; --buff:#ffb44d; --summon:#6ea2ff; --passive:#7c8599; } }
   * { box-sizing:border-box; }
   body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
   header { display:flex; flex-wrap:wrap; gap:12px; align-items:center; padding:14px 20px; border-bottom:1px solid var(--line); background:var(--card); position:sticky; top:0; z-index:1; }
@@ -124,6 +132,9 @@ PAGE = r"""<!doctype html>
   .noico { background:var(--line); }
   .lvl, .needs { font-size:11px; color:var(--muted); }
   .needs { border:1px solid var(--line); border-radius:4px; padding:0 4px; }
+  .passives { margin-top:8px; padding-top:8px; border-top:1px dashed var(--line); }
+  .passives .skill { background:var(--bg); }
+  .tag { font-size:11px; color:var(--muted); margin-right:4px; align-self:center; }
   @media (max-width:520px) { header, main { padding-left:16px; padding-right:16px; } td.lv { width:60px; } }
 </style>
 </head>
@@ -138,7 +149,7 @@ PAGE = r"""<!doctype html>
   <div class="legend">
     <span><i style="background:var(--attack)"></i>attack</span><span><i style="background:var(--debuff)"></i>debuff</span>
     <span><i style="background:var(--heal)"></i>heal</span><span><i style="background:var(--buff)"></i>buff</span>
-    <span><i style="background:var(--summon)"></i>summon</span>
+    <span><i style="background:var(--summon)"></i>summon</span><span><i style="background:var(--passive)"></i>passive (below the panel)</span>
     <span><i style="outline:2px solid var(--new)"></i>new at this level</span>
     <span><b style="color:var(--up)">Lv</b> skill level went up</span>
     <span><span class="needs">BOW</span> weapon / armor the skill needs</span>
@@ -159,11 +170,14 @@ async function load(classId) {
   $("chain").textContent = d.panel.chain.join(" → ");
   $("panels").innerHTML = d.panel.rows.map(row => {
     const lv = row.from === row.to ? row.from : `${row.from}–${row.to}`;
-    const skills = row.skills.map(s => `<span class="skill${s.new ? " new" : ""}${s.up ? " up" : ""}" style="--c:var(--${s.category})" title="${esc(s.name)} (id ${s.id})">`
+    const chip = s => `<span class="skill${s.new ? " new" : ""}${s.up ? " up" : ""}" style="--c:var(--${s.category})" title="${esc(s.name)} (id ${s.id})">`
       + (s.icon ? `<img class="ico" src="/icons/${s.id}.png" alt="">` : `<span class="noico"></span>`)
       + `${esc(s.name)} <span class="lvl">Lv ${s.level}</span>`
-      + s.needs.map(n => ` <span class="needs">${esc(n)}</span>`).join("") + `</span>`).join("");
-    return `<tr><td class="lv">${lv}</td><td><div class="skills">${skills || '<span class="lvl">no combat skills</span>'}</div></td></tr>`;
+      + s.needs.map(n => ` <span class="needs">${esc(n)}</span>`).join("") + `</span>`;
+    const skills = row.skills.map(chip).join("");
+    const passives = (row.passives || []).map(chip).join("");
+    return `<tr><td class="lv">${lv}</td><td><div class="skills">${skills || '<span class="lvl">no combat skills</span>'}</div>`
+      + (passives ? `<div class="skills passives"><span class="tag">passive</span>${passives}</div>` : "") + `</td></tr>`;
   }).join("");
 }
 $("cls").onchange = e => load(e.target.value);
