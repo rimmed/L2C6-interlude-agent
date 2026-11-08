@@ -152,6 +152,7 @@ public class RLAgentEnvironmentConfig
 	public static double RL_FARM_BAD_AREA_KD;
 	public static long RL_AUTO_SUMMON_INTERVAL;
 	public static int RL_LOOT_CLEAR_FREE_SLOTS;
+	public static int RL_FARM_ROTATE_MINUTES;
 	/** Buff set name -> weight, in the configured order. */
 	public static Map<String, Integer> RL_BUFF_SET_WEIGHTS;
 	public static Map<Integer, String> RL_BUFF_CLASS_SETS;
@@ -301,6 +302,7 @@ public class RLAgentEnvironmentConfig
 		RL_FARM_BAD_AREA_KD = config.getDouble("RLFarmBadAreaKD", 3.0);
 		RL_AUTO_SUMMON_INTERVAL = config.getLong("RLAutoSummonInterval", 30000);
 		RL_LOOT_CLEAR_FREE_SLOTS = config.getInt("RLLootClearFreeSlots", 0);
+		RL_FARM_ROTATE_MINUTES = config.getInt("RLFarmRotateMinutes", 0);
 		RL_BUFF_SET_WEIGHTS = parseWeights(config.getString("RLBuffSetWeights", "none:15;newbie:20;support:30;dances_songs:15;full:20"));
 		RL_BUFF_CLASS_SETS = new HashMap<>();
 		for (String entry : config.getString("RLBuffClassSets", "").split(";"))

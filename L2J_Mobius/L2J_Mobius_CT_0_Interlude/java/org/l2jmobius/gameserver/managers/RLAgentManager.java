@@ -88,6 +88,7 @@ import org.l2jmobius.gameserver.model.stats.Stat;
 import org.l2jmobius.gameserver.network.GameClient;
 import org.l2jmobius.gameserver.network.clientpackets.CharacterCreate;
 import org.l2jmobius.gameserver.network.serverpackets.ExAutoSoulShot;
+import org.l2jmobius.gameserver.taskmanagers.AttackStanceTaskManager;
 import org.l2jmobius.gameserver.util.RLAgentNameGenerator;
 
 /**
@@ -125,6 +126,8 @@ public class RLAgentManager
 	private static final String VAR_TARGET_CLASS = "RL_TARGET_CLASS";
 	/** How often agents are checked for being stuck (RLStuckRelocateSeconds), in ms. */
 	private static final long STUCK_CHECK_INTERVAL = 30000;
+	/** How often agents are checked for having farmed their area long enough (RLFarmRotateMinutes), in ms. */
+	private static final long ROTATE_CHECK_INTERVAL = 60000;
 	/** A move shorter than this does not count as progress of a stuck check. */
 	private static final int STUCK_MOVE_DISTANCE = 100;
 	/** Level range of each profession (0 = starting class .. 3 = third profession) for RLClassBalance. */
@@ -343,6 +346,10 @@ public class RLAgentManager
 		if (RLAgentEnvironmentConfig.RL_STUCK_SECONDS > 0)
 		{
 			ThreadPool.scheduleAtFixedRate(this::relocateStuck, STUCK_CHECK_INTERVAL, STUCK_CHECK_INTERVAL);
+		}
+		if ((RLAgentEnvironmentConfig.RL_FARM_ROTATE_MINUTES > 0) && RLAgentEnvironmentConfig.RL_FARM_AUTO)
+		{
+			ThreadPool.scheduleAtFixedRate(this::rotateAreas, ROTATE_CHECK_INTERVAL, ROTATE_CHECK_INTERVAL);
 		}
 		LOGGER.info(getClass().getSimpleName() + ": Agent levels " + RLAgentEnvironmentConfig.RL_MIN_LEVEL + "-" + RLAgentEnvironmentConfig.RL_MAX_LEVEL + ", accounts matching \"" + RLAgentEnvironmentConfig.RL_AGENT_ACCOUNT_PATTERN.pattern() + "\", " + RLAgentEnvironmentConfig.RL_FARM_ZONES.size() + " farm zone bracket(s).");
 	}
@@ -1368,6 +1375,21 @@ public class RLAgentManager
 				moveStuck(player, "made no progress for " + ((now - last[3]) / 1000) + " s");
 				_progress.put(player.getObjectId(), new long[] { player.getX(), player.getY(), player.getExp(), now });
 			});
+		}
+	}
+	
+	/**
+	 * Moves the agents that have farmed one area for RLFarmRotateMinutes to another one, out of a fight only: an agent kept in an area as long as it suits its level stays in a mediocre one (K/D far below the fleet's but above RLPoorAreaKD and RLFarmBadAreaKD) for the whole run.
+	 */
+	private void rotateAreas()
+	{
+		for (Player player : World.getInstance().getPlayers())
+		{
+			if (!isAgent(player) || !player.isOnline() || player.isDead() || player.isSitting() || player.isCastingNow() || AttackStanceTaskManager.getInstance().hasAttackStanceTask(player) || !_farmAreas.rotationDue(player, RLAgentEnvironmentConfig.RL_FARM_ROTATE_MINUTES))
+			{
+				continue;
+			}
+			runSafely(player, "area rotation", () -> moveStuck(player, "farmed its area for " + RLAgentEnvironmentConfig.RL_FARM_ROTATE_MINUTES + " min"));
 		}
 	}
 	

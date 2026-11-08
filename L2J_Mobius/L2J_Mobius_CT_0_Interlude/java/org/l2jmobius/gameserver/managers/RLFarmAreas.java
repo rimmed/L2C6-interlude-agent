@@ -146,6 +146,8 @@ final class RLFarmAreas
 	/** Per agent: kills and deaths in its current area (RLPoorAreaDeaths). */
 	private final Map<Integer, Integer> _areaKills = new ConcurrentHashMap<>();
 	private final Map<Integer, Integer> _areaDeaths = new ConcurrentHashMap<>();
+	/** Agent object id -> when it was assigned its current area (RLFarmRotateMinutes). */
+	private final Map<Integer, Long> _assignedAt = new ConcurrentHashMap<>();
 	/** Area key -> {kills, deaths} of all agents there (RLFarmBadAreaDeaths, RLFarmBadAreaKD). */
 	private final Map<String, int[]> _areaTotals = new ConcurrentHashMap<>();
 	/** Areas found bad during the run (logged once). */
@@ -227,12 +229,25 @@ final class RLFarmAreas
 		{
 			_areaKills.remove(player.getObjectId());
 			_areaDeaths.remove(player.getObjectId());
+			_assignedAt.put(player.getObjectId(), System.currentTimeMillis());
 			LOGGER.info(RLFarmAreas.class.getSimpleName() + ": " + player.getName() + " (" + player.getPlayerClass() + ", level " + player.getLevel() + ") assigned to " + area.key() + ".");
 		}
 	}
 	
+	/**
+	 * @param player the agent
+	 * @param minutes how long an agent farms one area (RLFarmRotateMinutes)
+	 * @return {@code true} when the agent has been in its current area for that long
+	 */
+	boolean rotationDue(Player player, int minutes)
+	{
+		final Long since = _assignedAt.get(player.getObjectId());
+		return (since != null) && _assignments.containsKey(player.getObjectId()) && ((System.currentTimeMillis() - since) >= (minutes * 60000L));
+	}
+	
 	void release(Player player)
 	{
+		_assignedAt.remove(player.getObjectId());
 		_assignments.remove(player.getObjectId());
 		_areaKills.remove(player.getObjectId());
 		_areaDeaths.remove(player.getObjectId());
