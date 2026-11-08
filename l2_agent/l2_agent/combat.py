@@ -129,6 +129,7 @@ class Fighter:
         executor.sync_cooldowns(now)
         if self.cfg.buff_potions:
             executor.drink_buff_potions(now)
+        executor.self_heal(now)
         executor.drop_stuck_target(now)
         if self._pick_up(now):
             return

@@ -70,12 +70,18 @@ class ExecutorConfig:
     rest_until: float = 0.95
     #: re-send the sit / stand toggle when ChangeWaitType did not come in this time
     rest_retry_s: float = 2.0
+    #: below this share of HP the character casts its own heal (``SELF_HEAL_SKILLS``) when it has one ready:
+    #: scripted like the buff potions, a hint for the model, which hardly ever picks it (the Elven Scout cast
+    #: Elemental Heal once in 60 000 fights of rl_bc_v11q); 0 = off
+    self_heal_hp: float = 0.4
 
 
 #: Shop buff potions (RLBuffPotions on the server) -> the skill of their effect; Greater ones first.
 BUFF_POTIONS: dict[int, int] = {1374: 2034, 734: 2011, 1375: 2035, 735: 2012, 6036: 2169, 6035: 2169}
 #: A drunk potion's effect may take a moment to show up in AbnormalStatusUpdate: do not drink again meanwhile.
 POTION_RETRY_S = 8.0
+#: Heals a fighter casts on itself (Elemental Heal of the elven fighters), best first.
+SELF_HEAL_SKILLS: tuple[int, ...] = (58,)
 
 
 def find_healing_potion(char) -> dict | None:
@@ -111,6 +117,9 @@ class ActionExecutor:
         self.rest_s = 0.0
         #: times the character asked for .heal in the current fight (episode statistics)
         self.heals = 0
+        #: own heals the executor cast in the current fight (``self_heal``)
+        self.self_heals = 0
+        self._self_heal_at = 0.0
         self._rest_tick = 0.0
         self._heal_at = 0.0
 
@@ -195,6 +204,29 @@ class ActionExecutor:
             self._potion_tried[kind] = now
             return item_data.get_item_name(item_id) or str(item_id)
         return None
+
+    def self_heal(self, now: float) -> str | None:
+        """
+        Cast the character's own heal (``SELF_HEAL_SKILLS``) when its HP is below ``self_heal_hp`` and the heal is
+        off cooldown. Scripted like the buff potions; returns the skill's name or ``None``.
+        """
+        world, char, cfg = self.world, self.world.char, self.cfg
+        if cfg.self_heal_hp <= 0 or world.dead or world.sitting or now < world.cast_until or char.max_hp <= 0:
+            return None
+        if char.cur_hp / char.max_hp >= cfg.self_heal_hp:
+            return None
+        known = {s["id"] for s in char.skills if not s.get("passive")}
+        skill_id = next((s for s in SELF_HEAL_SKILLS if s in known), None)
+        if skill_id is None:
+            return None
+        # its reuse (game time) at the server's speed, and a margin for the cast itself
+        reuse = (skill_data.get_skill_reuse_delay(skill_id) or 10000) / 1000.0 / max(world.server_speed, 1e-6) + 0.5
+        if now - self._self_heal_at < reuse:
+            return None
+        self._send(packets.build_use_skill(skill_id))
+        self._self_heal_at = now
+        self.self_heals += 1
+        return skill_data.get_skill_name(skill_id) or str(skill_id)
 
     def sync_cooldowns(self, now: float) -> None:
         """Ask the server for the real cooldowns while a skill is cooling down."""

@@ -314,6 +314,7 @@ class Actor:
         self.executor.sync_cooldowns(now)
         if self.cfg.buff_potions:
             self.executor.drink_buff_potions(now)
+        self.executor.self_heal(now)
         self.executor.drop_stuck_target(now)
         if self.cfg.rest and self.executor.rest(now):
             return
@@ -424,6 +425,7 @@ class Actor:
                 "duration_s": round(time.time() - self.episode_started, 2),
                 "rest_s": round(self.executor.rest_s, 1),
                 "heals": self.executor.heals,
+                "self_heals": self.executor.self_heals,
                 "mp_end": round(char.cur_mp / char.max_mp, 3) if char.max_mp else None,
                 "attackers": sum(mob.get("attacking_me_until", 0.0) > time.time() for mob in char.radar.entries.values()),
                 # The lower one: a kill that levels up ends a fight on the next level, and the reset to the base level comes after the next fight began.
@@ -448,6 +450,7 @@ class Actor:
         self.episode_level = self.world.char.level
         self.executor.rest_s = 0.0
         self.executor.heals = 0
+        self.executor.self_heals = 0
         self.encoder.reset_session()
 
     def stop(self) -> None:
